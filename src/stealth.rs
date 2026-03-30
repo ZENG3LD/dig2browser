@@ -99,7 +99,7 @@ pub fn get_scripts(config: &StealthConfig) -> Vec<String> {
     scripts.push(randomize_canvas_fingerprint());
     scripts.push(override_plugins());
     scripts.push(override_languages(&config.locale.locale));
-    scripts.push(override_permissions());
+    scripts.push(override_permissions_all());
     scripts.push(override_hardware_concurrency(config.hardware_concurrency));
     scripts.push(override_device_memory(config.device_memory_gb));
     scripts.push(override_connection_info());
@@ -117,6 +117,7 @@ pub fn get_scripts(config: &StealthConfig) -> Vec<String> {
     }
 
     // Full: adds webrtc + timezone + media_devices + performance_timing + battery
+    //       + outer window size + userAgentData
     scripts.push(override_webrtc_leak());
     if let Some(tz) = &config.locale.timezone {
         scripts.push(override_timezone(tz));
@@ -124,6 +125,8 @@ pub fn get_scripts(config: &StealthConfig) -> Vec<String> {
     scripts.push(override_media_devices());
     scripts.push(override_performance_timing());
     scripts.push(override_battery_api());
+    scripts.push(override_outer_size());
+    scripts.push(override_user_agent_data());
 
     scripts
 }
@@ -189,47 +192,170 @@ pub async fn human_scroll(page: &chromiumoxide::Page) -> Result<(), BrowserError
 // ---------------------------------------------------------------------------
 
 /// Override `navigator.webdriver` to hide automation.
+///
+/// Patches `Navigator.prototype` (not the instance) with `configurable: false`
+/// so that anti-bot scripts inspecting the prototype descriptor see the same
+/// shape as a real browser rather than detecting a per-instance override.
 fn override_navigator_webdriver() -> String {
     r#"
-    Object.defineProperty(navigator, 'webdriver', {
+    try {
+        delete navigator.__proto__.webdriver;
+    } catch (_) {}
+    Object.defineProperty(Navigator.prototype, 'webdriver', {
         get: () => false,
-        configurable: true
+        configurable: false,
+        enumerable: true,
     });
     "#
     .to_string()
 }
 
 /// Fake `window.chrome` to mimic a real Chrome/Edge browser.
+///
+/// Detection scripts check for `chrome.app`, `chrome.csi()`, `chrome.loadTimes()`,
+/// and `chrome.runtime.id`. An empty `{}` for runtime is immediately suspicious.
 fn override_chrome_runtime() -> String {
     r#"
     window.chrome = {
-        runtime: {}
+        app: {
+            isInstalled: false,
+            InstallState: {
+                INSTALLED: 'installed',
+                NOT_INSTALLED: 'not_installed',
+                DISABLED: 'disabled',
+            },
+            RunningState: {
+                RUNNING: 'running',
+                CANNOT_RUN: 'cannot_run',
+                READY_TO_RUN: 'ready_to_run',
+            },
+            getDetails: function() { return null; },
+            getIsInstalled: function() { return false; },
+            installState: function(cb) { if (cb) cb('not_installed'); },
+        },
+        csi: function() {
+            return {
+                onloadT: Date.now(),
+                startE: Date.now(),
+                pageT: Date.now(),
+                tran: 15,
+            };
+        },
+        loadTimes: function() {
+            return {
+                commitLoadTime: Date.now() / 1000,
+                connectionInfo: 'h2',
+                finishDocumentLoadTime: 0,
+                finishLoadTime: 0,
+                firstPaintAfterLoadTime: 0,
+                firstPaintTime: 0,
+                navigationType: 'Other',
+                npnNegotiatedProtocol: 'h2',
+                requestTime: Date.now() / 1000,
+                startLoadTime: Date.now() / 1000,
+                wasAlternateProtocolAvailable: false,
+                wasFetchedViaSpdy: true,
+                wasNpnNegotiated: true,
+            };
+        },
+        runtime: {
+            OnInstalledReason: {
+                CHROME_UPDATE: 'chrome_update',
+                INSTALL: 'install',
+                SHARED_MODULE_UPDATE: 'shared_module_update',
+                UPDATE: 'update',
+            },
+            OnRestartRequiredReason: {
+                APP_UPDATE: 'app_update',
+                OS_UPDATE: 'os_update',
+                PERIODIC: 'periodic',
+            },
+            PlatformArch: {
+                ARM: 'arm',
+                MIPS: 'mips',
+                MIPS64: 'mips64',
+                X86_32: 'x86-32',
+                X86_64: 'x86-64',
+            },
+            PlatformNaclArch: {
+                ARM: 'arm',
+                MIPS: 'mips',
+                MIPS64: 'mips64',
+                X86_32: 'x86-32',
+                X86_64: 'x86-64',
+            },
+            PlatformOs: {
+                ANDROID: 'android',
+                CROS: 'cros',
+                LINUX: 'linux',
+                MAC: 'mac',
+                OPENBSD: 'openbsd',
+                WIN: 'win',
+            },
+            RequestUpdateCheckStatus: {
+                NO_UPDATE: 'no_update',
+                THROTTLED: 'throttled',
+                UPDATE_AVAILABLE: 'update_available',
+            },
+            connect: function() {
+                return {
+                    onDisconnect: { addListener: function() {} },
+                    onMessage: { addListener: function() {} },
+                    postMessage: function() {},
+                    disconnect: function() {},
+                };
+            },
+            sendMessage: function() {},
+            id: undefined,
+        },
     };
     "#
     .to_string()
 }
 
 /// Add slight noise to canvas pixel data to randomise the fingerprint.
+///
+/// Uses a deterministic per-session seed (computed once at injection time) so
+/// repeated calls return consistent pixel offsets within a session. Randomising
+/// on every call is itself a detectable pattern: real browsers return identical
+/// canvas output for identical drawing operations.
 fn randomize_canvas_fingerprint() -> String {
     r#"
-    const getImageData = CanvasRenderingContext2D.prototype.getImageData;
-    CanvasRenderingContext2D.prototype.getImageData = function() {
-        const imageData = getImageData.apply(this, arguments);
-        for (let i = 0; i < imageData.data.length; i += 4) {
-            imageData.data[i] = imageData.data[i] + Math.floor(Math.random() * 3) - 1;
+    (function() {
+        // Seed computed once per page context — stable within session.
+        const _seed = (Math.random() * 0xFFFFFFFF) >>> 0;
+        // Simple xorshift32 — fast, deterministic, non-cryptographic.
+        function xorshift(n) {
+            n ^= n << 13; n ^= n >>> 17; n ^= n << 5;
+            return (n >>> 0);
         }
-        return imageData;
-    };
+        // Map seed + pixel index to a stable offset in {-1, 0, +1}.
+        function pixelOffset(idx) {
+            return (xorshift(_seed ^ (idx * 1664525 + 1013904223)) % 3) - 1;
+        }
 
-    const toDataURL = HTMLCanvasElement.prototype.toDataURL;
-    HTMLCanvasElement.prototype.toDataURL = function() {
-        const context = this.getContext('2d');
-        if (context) {
-            context.fillStyle = 'rgba(0,0,0,0.01)';
-            context.fillRect(0, 0, 1, 1);
-        }
-        return toDataURL.apply(this, arguments);
-    };
+        const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+        CanvasRenderingContext2D.prototype.getImageData = function() {
+            const imageData = origGetImageData.apply(this, arguments);
+            for (let i = 0; i < imageData.data.length; i += 4) {
+                const delta = pixelOffset(i);
+                imageData.data[i] = Math.max(0, Math.min(255, imageData.data[i] + delta));
+            }
+            return imageData;
+        };
+
+        const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+        HTMLCanvasElement.prototype.toDataURL = function() {
+            const ctx = this.getContext('2d');
+            if (ctx) {
+                // Stable 1x1 pixel draw — same value every call for this session.
+                const alpha = ((xorshift(_seed) % 10) + 1) / 1000;
+                ctx.fillStyle = 'rgba(0,0,0,' + alpha + ')';
+                ctx.fillRect(0, 0, 1, 1);
+            }
+            return origToDataURL.apply(this, arguments);
+        };
+    })();
     "#
     .to_string()
 }
@@ -277,19 +403,6 @@ fn override_languages(locale: &str) -> String {
     }});
     "#
     )
-}
-
-/// Override the Permissions API to behave like a real browser.
-fn override_permissions() -> String {
-    r#"
-    const originalQuery = window.navigator.permissions.query;
-    window.navigator.permissions.query = (parameters) => (
-        parameters.name === 'notifications' ?
-            Promise.resolve({ state: Notification.permission }) :
-            originalQuery(parameters)
-    );
-    "#
-    .to_string()
 }
 
 /// Set `navigator.hardwareConcurrency` to `cores`.
@@ -367,7 +480,12 @@ fn override_webgl_vendor() -> String {
 }
 
 /// Override `screen.width/height/availWidth/availHeight` to `width × height`.
+///
+/// `availHeight` is evaluated in Rust (not via a JS expression) to avoid any
+/// ambiguity with operator precedence in minified contexts. Also sets
+/// `devicePixelRatio` to 1.0 for consistency on 1080p non-retina displays.
 fn override_screen_resolution(width: u32, height: u32) -> String {
+    let avail_height = height.saturating_sub(40);
     format!(
         r#"
     Object.defineProperty(screen, 'width', {{
@@ -383,27 +501,25 @@ fn override_screen_resolution(width: u32, height: u32) -> String {
         configurable: true
     }});
     Object.defineProperty(screen, 'availHeight', {{
-        get: () => {height} - 40,
+        get: () => {avail_height},
+        configurable: true
+    }});
+    Object.defineProperty(window, 'devicePixelRatio', {{
+        get: () => 1,
         configurable: true
     }});
     "#
     )
 }
 
-/// Wrap `RTCPeerConnection` to prevent WebRTC-based IP leaks.
+/// Disable WebRTC to prevent IP leaks via ICE candidates.
+///
+/// Map scraping never requires WebRTC, so the safest approach is to remove it
+/// entirely rather than wrapping it with a no-op that leaks local IPs anyway.
 fn override_webrtc_leak() -> String {
     r#"
-    const originalRTCPeerConnection = window.RTCPeerConnection;
-    window.RTCPeerConnection = function(...args) {
-        const pc = new originalRTCPeerConnection(...args);
-        const originalCreateDataChannel = pc.createDataChannel;
-        pc.createDataChannel = function() {
-            const result = originalCreateDataChannel.apply(this, arguments);
-            return result;
-        };
-        return pc;
-    };
-    window.RTCPeerConnection.prototype = originalRTCPeerConnection.prototype;
+    window.RTCPeerConnection = undefined;
+    window.webkitRTCPeerConnection = undefined;
     "#
     .to_string()
 }
@@ -490,6 +606,93 @@ fn override_battery_api() -> String {
         }),
         configurable: true
     });
+    "#
+    .to_string()
+}
+
+/// Override `window.outerWidth` / `window.outerHeight`.
+///
+/// Headless Chrome reports 0 for both. Real browsers report the full window
+/// frame including browser chrome (~85px overhead for the toolbar).
+fn override_outer_size() -> String {
+    r#"
+    if (window.outerWidth === 0) {
+        Object.defineProperty(window, 'outerWidth', {
+            get: () => window.innerWidth,
+            configurable: true,
+        });
+        Object.defineProperty(window, 'outerHeight', {
+            get: () => window.innerHeight + 85,
+            configurable: true,
+        });
+    }
+    "#
+    .to_string()
+}
+
+/// Override `navigator.userAgentData` (User-Agent Client Hints API).
+///
+/// Modern Chrome exposes this object. Sites like Yandex check
+/// `navigator.userAgentData.brands` and `.platform`. Headless Chrome may
+/// return a minimal or incorrect object; we provide a realistic Windows profile.
+fn override_user_agent_data() -> String {
+    r#"
+    if (!navigator.userAgentData) {
+        Object.defineProperty(Navigator.prototype, 'userAgentData', {
+            get: () => ({
+                brands: [
+                    { brand: 'Chromium', version: '131' },
+                    { brand: 'Not_A Brand', version: '24' },
+                ],
+                mobile: false,
+                platform: 'Windows',
+                getHighEntropyValues: function(hints) {
+                    return Promise.resolve({
+                        architecture: 'x86',
+                        bitness: '64',
+                        brands: [
+                            { brand: 'Chromium', version: '131' },
+                            { brand: 'Not_A Brand', version: '24' },
+                        ],
+                        fullVersionList: [
+                            { brand: 'Chromium', version: '131.0.6778.140' },
+                            { brand: 'Not_A Brand', version: '24.0.0.0' },
+                        ],
+                        mobile: false,
+                        model: '',
+                        platform: 'Windows',
+                        platformVersion: '15.0.0',
+                        uaFullVersion: '131.0.6778.140',
+                    });
+                },
+                toJSON: function() {
+                    return { brands: this.brands, mobile: this.mobile, platform: this.platform };
+                },
+            }),
+            configurable: true,
+            enumerable: true,
+        });
+    }
+    "#
+    .to_string()
+}
+
+/// Override `navigator.permissions.query` to handle all permission types.
+///
+/// The previous implementation only handled `notifications`. Yandex SmartCaptcha
+/// tests multiple permission types (`clipboard-read`, `push`, `midi`, etc.).
+/// Return `prompt` state for unknown permissions so behaviour matches a real
+/// browser that has not yet been asked for those permissions.
+fn override_permissions_all() -> String {
+    r#"
+    if (window.navigator.permissions) {
+        window.navigator.permissions.query = function(parameters) {
+            if (parameters.name === 'notifications') {
+                return Promise.resolve({ state: Notification.permission, onchange: null });
+            }
+            return Promise.resolve({ state: 'prompt', onchange: null });
+        };
+    }
     "#
     .to_string()
 }

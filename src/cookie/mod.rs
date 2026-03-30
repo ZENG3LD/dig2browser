@@ -4,4 +4,4 @@ pub mod sqlite;
 pub mod decrypt;
 
 pub use types::{Cookie, CookieJar};
-pub use interceptor::{InterceptConfig, intercept_cookies};
+pub use interceptor::{InterceptConfig, intercept_cookies, open_auth_session};

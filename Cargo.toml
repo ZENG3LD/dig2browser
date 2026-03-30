@@ -1,3 +1,5 @@
+[workspace]
+
 [package]
 name = "dig2browser"
 version = "0.1.0"
@@ -5,7 +7,7 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-chromiumoxide = { version = "0.9" }
+chromiumoxide = { path = "chromiumoxide-patched", default-features = false }
 futures = "0.3"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

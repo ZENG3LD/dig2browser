@@ -42,7 +42,24 @@ pub fn read_cookies(
         "dig2browser-cookies-{}.db",
         uuid::Uuid::new_v4()
     ));
-    std::fs::copy(&db_path, &db_copy)?;
+    // Retry copy up to 10 times with 1 second sleep — Chrome may still hold WAL lock
+    let mut last_err = None;
+    for attempt in 0..10 {
+        match std::fs::copy(&db_path, &db_copy) {
+            Ok(_) => {
+                last_err = None;
+                break;
+            }
+            Err(e) => {
+                tracing::debug!("[dig2browser] Cookie DB copy attempt {} failed: {}", attempt + 1, e);
+                last_err = Some(e);
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+    }
+    if let Some(e) = last_err {
+        return Err(CookieError::Io(e));
+    }
 
     let result = read_cookies_from_path(&db_copy, domain, key);
 

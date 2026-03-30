@@ -28,9 +28,47 @@ impl InterceptConfig {
             domain: domain.into(),
             browser_pref: BrowserPreference::Auto,
             profile_dir: None,
-            flush_wait: std::time::Duration::from_millis(500),
+            flush_wait: std::time::Duration::from_millis(2000),
         }
     }
+}
+
+/// Open a visible browser for the user to log in, then close.
+/// Profile is saved to `profile_dir` — no cookie reading needed.
+/// Use this when the headless daemon will reuse the same profile directory.
+pub async fn open_auth_session(
+    start_url: &str,
+    profile_dir: &std::path::Path,
+    browser_pref: BrowserPreference,
+) -> Result<(), CookieError> {
+    use crate::browser_detect::detect_browser;
+
+    let binary = detect_browser(browser_pref).map_err(CookieError::Browser)?;
+
+    std::fs::create_dir_all(profile_dir)?;
+
+    let args: Vec<String> = vec![
+        "--no-first-run".into(),
+        "--disable-default-apps".into(),
+        format!("--user-data-dir={}", profile_dir.display()),
+        start_url.to_string(),
+    ];
+
+    println!("[dig2browser] Opening browser at: {}", start_url);
+    println!("[dig2browser] Log in, pass captchas, then CLOSE the browser window.");
+    println!("[dig2browser] Profile: {}", profile_dir.display());
+
+    let binary_path = binary.path.clone();
+    tokio::task::spawn_blocking(move || {
+        std::process::Command::new(&binary_path)
+            .args(&args)
+            .status()
+    })
+    .await
+    .map_err(|e| CookieError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))??;
+
+    println!("[dig2browser] Browser closed. Profile saved.");
+    Ok(())
 }
 
 /// Open a visible browser window at `config.start_url`, wait for the user to
@@ -91,7 +129,21 @@ pub async fn intercept_cookies(config: &InterceptConfig) -> Result<CookieJar, Co
     .await
     .map_err(|e| CookieError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))??;
 
-    // Step 5: wait for Chrome to flush WAL.
+    // Step 5: kill lingering browser processes that hold the cookie DB lock.
+    // Edge/Chrome spawn background tasks that outlive the main window.
+    // We need them dead before we can copy the SQLite file.
+    let exe_name = binary.path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("chrome.exe")
+        .to_string();
+    tracing::debug!("[dig2browser] Killing lingering {} processes", exe_name);
+    let _ = std::process::Command::new("taskkill")
+        .args(["/IM", &exe_name, "/F"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    // Wait for processes to fully exit and release file locks.
     tokio::time::sleep(config.flush_wait).await;
 
     // Step 6: derive AES key.
