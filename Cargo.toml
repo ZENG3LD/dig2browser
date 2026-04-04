@@ -1,14 +1,15 @@
-[workspace]
-members = ["crates/*"]
-resolver = "2"
-
-[workspace.package]
+[package]
+name = "dig2browser"
+version = "0.3.2"
 edition = "2021"
-version = "0.3.1"
 license = "MIT"
+description = "Stealth browser automation — custom CDP, WebDriver, BiDi backends"
+repository = "https://github.com/ZENG3LD/dig2browser"
+keywords = ["browser", "automation", "cdp", "webdriver", "stealth"]
+categories = ["web-programming", "development-tools::testing"]
+readme = "README.md"
 
-[workspace.dependencies]
-# async runtime
+[dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 reqwest = { version = "0.12", features = ["json"] }
@@ -24,20 +25,9 @@ base64 = "0.22"
 futures = "0.3"
 dashmap = "6"
 
-# internal crates
-dig2browser-cdp = { path = "crates/cdp" }
-dig2browser-webdriver = { path = "crates/webdriver" }
-dig2browser-bidi = { path = "crates/bidi" }
-dig2browser-stealth = { path = "crates/stealth" }
-dig2browser-cookie = { path = "crates/cookie" }
-dig2browser-detect = { path = "crates/detect" }
-dig2browser-core = { path = "crates/core" }
-
-[package]
-name = "dig2browser"
-edition.workspace = true
-version.workspace = true
-license.workspace = true
-
-[dependencies]
-dig2browser-core.workspace = true
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Security_Cryptography",
+    "Win32_Foundation",
+    "Win32_System_Memory",
+] }

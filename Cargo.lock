@@ -203,107 +203,23 @@ checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 
 [[package]]
 name = "dig2browser"
-version = "0.3.1"
-dependencies = [
- "dig2browser-core",
-]
-
-[[package]]
-name = "dig2browser-bidi"
-version = "0.3.1"
-dependencies = [
- "base64",
- "dashmap",
- "futures",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-tungstenite",
- "tracing",
-]
-
-[[package]]
-name = "dig2browser-cdp"
-version = "0.3.1"
-dependencies = [
- "base64",
- "dashmap",
- "futures",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-tungstenite",
- "tracing",
-]
-
-[[package]]
-name = "dig2browser-cookie"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "aes-gcm",
  "base64",
- "dig2browser-detect",
+ "dashmap",
+ "futures",
+ "rand 0.8.5",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "uuid",
  "windows",
-]
-
-[[package]]
-name = "dig2browser-core"
-version = "0.3.1"
-dependencies = [
- "base64",
- "dig2browser-bidi",
- "dig2browser-cdp",
- "dig2browser-cookie",
- "dig2browser-detect",
- "dig2browser-stealth",
- "dig2browser-webdriver",
- "futures",
- "rand 0.8.5",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "dig2browser-detect"
-version = "0.3.1"
-dependencies = [
- "thiserror",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "dig2browser-stealth"
-version = "0.3.1"
-dependencies = [
- "futures",
- "serde",
- "thiserror",
-]
-
-[[package]]
-name = "dig2browser-webdriver"
-version = "0.3.1"
-dependencies = [
- "base64",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tracing",
 ]
 
 [[package]]
