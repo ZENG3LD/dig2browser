@@ -34,6 +34,51 @@ impl CdpSession {
         Ok(())
     }
 
+    /// Override the User-Agent string together with full UA Client Hints metadata.
+    ///
+    /// Passing `userAgentMetadata` causes Chrome to also rewrite the
+    /// `Sec-CH-UA`, `Sec-CH-UA-Platform`, `Sec-CH-UA-Mobile`, and related
+    /// HTTP request headers — something that JS-only patching cannot achieve.
+    ///
+    /// `brands` should be `[("Google Chrome", "131"), ("Chromium", "131"), ("Not_A Brand", "24")]`.
+    pub async fn set_user_agent_with_metadata(
+        &self,
+        user_agent: &str,
+        platform: &str,
+        platform_version: &str,
+        architecture: &str,
+        model: &str,
+        mobile: bool,
+        brands: &[(&str, &str)],
+        full_version_list: &[(&str, &str)],
+    ) -> Result<(), CdpError> {
+        let brands_json: Vec<serde_json::Value> = brands
+            .iter()
+            .map(|(brand, version)| json!({ "brand": brand, "version": version }))
+            .collect();
+        let full_version_list_json: Vec<serde_json::Value> = full_version_list
+            .iter()
+            .map(|(brand, version)| json!({ "brand": brand, "version": version }))
+            .collect();
+        self.call(
+            "Emulation.setUserAgentOverride",
+            Some(json!({
+                "userAgent": user_agent,
+                "userAgentMetadata": {
+                    "brands": brands_json,
+                    "fullVersionList": full_version_list_json,
+                    "platform": platform,
+                    "platformVersion": platform_version,
+                    "architecture": architecture,
+                    "model": model,
+                    "mobile": mobile,
+                }
+            })),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Override the device screen metrics.
     pub async fn set_device_metrics(
         &self,

@@ -43,10 +43,35 @@ pub struct Viewport {
 }
 
 impl CdpSession {
-    /// Navigate the page to the given URL.
+    /// Navigate the page to the given URL and wait up to 30 s for load.
     pub async fn navigate(&self, url: &str) -> Result<(), CdpError> {
+        // Subscribe before sending the command so we don't miss a fast load.
+        let mut events = self.client().subscribe();
+
         self.call("Page.navigate", Some(json!({ "url": url }))).await?;
-        Ok(())
+
+        // Wait for Page.loadEventFired (or Page.frameStoppedLoading as fallback).
+        let deadline = Duration::from_secs(30);
+        let result = timeout(deadline, async move {
+            loop {
+                match events.recv().await {
+                    Ok(CdpEvent { method, .. })
+                        if method == "Page.loadEventFired"
+                            || method == "Page.frameStoppedLoading" =>
+                    {
+                        return Ok(());
+                    }
+                    Ok(_) => continue,
+                    Err(_) => return Err(CdpError::ConnectionClosed),
+                }
+            }
+        })
+        .await;
+
+        match result {
+            Ok(inner) => inner,
+            Err(_elapsed) => Err(CdpError::Timeout),
+        }
     }
 
     /// Return the full outer HTML of the document via `Runtime.evaluate`.

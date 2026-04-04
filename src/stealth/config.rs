@@ -42,6 +42,15 @@ impl LocaleProfile {
     }
 }
 
+/// Chrome 131 / Windows desktop User-Agent string used by default.
+///
+/// Kept as a constant so `StealthConfig::user_agent` and the JS
+/// `override_user_agent_data` script stay in sync without duplication.
+pub const DEFAULT_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+     AppleWebKit/537.36 (KHTML, like Gecko) \
+     Chrome/131.0.0.0 Safari/537.36";
+
 /// Full stealth configuration passed to script generators and injection strategies.
 #[derive(Debug, Clone)]
 pub struct StealthConfig {
@@ -50,6 +59,9 @@ pub struct StealthConfig {
     pub viewport: (u32, u32),
     pub hardware_concurrency: u32,
     pub device_memory_gb: u32,
+    /// User-Agent string to report via both HTTP headers and JS `navigator.userAgent`.
+    /// CDP backend uses this with `Emulation.setUserAgentOverride`.
+    pub user_agent: String,
 }
 
 impl Default for StealthConfig {
@@ -60,6 +72,7 @@ impl Default for StealthConfig {
             viewport: (1920, 1080),
             hardware_concurrency: 8,
             device_memory_gb: 8,
+            user_agent: DEFAULT_USER_AGENT.to_owned(),
         }
     }
 }

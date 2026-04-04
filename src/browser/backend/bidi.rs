@@ -51,7 +51,9 @@ impl BiDiBrowserBackend {
 
         let client = WdClient::new(&launch.geckodriver_url);
 
-        let mut caps = Capabilities::firefox().with_bidi();
+        let mut caps = Capabilities::firefox()
+            .with_bidi()
+            .with_firefox_stealth_prefs();
         if launch.headless {
             caps = caps.headless();
         }

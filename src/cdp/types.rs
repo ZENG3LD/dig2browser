@@ -25,7 +25,7 @@ pub(crate) struct CdpOutboundFrame<'a> {
     pub method: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<&'a serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "sessionId", skip_serializing_if = "Option::is_none")]
     pub session_id: Option<&'a str>,
 }
 

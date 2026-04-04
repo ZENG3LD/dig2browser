@@ -71,6 +71,45 @@ impl Capabilities {
         am["webSocketUrl"] = serde_json::Value::Bool(true);
         self
     }
+
+    /// Apply Firefox anti-detection preferences via `moz:firefoxOptions.prefs`.
+    ///
+    /// These operate at the browser-engine level (not via JS injection), so they
+    /// are more robust than JS overrides:
+    ///
+    /// - `dom.webdriver.enabled = false` — hides `navigator.webdriver = true`
+    /// - `media.peerconnection.enabled = false` — disables WebRTC (prevents IP leaks)
+    /// - `media.navigator.enabled = false` — disables `navigator.mediaDevices` enumeration
+    /// - `geo.enabled = false` — disables geolocation API
+    /// - `network.dns.disablePrefetch = true` — stops DNS prefetch leaks
+    /// - `fission.autostart = true` — modern WAFs detect its absence as automation
+    ///
+    /// Only has effect when the capabilities target Firefox (`moz:firefoxOptions`).
+    /// Silently no-ops for Chrome/Edge.
+    pub fn with_firefox_stealth_prefs(mut self) -> Self {
+        let am = self.always_match.get_or_insert_with(|| serde_json::json!({}));
+        if let Some(opts) = am.get_mut("moz:firefoxOptions") {
+            if let Some(obj) = opts.as_object_mut() {
+                obj.insert(
+                    "prefs".to_string(),
+                    serde_json::json!({
+                        "dom.webdriver.enabled": false,
+                        "media.peerconnection.enabled": false,
+                        "media.peerconnection.ice.no_host": true,
+                        "media.navigator.enabled": false,
+                        "geo.enabled": false,
+                        "network.dns.disablePrefetch": true,
+                        "network.dns.disablePrefetchFromHTTPS": true,
+                        "network.prefetch-next": false,
+                        "fission.autostart": true,
+                        "toolkit.telemetry.enabled": false,
+                        "datareporting.healthreport.uploadEnabled": false,
+                    }),
+                );
+            }
+        }
+        self
+    }
 }
 
 /// Push a command-line argument into the vendor-specific options args array.

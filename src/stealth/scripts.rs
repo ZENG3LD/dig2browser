@@ -178,6 +178,10 @@ fn override_chrome_runtime() -> String {
 /// repeated calls return consistent pixel offsets within a session. Randomising
 /// on every call is itself a detectable pattern: real browsers return identical
 /// canvas output for identical drawing operations.
+///
+/// `toString()` is spoofed on the patched functions so that
+/// `CanvasRenderingContext2D.prototype.getImageData.toString()` returns the
+/// native-code string that detectors expect.
 fn randomize_canvas_fingerprint() -> String {
     r#"
     (function() {
@@ -194,7 +198,7 @@ fn randomize_canvas_fingerprint() -> String {
         }
 
         const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
-        CanvasRenderingContext2D.prototype.getImageData = function() {
+        const patchedGetImageData = function getImageData() {
             const imageData = origGetImageData.apply(this, arguments);
             for (let i = 0; i < imageData.data.length; i += 4) {
                 const delta = pixelOffset(i);
@@ -202,9 +206,15 @@ fn randomize_canvas_fingerprint() -> String {
             }
             return imageData;
         };
+        // Spoof toString so detectors see native-code signature.
+        Object.defineProperty(patchedGetImageData, 'toString', {
+            value: function() { return 'function getImageData() { [native code] }'; },
+            configurable: true,
+        });
+        CanvasRenderingContext2D.prototype.getImageData = patchedGetImageData;
 
         const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
-        HTMLCanvasElement.prototype.toDataURL = function() {
+        const patchedToDataURL = function toDataURL() {
             const ctx = this.getContext('2d');
             if (ctx) {
                 // Stable 1x1 pixel draw — same value every call for this session.
@@ -214,6 +224,29 @@ fn randomize_canvas_fingerprint() -> String {
             }
             return origToDataURL.apply(this, arguments);
         };
+        Object.defineProperty(patchedToDataURL, 'toString', {
+            value: function() { return 'function toDataURL() { [native code] }'; },
+            configurable: true,
+        });
+        HTMLCanvasElement.prototype.toDataURL = patchedToDataURL;
+
+        const origToBlob = HTMLCanvasElement.prototype.toBlob;
+        if (origToBlob) {
+            const patchedToBlob = function toBlob(callback) {
+                const ctx = this.getContext('2d');
+                if (ctx) {
+                    const alpha = ((xorshift(_seed) % 10) + 1) / 1000;
+                    ctx.fillStyle = 'rgba(0,0,0,' + alpha + ')';
+                    ctx.fillRect(0, 0, 1, 1);
+                }
+                return origToBlob.apply(this, arguments);
+            };
+            Object.defineProperty(patchedToBlob, 'toString', {
+                value: function() { return 'function toBlob() { [native code] }'; },
+                configurable: true,
+            });
+            HTMLCanvasElement.prototype.toBlob = patchedToBlob;
+        }
     })();
     "#
     .to_string()
@@ -305,35 +338,39 @@ fn override_connection_info() -> String {
 }
 
 /// Spoof WebGL vendor/renderer strings to look like NVIDIA hardware.
+///
+/// `toString()` is spoofed on the patched `getParameter` so that
+/// `WebGLRenderingContext.prototype.getParameter.toString()` returns the
+/// native-code string that bot detectors expect.
 fn override_webgl_vendor() -> String {
     r#"
-    const getParameter = WebGLRenderingContext.prototype.getParameter;
-    WebGLRenderingContext.prototype.getParameter = function(parameter) {
-        const debugInfo = this.getExtension('WEBGL_debug_renderer_info');
-        if (debugInfo) {
-            if (parameter === debugInfo.UNMASKED_VENDOR_WEBGL) {
-                return 'Google Inc. (NVIDIA)';
-            }
-            if (parameter === debugInfo.UNMASKED_RENDERER_WEBGL) {
-                return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1080 Direct3D11 vs_5_0 ps_5_0, D3D11)';
-            }
+    (function() {
+        function patchGetParameter(ctx) {
+            const orig = ctx.prototype.getParameter;
+            const patched = function getParameter(parameter) {
+                const debugInfo = this.getExtension('WEBGL_debug_renderer_info');
+                if (debugInfo) {
+                    if (parameter === debugInfo.UNMASKED_VENDOR_WEBGL) {
+                        return 'Google Inc. (NVIDIA)';
+                    }
+                    if (parameter === debugInfo.UNMASKED_RENDERER_WEBGL) {
+                        return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1080 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+                    }
+                }
+                return orig.apply(this, arguments);
+            };
+            // Spoof toString so detectors see native-code signature.
+            Object.defineProperty(patched, 'toString', {
+                value: function() { return 'function getParameter() { [native code] }'; },
+                configurable: true,
+            });
+            ctx.prototype.getParameter = patched;
         }
-        return getParameter.apply(this, arguments);
-    };
-
-    const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
-    WebGL2RenderingContext.prototype.getParameter = function(parameter) {
-        const debugInfo = this.getExtension('WEBGL_debug_renderer_info');
-        if (debugInfo) {
-            if (parameter === debugInfo.UNMASKED_VENDOR_WEBGL) {
-                return 'Google Inc. (NVIDIA)';
-            }
-            if (parameter === debugInfo.UNMASKED_RENDERER_WEBGL) {
-                return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1080 Direct3D11 vs_5_0 ps_5_0, D3D11)';
-            }
+        patchGetParameter(WebGLRenderingContext);
+        if (typeof WebGL2RenderingContext !== 'undefined') {
+            patchGetParameter(WebGL2RenderingContext);
         }
-        return getParameter2.apply(this, arguments);
-    };
+    })();
     "#
     .to_string()
 }
@@ -343,6 +380,11 @@ fn override_webgl_vendor() -> String {
 /// `availHeight` is evaluated in Rust (not via a JS expression) to avoid any
 /// ambiguity with operator precedence in minified contexts. Also sets
 /// `devicePixelRatio` to 1.0 for consistency on 1080p non-retina displays.
+///
+/// NOTE: On the CDP backend this script is superseded by a native
+/// `Emulation.setDeviceMetricsOverride` call which is more reliable (survives
+/// CSS media query checks, affects visual viewport). The JS override remains
+/// here for the BiDi/Firefox backend where no CDP equivalent is available.
 fn override_screen_resolution(width: u32, height: u32) -> String {
     let avail_height = height.saturating_sub(40);
     format!(
@@ -378,12 +420,18 @@ fn override_screen_resolution(width: u32, height: u32) -> String {
 fn override_webrtc_leak() -> String {
     r#"
     window.RTCPeerConnection = undefined;
-    window.webkitRTCPeerConnection = undefined;
+    // Use delete rather than assigning undefined to avoid creating an own property
+    // on window where none existed (detectable via hasOwnProperty).
+    try { delete window.webkitRTCPeerConnection; } catch (_) {}
     "#
     .to_string()
 }
 
 /// Override `Intl.DateTimeFormat.resolvedOptions` to report timezone `tz`.
+///
+/// NOTE: On the CDP backend this is superseded by `Emulation.setTimezoneOverride`
+/// which also fixes `new Date().toString()`. The JS override is kept for the
+/// BiDi/Firefox backend where no native CDP equivalent is available.
 fn override_timezone(tz: &str) -> String {
     format!(
         r#"
@@ -411,29 +459,31 @@ fn override_media_devices() -> String {
                 {
                     deviceId: 'default',
                     kind: 'audioinput',
-                    label: 'Default - Microphone Array (Realtek High Definition Audio)',
+                    label: '',
                     groupId: 'audio-input-group-1'
                 },
                 {
                     deviceId: 'communications',
                     kind: 'audioinput',
-                    label: 'Communications - Microphone Array (Realtek High Definition Audio)',
+                    label: '',
                     groupId: 'audio-input-group-1'
                 },
                 {
                     deviceId: 'webcam-001',
                     kind: 'videoinput',
-                    label: 'HD WebCam (04f2:b5ce)',
+                    label: '',
                     groupId: 'video-input-group-1'
                 },
                 {
                     deviceId: 'speaker-default',
                     kind: 'audiooutput',
-                    label: 'Default - Speakers (Realtek High Definition Audio)',
+                    label: '',
                     groupId: 'audio-output-group-1'
                 }
             ]),
-            getUserMedia: () => Promise.reject(new Error('Permission denied'))
+            getUserMedia: () => Promise.reject(
+                new DOMException('Permission denied', 'NotAllowedError')
+            )
         }),
         configurable: true
     });
@@ -441,30 +491,78 @@ fn override_media_devices() -> String {
     .to_string()
 }
 
-/// Add small random noise to `Date.prototype.getTime` to disrupt timing fingerprints.
+/// Add small random noise to `Date.prototype.getTime` and `performance.now()`
+/// to disrupt timing-based fingerprinting.
+///
+/// Uses a time-bucket approach: the same noise offset is returned for calls
+/// within the same 10 ms window. This prevents the detectable inconsistency
+/// of `new Date().getTime() !== new Date().getTime()` within the same tick.
+///
+/// `toString()` is spoofed on both patched functions.
 fn override_performance_timing() -> String {
     r#"
-    const originalGetTime = Date.prototype.getTime;
-    Date.prototype.getTime = function() {
-        const time = originalGetTime.call(this);
-        return time + Math.floor(Math.random() * 10) - 5;
-    };
+    (function() {
+        // Bucket noise: same offset within each 10 ms window.
+        // This avoids the detectable pattern of two identical Date objects
+        // returning different values in the same synchronous frame.
+        var _lastBucket = -1;
+        var _bucketNoise = 0;
+        function getBucketNoise() {
+            var bucket = Math.floor(Date.now() / 10);
+            if (bucket !== _lastBucket) {
+                _lastBucket = bucket;
+                _bucketNoise = Math.floor(Math.random() * 11) - 5; // -5..+5
+            }
+            return _bucketNoise;
+        }
+
+        var originalGetTime = Date.prototype.getTime;
+        var patchedGetTime = function getTime() {
+            return originalGetTime.call(this) + getBucketNoise();
+        };
+        Object.defineProperty(patchedGetTime, 'toString', {
+            value: function() { return 'function getTime() { [native code] }'; },
+            configurable: true,
+        });
+        Date.prototype.getTime = patchedGetTime;
+
+        if (typeof performance !== 'undefined' && performance.now) {
+            var originalPerfNow = performance.now.bind(performance);
+            var patchedPerfNow = function now() {
+                return originalPerfNow() + getBucketNoise();
+            };
+            Object.defineProperty(patchedPerfNow, 'toString', {
+                value: function() { return 'function now() { [native code] }'; },
+                configurable: true,
+            });
+            performance.now = patchedPerfNow;
+        }
+    })();
     "#
     .to_string()
 }
 
 /// Override `navigator.getBattery` to return a fully-charged static profile.
+///
+/// Guard: Chrome 113+ removed the Battery Status API, so `navigator.getBattery`
+/// is `undefined` on modern Chrome. We only override if the API is present;
+/// creating a fake `getBattery` where none existed is more suspicious than
+/// leaving it absent.
 fn override_battery_api() -> String {
     r#"
-    Object.defineProperty(navigator, 'getBattery', {
-        value: () => Promise.resolve({
-            charging: true,
-            chargingTime: 0,
-            dischargingTime: Infinity,
-            level: 1.0
-        }),
-        configurable: true
-    });
+    if (typeof navigator.getBattery === 'function') {
+        Object.defineProperty(navigator, 'getBattery', {
+            value: () => Promise.resolve({
+                charging: true,
+                chargingTime: 0,
+                dischargingTime: Infinity,
+                level: 1.0,
+                addEventListener: function() {},
+                removeEventListener: function() {},
+            }),
+            configurable: true
+        });
+    }
     "#
     .to_string()
 }
@@ -494,12 +592,17 @@ fn override_outer_size() -> String {
 /// Modern Chrome exposes this object. Sites like Yandex check
 /// `navigator.userAgentData.brands` and `.platform`. Headless Chrome may
 /// return a minimal or incorrect object; we provide a realistic Windows profile.
+///
+/// NOTE: On the CDP backend this is superseded by `Emulation.setUserAgentOverride`
+/// with `userAgentMetadata` which sets Client Hints natively (including HTTP headers).
+/// This JS version remains for the BiDi/Firefox backend.
 fn override_user_agent_data() -> String {
     r#"
     if (!navigator.userAgentData) {
         Object.defineProperty(Navigator.prototype, 'userAgentData', {
             get: () => ({
                 brands: [
+                    { brand: 'Google Chrome', version: '131' },
                     { brand: 'Chromium', version: '131' },
                     { brand: 'Not_A Brand', version: '24' },
                 ],
@@ -510,10 +613,12 @@ fn override_user_agent_data() -> String {
                         architecture: 'x86',
                         bitness: '64',
                         brands: [
+                            { brand: 'Google Chrome', version: '131' },
                             { brand: 'Chromium', version: '131' },
                             { brand: 'Not_A Brand', version: '24' },
                         ],
                         fullVersionList: [
+                            { brand: 'Google Chrome', version: '131.0.6778.140' },
                             { brand: 'Chromium', version: '131.0.6778.140' },
                             { brand: 'Not_A Brand', version: '24.0.0.0' },
                         ],

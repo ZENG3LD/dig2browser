@@ -88,11 +88,6 @@ impl CdpBrowserBackend {
 
         let root = client.root_session();
 
-        // Enable Page domain on root so events flow.
-        root.call("Page.enable", None)
-            .await
-            .map_err(|e| BrowserError::Connect(e.to_string()))?;
-
         Ok(Self {
             client,
             root,
@@ -150,12 +145,10 @@ impl CdpBrowserBackend {
 
     /// Create and attach to a new page target, inject stealth scripts, optionally navigate.
     async fn open_page(&self, url: Option<&str>) -> Result<CdpPageBackend, BrowserError> {
-        let nav_url = url.unwrap_or("about:blank");
-
-        // Create a new page target.
+        // Always start as about:blank so we attach before any real navigation begins.
         let target_id = self
             .root
-            .create_target(nav_url)
+            .create_target("about:blank")
             .await
             .map_err(|e| BrowserError::Navigate(e.to_string()))?;
 
@@ -178,13 +171,68 @@ impl CdpBrowserBackend {
             .await
             .map_err(|e| BrowserError::Connect(e.to_string()))?;
 
-        // Inject stealth scripts so they run on every new document.
+        // ── CDP-native stealth overrides ──────────────────────────────────────
+        // These run at the protocol level and are more reliable than JS patching:
+        // they survive property-descriptor inspection and also affect HTTP headers.
+
+        // User-Agent + Client Hints: sets Sec-CH-UA* HTTP headers automatically.
+        session
+            .set_user_agent_with_metadata(
+                &self.stealth.user_agent,
+                "Windows",
+                "15.0.0",
+                "x86",
+                "",   // model — empty for desktops
+                false, // mobile
+                &[
+                    ("Google Chrome", "131"),
+                    ("Chromium", "131"),
+                    ("Not_A Brand", "24"),
+                ],
+                &[
+                    ("Google Chrome", "131.0.6778.140"),
+                    ("Chromium", "131.0.6778.140"),
+                    ("Not_A Brand", "24.0.0.0"),
+                ],
+            )
+            .await
+            .map_err(|e| BrowserError::StealthInject(e.to_string()))?;
+
+        // Timezone: fixes both Intl.DateTimeFormat AND new Date().toString().
+        // The JS override_timezone script only fixes Intl, missing Date.toString().
+        if let Some(tz) = &self.stealth.locale.timezone {
+            session
+                .set_timezone(tz)
+                .await
+                .map_err(|e| BrowserError::StealthInject(e.to_string()))?;
+        }
+
+        // Device metrics: screen dimensions + devicePixelRatio at browser level.
+        // Also affects CSS media queries and visual viewport, unlike JS patching.
+        let (vp_w, vp_h) = self.stealth.viewport;
+        session
+            .set_device_metrics(vp_w, vp_h, 1.0)
+            .await
+            .map_err(|e| BrowserError::StealthInject(e.to_string()))?;
+
+        // ── JS stealth scripts ────────────────────────────────────────────────
+        // Injected after native overrides. Some overlap with the CDP calls above
+        // but JS scripts cover properties that have no CDP equivalent (plugins,
+        // permissions, WebGL, etc.) and serve as safety nets for the ones that do.
         let scripts = get_scripts(&self.stealth);
         for script in &scripts {
             session
                 .add_script_on_new_document(script)
                 .await
                 .map_err(|e| BrowserError::StealthInject(e.to_string()))?;
+        }
+
+        // Navigate to the target URL and wait for the page to fully load.
+        if let Some(nav_url) = url {
+            session
+                .navigate(nav_url)
+                .await
+                .map_err(|e| BrowserError::Navigate(e.to_string()))?;
         }
 
         self.page_count.fetch_add(1, Ordering::Relaxed);
