@@ -1,11 +1,11 @@
 [package]
 name = "dig2browser"
-version = "0.3.3"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
-description = "Stealth browser automation — custom CDP, WebDriver, BiDi backends"
+description = "Stealth browser automation with Web Bot Auth — CDP, WebDriver, BiDi backends"
 repository = "https://github.com/ZENG3LD/dig2browser"
-keywords = ["browser", "automation", "cdp", "webdriver", "stealth"]
+keywords = ["browser", "automation", "cdp", "web-bot-auth", "stealth"]
 categories = ["web-programming", "development-tools::testing"]
 readme = "README.md"
 
@@ -20,6 +20,12 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
 rusqlite = { version = "0.31", features = ["bundled"] }
+web-bot-auth = "0.6.1"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+sha2 = "0.10"
+time = "0.3"
+indexmap = "2"
+url = "2"
 aes-gcm = "0.10"
 base64 = "0.22"
 futures = "0.3"

@@ -1,3 +1,4 @@
+pub mod bot_auth;
 pub mod cdp;
 pub mod webdriver;
 pub mod bidi;
