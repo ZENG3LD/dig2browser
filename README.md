@@ -227,13 +227,18 @@ let jwks = JwksDirectory::from_keypair(&keypair);
 jwks.save_to_file(Path::new("public/.well-known/http-message-signatures-directory"))?;
 println!("JWKS:\n{}", jwks.to_json());
 
-// 3. Create identity
-let identity = BotIdentity::new(
+// 3. Create identity (from env: BOT_AUTH_JWKS_URL, BOT_AUTH_KEY_PATH)
+let identity = BotIdentity::from_env(
     "my-crawler",
     "https://github.com/you/my-crawler",
-    "https://you.github.io/.well-known/http-message-signatures-directory",
-    "keys/my-bot.key",
 );
+// Or manually:
+// let identity = BotIdentity::new(
+//     "my-crawler",
+//     "https://github.com/you/my-crawler",
+//     "https://you.github.io/.well-known/http-message-signatures-directory",
+//     "keys/my-bot.key",
+// );
 
 // 4. Sign requests
 let signer = RequestSigner::from_identity(identity)?;
@@ -263,7 +268,15 @@ let resp = client.get(url)
 3. Register with each provider using the links above (provide your JWKS URL + bot homepage)
 4. Sign all requests with `RequestSigner` — the 3 headers are added automatically
 
-**Security:** Never commit your private key (`*.key`). Add `keys/` and `*.key` to `.gitignore`.
+**Environment variables** (set in consumer's `.env`):
+| Variable | Description |
+|----------|-------------|
+| `BOT_AUTH_JWKS_URL` | Public URL where JWKS directory is hosted |
+| `BOT_AUTH_KEY_PATH` | Path to Ed25519 private key (32 bytes raw) |
+
+`BotIdentity::from_env(name, homepage)` reads both from env. Panics if missing.
+
+**Security:** Never commit your private key (`*.key`). Add `keys/`, `*.key`, and `.env` to `.gitignore`.
 
 ## CDP Domains
 
