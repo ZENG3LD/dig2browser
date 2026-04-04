@@ -1,0 +1,10 @@
+[package]
+name = "dig2browser-stealth"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+futures.workspace = true

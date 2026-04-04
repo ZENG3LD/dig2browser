@@ -1,0 +1,23 @@
+[package]
+name = "dig2browser-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+dig2browser-cdp.workspace = true
+dig2browser-webdriver.workspace = true
+dig2browser-bidi.workspace = true
+dig2browser-stealth.workspace = true
+dig2browser-cookie.workspace = true
+dig2browser-detect.workspace = true
+
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+futures.workspace = true
+uuid.workspace = true
+base64.workspace = true
+rand = "0.8"
