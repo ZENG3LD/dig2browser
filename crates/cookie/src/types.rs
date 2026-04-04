@@ -82,8 +82,8 @@ impl CookieJar {
                         value: nv[1].to_string(),
                         domain: parts[1].to_string(),
                         path: parts[2].to_string(),
-                        is_secure: parts.get(3).map_or(false, |s| s.contains("secure")),
-                        is_httponly: parts.get(4).map_or(false, |s| s.contains("httponly")),
+                        is_secure: parts.get(3).is_some_and(|s| s.contains("secure")),
+                        is_httponly: parts.get(4).is_some_and(|s| s.contains("httponly")),
                         expires_utc: None,
                     });
                 }

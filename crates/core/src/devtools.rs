@@ -70,9 +70,6 @@ impl PageDevTools {
     /// Returns `None` if no event is currently available or the channel is
     /// closed.
     pub fn try_next(&mut self) -> Option<DevToolsEvent> {
-        match self.events_rx.try_recv() {
-            Ok(event) => Some(event),
-            Err(_) => None,
-        }
+        self.events_rx.try_recv().ok()
     }
 }

@@ -57,10 +57,7 @@ impl<'a> WaitBuilder<'a> {
         let deadline = Instant::now() + self.timeout;
 
         loop {
-            match self.page.find(selector).await {
-                Ok(el) => return Ok(el),
-                Err(_) => {}
-            }
+            if let Ok(el) = self.page.find(selector).await { return Ok(el) }
 
             if Instant::now() >= deadline {
                 return Err(BrowserError::Timeout(self.timeout));

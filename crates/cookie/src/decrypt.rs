@@ -138,7 +138,7 @@ pub(crate) fn dpapi_decrypt(ciphertext: &[u8]) -> Result<Vec<u8>, CookieError> {
     };
 
     unsafe {
-        CryptUnprotectData(&mut input, None, None, None, None, 0, &mut output).map_err(|_| {
+        CryptUnprotectData(&input, None, None, None, None, 0, &mut output).map_err(|_| {
             CookieError::DpapiDecrypt { code: 0 }
         })?;
     }

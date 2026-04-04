@@ -69,7 +69,7 @@ pub async fn open_auth_session(
             .status()
     })
     .await
-    .map_err(|e| CookieError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))??;
+    .map_err(|e| CookieError::Io(std::io::Error::other(e.to_string())))??;
 
     println!("[dig2browser] Browser closed. Profile saved.");
     Ok(())
@@ -127,7 +127,7 @@ pub async fn intercept_cookies(config: &InterceptConfig) -> Result<CookieJar, Co
             .status()
     })
     .await
-    .map_err(|e| CookieError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))??;
+    .map_err(|e| CookieError::Io(std::io::Error::other(e.to_string())))??;
 
     // Step 5: kill lingering browser processes that hold the cookie DB lock.
     // Edge/Chrome spawn background tasks that outlive the main window.
