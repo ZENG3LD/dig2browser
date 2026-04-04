@@ -11,12 +11,15 @@ mod devtools;
 mod error;
 mod page;
 mod pool;
+mod wait;
 
 pub use browser::StealthBrowser;
+pub use backend::{BoundingBox, ElementHandle, PrintOptions};
 pub use devtools::{ConsoleEvent, DevToolsEvent, NetworkEvent, PageDevTools};
 pub use error::BrowserError;
-pub use page::StealthPage;
+pub use page::{Element, StealthPage};
 pub use pool::{BrowserPool, PoolConfig, PoolPage};
+pub use wait::WaitBuilder;
 
 // Re-export leaf crate types so callers only need to import dig2browser-core.
 pub use dig2browser_detect::{BrowserBinary, BrowserKind, BrowserPreference, BrowserProfile, LaunchConfig};

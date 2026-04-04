@@ -7,6 +7,13 @@ use serde_json::json;
 use crate::error::CdpError;
 use crate::session::CdpSession;
 
+/// A single header name/value pair used when rewriting intercepted requests.
+#[derive(Debug, Clone, Serialize)]
+pub struct HeaderEntry {
+    pub name: String,
+    pub value: String,
+}
+
 /// Pattern used to enable request interception.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -50,6 +57,33 @@ impl CdpSession {
             Some(json!({ "requestId": request_id, "errorReason": reason })),
         )
         .await?;
+        Ok(())
+    }
+
+    /// Continue a paused request with optional modifications to URL, method,
+    /// headers, or POST body.
+    pub async fn continue_request_modified(
+        &self,
+        request_id: &str,
+        url: Option<&str>,
+        method: Option<&str>,
+        headers: Option<Vec<HeaderEntry>>,
+        post_data: Option<&str>,
+    ) -> Result<(), CdpError> {
+        let mut params = json!({ "requestId": request_id });
+        if let Some(u) = url {
+            params["url"] = serde_json::Value::String(u.to_owned());
+        }
+        if let Some(m) = method {
+            params["method"] = serde_json::Value::String(m.to_owned());
+        }
+        if let Some(h) = headers {
+            params["headers"] = serde_json::to_value(h)?;
+        }
+        if let Some(d) = post_data {
+            params["postData"] = serde_json::Value::String(d.to_owned());
+        }
+        self.call("Fetch.continueRequest", Some(params)).await?;
         Ok(())
     }
 

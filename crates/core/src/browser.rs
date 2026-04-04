@@ -1,5 +1,7 @@
 //! StealthBrowser — the primary public browser API.
 
+use std::sync::Arc;
+
 use dig2browser_detect::{BrowserPreference, LaunchConfig};
 use dig2browser_stealth::StealthConfig;
 
@@ -64,13 +66,17 @@ impl StealthBrowser {
     /// Open a new page and navigate to `url`.
     pub async fn new_page(&self, url: &str) -> Result<StealthPage, BrowserError> {
         let backend = self.backend.new_page(url).await?;
-        Ok(StealthPage { backend })
+        Ok(StealthPage {
+            backend: Arc::from(backend),
+        })
     }
 
     /// Open a new blank page (about:blank) without navigating.
     pub async fn new_blank_page(&self) -> Result<StealthPage, BrowserError> {
         let backend = self.backend.new_blank_page().await?;
-        Ok(StealthPage { backend })
+        Ok(StealthPage {
+            backend: Arc::from(backend),
+        })
     }
 
     /// Number of pages opened since the last restart.

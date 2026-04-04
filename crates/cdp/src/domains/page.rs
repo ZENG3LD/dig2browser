@@ -1,12 +1,46 @@
 //! CDP Page domain helpers.
 
 use base64::Engine;
+use serde::Serialize;
 use serde_json::json;
 use tokio::time::{timeout, Duration};
 
 use crate::error::CdpError;
 use crate::session::CdpSession;
 use crate::types::CdpEvent;
+
+/// Options for `Page.printToPDF`.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct PrintToPdfOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub landscape: Option<bool>,
+    #[serde(rename = "paperWidth", skip_serializing_if = "Option::is_none")]
+    pub paper_width: Option<f64>,
+    #[serde(rename = "paperHeight", skip_serializing_if = "Option::is_none")]
+    pub paper_height: Option<f64>,
+    #[serde(rename = "marginTop", skip_serializing_if = "Option::is_none")]
+    pub margin_top: Option<f64>,
+    #[serde(rename = "marginBottom", skip_serializing_if = "Option::is_none")]
+    pub margin_bottom: Option<f64>,
+    #[serde(rename = "marginLeft", skip_serializing_if = "Option::is_none")]
+    pub margin_left: Option<f64>,
+    #[serde(rename = "marginRight", skip_serializing_if = "Option::is_none")]
+    pub margin_right: Option<f64>,
+    #[serde(rename = "printBackground", skip_serializing_if = "Option::is_none")]
+    pub print_background: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scale: Option<f64>,
+}
+
+/// A rectangular viewport clip region for screenshots.
+#[derive(Debug, Clone, Serialize)]
+pub struct Viewport {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub scale: f64,
+}
 
 impl CdpSession {
     /// Navigate the page to the given URL.
@@ -73,6 +107,66 @@ impl CdpSession {
             .decode(encoded)
             .map_err(|e| CdpError::WebSocket(format!("base64 decode error: {e}")))?;
         Ok(bytes)
+    }
+
+    /// Print the page to PDF and return the raw bytes.
+    pub async fn print_to_pdf(&self, options: PrintToPdfOptions) -> Result<Vec<u8>, CdpError> {
+        let params = serde_json::to_value(&options)?;
+        let result = self.call("Page.printToPDF", Some(params)).await?;
+        let encoded = result["data"]
+            .as_str()
+            .ok_or_else(|| CdpError::Protocol {
+                code: -1,
+                message: "missing data in Page.printToPDF response".to_owned(),
+            })?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|e| CdpError::WebSocket(format!("base64 decode error: {e}")))?;
+        Ok(bytes)
+    }
+
+    /// Capture a screenshot with full options, including optional clip viewport
+    /// and full-page mode.
+    pub async fn capture_screenshot_with(
+        &self,
+        format: &str,
+        quality: Option<u32>,
+        clip: Option<Viewport>,
+        full_page: bool,
+    ) -> Result<Vec<u8>, CdpError> {
+        let mut params = json!({ "format": format });
+        if let Some(q) = quality {
+            params["quality"] = serde_json::Value::Number(q.into());
+        }
+        if let Some(c) = clip {
+            params["clip"] = serde_json::to_value(&c)?;
+        }
+        if full_page {
+            params["captureBeyondViewport"] = serde_json::Value::Bool(true);
+        }
+        let result = self.call("Page.captureScreenshot", Some(params)).await?;
+        let encoded = result["data"]
+            .as_str()
+            .ok_or_else(|| CdpError::Protocol {
+                code: -1,
+                message: "missing data in Page.captureScreenshot response".to_owned(),
+            })?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|e| CdpError::WebSocket(format!("base64 decode error: {e}")))?;
+        Ok(bytes)
+    }
+
+    /// Enable the Page domain (required before receiving Page events).
+    pub async fn enable_page(&self) -> Result<(), CdpError> {
+        self.call("Page.enable", None).await?;
+        Ok(())
+    }
+
+    /// Return the current frame tree.
+    pub async fn get_frame_tree(&self) -> Result<serde_json::Value, CdpError> {
+        let result = self.call("Page.getFrameTree", None).await?;
+        Ok(result["frameTree"].clone())
     }
 
     /// Wait for the `Page.loadEventFired` event up to `timeout_ms` milliseconds.

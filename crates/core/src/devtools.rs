@@ -1,7 +1,8 @@
-//! DevTools event types for agent-facing inspection.
+//! DevTools event types and the PageDevTools inspection handle.
 //!
-//! These types define the surface for network and console event observation.
-//! Actual wiring to CDP/BiDi event streams is a future extension.
+//! Callers use [`PageDevTools`] — obtained via [`StealthPage::devtools`] — to
+//! receive a stream of CDP/BiDi events translated into the unified
+//! [`DevToolsEvent`] type.
 
 /// A DevTools event emitted by the browser.
 #[derive(Debug, Clone)]
@@ -36,21 +37,42 @@ pub struct ConsoleEvent {
 
 /// DevTools inspection handle for a page.
 ///
-/// Currently a type-only placeholder. Actual event subscription (via CDP
-/// broadcast receiver or BiDi event stream) will be wired in a future iteration.
+/// Obtained via [`StealthPage::devtools`]. Wraps a broadcast receiver that
+/// delivers CDP/BiDi events translated into [`DevToolsEvent`] values.
 pub struct PageDevTools {
-    _private: (),
+    events_rx: tokio::sync::broadcast::Receiver<DevToolsEvent>,
 }
 
 impl PageDevTools {
-    /// Create a new (currently inert) DevTools handle.
-    pub fn new() -> Self {
-        Self { _private: () }
+    /// Create a new DevTools handle backed by the given broadcast receiver.
+    pub(crate) fn new(rx: tokio::sync::broadcast::Receiver<DevToolsEvent>) -> Self {
+        Self { events_rx: rx }
     }
-}
 
-impl Default for PageDevTools {
-    fn default() -> Self {
-        Self::new()
+    /// Wait for the next event.
+    ///
+    /// Returns `None` if the event channel has been closed (browser gone).
+    pub async fn next_event(&mut self) -> Option<DevToolsEvent> {
+        loop {
+            match self.events_rx.recv().await {
+                Ok(event) => return Some(event),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // We fell behind — skip missed events and continue.
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    }
+
+    /// Try to get an event without blocking.
+    ///
+    /// Returns `None` if no event is currently available or the channel is
+    /// closed.
+    pub fn try_next(&mut self) -> Option<DevToolsEvent> {
+        match self.events_rx.try_recv() {
+            Ok(event) => Some(event),
+            Err(_) => None,
+        }
     }
 }

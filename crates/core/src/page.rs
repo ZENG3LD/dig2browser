@@ -1,17 +1,20 @@
 //! StealthPage — the primary public page API.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use dig2browser_cookie::CookieJar;
 
-use crate::backend::PageBackend;
+use crate::backend::{BoundingBox, ElementHandle, PageBackend, PrintOptions};
+use crate::devtools::PageDevTools;
 use crate::error::BrowserError;
+use crate::wait::WaitBuilder;
 
 /// A browser page (tab) with stealth capabilities.
 ///
 /// Obtained via [`StealthBrowser::new_page`] or [`StealthBrowser::new_blank_page`].
 pub struct StealthPage {
-    pub(crate) backend: Box<dyn PageBackend>,
+    pub(crate) backend: Arc<dyn PageBackend>,
 }
 
 impl StealthPage {
@@ -68,6 +71,16 @@ impl StealthPage {
         self.backend.screenshot().await
     }
 
+    /// Capture a PNG screenshot of the full page (not just the viewport).
+    pub async fn screenshot_full(&self) -> Result<Vec<u8>, BrowserError> {
+        self.backend.screenshot_full_page().await
+    }
+
+    /// Print the page as a PDF and return the raw bytes.
+    pub async fn pdf(&self, options: PrintOptions) -> Result<Vec<u8>, BrowserError> {
+        self.backend.print_pdf(&options).await
+    }
+
     /// Sleep a human-like random delay (50–300 ms).
     pub async fn human_delay(&self) {
         use rand::Rng;
@@ -96,5 +109,93 @@ impl StealthPage {
     /// Set the page's cookies from a [`CookieJar`].
     pub async fn set_cookies(&self, jar: &CookieJar) -> Result<(), BrowserError> {
         self.backend.set_cookies(&jar.0).await
+    }
+
+    /// Find the first element matching the CSS `selector`.
+    pub async fn find(&self, selector: &str) -> Result<Element, BrowserError> {
+        let handle = self.backend.find_element(selector).await?;
+        Ok(Element {
+            handle,
+            backend: Arc::clone(&self.backend),
+        })
+    }
+
+    /// Find all elements matching the CSS `selector`.
+    pub async fn find_all(&self, selector: &str) -> Result<Vec<Element>, BrowserError> {
+        let handles = self.backend.find_elements(selector).await?;
+        Ok(handles
+            .into_iter()
+            .map(|handle| Element {
+                handle,
+                backend: Arc::clone(&self.backend),
+            })
+            .collect())
+    }
+
+    /// Create a wait builder for polling-based waiting.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use std::time::Duration;
+    /// # async fn example(page: &dig2browser_core::StealthPage) -> Result<(), dig2browser_core::BrowserError> {
+    /// let el = page.wait().at_most(Duration::from_secs(10)).for_element("#submit").await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn wait(&self) -> WaitBuilder<'_> {
+        WaitBuilder::new(self)
+    }
+
+    /// Subscribe to DevTools events for this page.
+    pub async fn devtools(&self) -> Result<PageDevTools, BrowserError> {
+        let rx = self.backend.subscribe_events().await?;
+        Ok(PageDevTools::new(rx))
+    }
+}
+
+// ── Element ──────────────────────────────────────────────────────────────────
+
+/// An element obtained from [`StealthPage::find`] or [`StealthPage::find_all`].
+///
+/// `Element` borrows the page's backend via `Arc`, so it can outlive the
+/// `StealthPage` reference but not the underlying browser session.
+pub struct Element {
+    pub(crate) handle: ElementHandle,
+    pub(crate) backend: Arc<dyn PageBackend>,
+}
+
+impl Element {
+    /// Click this element.
+    pub async fn click(&self) -> Result<(), BrowserError> {
+        self.backend.click_element(&self.handle).await
+    }
+
+    /// Type `text` into this element.
+    pub async fn type_text(&self, text: &str) -> Result<(), BrowserError> {
+        self.backend.type_into_element(&self.handle, text).await
+    }
+
+    /// Get the visible text content of this element.
+    pub async fn text(&self) -> Result<String, BrowserError> {
+        self.backend.element_text(&self.handle).await
+    }
+
+    /// Get the value of a named attribute, or `None` if absent.
+    pub async fn attribute(&self, name: &str) -> Result<Option<String>, BrowserError> {
+        self.backend.element_attribute(&self.handle, name).await
+    }
+
+    /// Get the outer HTML of this element.
+    pub async fn html(&self) -> Result<String, BrowserError> {
+        self.backend.element_html(&self.handle).await
+    }
+
+    /// Get the bounding box of this element.
+    pub async fn bounding_box(&self) -> Result<BoundingBox, BrowserError> {
+        self.backend.element_bounding_box(&self.handle).await
+    }
+
+    /// Capture a screenshot cropped to this element.
+    pub async fn screenshot(&self) -> Result<Vec<u8>, BrowserError> {
+        self.backend.screenshot_element(&self.handle).await
     }
 }

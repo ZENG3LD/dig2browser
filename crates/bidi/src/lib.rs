@@ -19,11 +19,16 @@
 //! ```
 
 mod error;
+mod events;
 mod modules;
 mod transport;
 mod types;
 
 pub use error::BiDiError;
-pub use modules::ScriptTarget;
+pub use events::{
+    BiDiEventStream, BiDiEventType, BiDiRequest, BiDiResponse, LogEntryAdded, LogSource,
+    NetworkBeforeRequestSent, NetworkResponseCompleted,
+};
+pub use modules::{BrowsingContext, NavigateResult, ScriptTarget};
 pub use transport::BiDiClient;
 pub use types::BiDiEvent;

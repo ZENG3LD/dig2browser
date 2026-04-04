@@ -22,9 +22,18 @@ mod transport;
 mod types;
 
 pub mod domains;
+pub mod events;
 
-pub use domains::{CdpCookie, RequestPattern, TargetInfo};
+pub use domains::{
+    BoxModel, CdpCookie, DomNode, HeaderEntry, MediaFeature, PrintToPdfOptions, RequestPattern,
+    TargetInfo, TouchPoint, Viewport,
+};
 pub use error::CdpError;
+pub use events::{
+    CdpEventType, EventStream, FetchRequestPaused, LogEntry, LogEntryAdded, NetworkRequest,
+    NetworkRequestWillBeSent, NetworkResponse, NetworkResponseReceived, PageFrameNavigated,
+    PageLoadEventFired, RuntimeConsoleApiCalled,
+};
 pub use session::CdpSession;
 pub use transport::CdpClient;
 pub use types::CdpEvent;

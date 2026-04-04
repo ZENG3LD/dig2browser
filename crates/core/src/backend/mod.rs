@@ -1,13 +1,14 @@
 //! Backend abstraction layer — protocol-agnostic traits for browser and page handles.
 //!
 //! All trait methods use `BoxFuture` so the traits are object-safe and can be
-//! stored as `Box<dyn BrowserBackend>` / `Box<dyn PageBackend>`.
+//! stored as `Arc<dyn PageBackend>`.
 
 pub mod bidi;
 pub mod cdp;
 
 use futures::future::BoxFuture;
 
+use crate::devtools::DevToolsEvent;
 use crate::error::BrowserError;
 
 /// A running browser instance capable of creating new pages.
@@ -52,4 +53,122 @@ pub trait PageBackend: Send + Sync {
         &'a self,
         cookies: &'a [dig2browser_cookie::Cookie],
     ) -> BoxFuture<'a, Result<(), BrowserError>>;
+
+    // ── Element interaction ────────────────────────────────────────────────
+
+    /// Find the first element matching `selector`.
+    fn find_element<'a>(
+        &'a self,
+        selector: &'a str,
+    ) -> BoxFuture<'a, Result<ElementHandle, BrowserError>>;
+
+    /// Find all elements matching `selector`.
+    fn find_elements<'a>(
+        &'a self,
+        selector: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<ElementHandle>, BrowserError>>;
+
+    /// Click an element at its center.
+    fn click_element<'a>(
+        &'a self,
+        element: &'a ElementHandle,
+    ) -> BoxFuture<'a, Result<(), BrowserError>>;
+
+    /// Type `text` into an element (focus first).
+    fn type_into_element<'a>(
+        &'a self,
+        element: &'a ElementHandle,
+        text: &'a str,
+    ) -> BoxFuture<'a, Result<(), BrowserError>>;
+
+    /// Get the visible text content of an element.
+    fn element_text<'a>(
+        &'a self,
+        element: &'a ElementHandle,
+    ) -> BoxFuture<'a, Result<String, BrowserError>>;
+
+    /// Get the value of a named attribute, or `None` if the attribute is absent.
+    fn element_attribute<'a>(
+        &'a self,
+        element: &'a ElementHandle,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<Option<String>, BrowserError>>;
+
+    /// Get the outer HTML of an element.
+    fn element_html<'a>(
+        &'a self,
+        element: &'a ElementHandle,
+    ) -> BoxFuture<'a, Result<String, BrowserError>>;
+
+    /// Get the bounding box (position + size) of an element.
+    fn element_bounding_box<'a>(
+        &'a self,
+        element: &'a ElementHandle,
+    ) -> BoxFuture<'a, Result<BoundingBox, BrowserError>>;
+
+    // ── PDF ───────────────────────────────────────────────────────────────
+
+    /// Print the page as a PDF and return the raw bytes.
+    fn print_pdf<'a>(
+        &'a self,
+        options: &'a PrintOptions,
+    ) -> BoxFuture<'a, Result<Vec<u8>, BrowserError>>;
+
+    // ── Enhanced screenshots ───────────────────────────────────────────────
+
+    /// Capture a screenshot of the full page (not just the viewport).
+    fn screenshot_full_page<'a>(&'a self) -> BoxFuture<'a, Result<Vec<u8>, BrowserError>>;
+
+    /// Capture a screenshot cropped to a specific element.
+    fn screenshot_element<'a>(
+        &'a self,
+        element: &'a ElementHandle,
+    ) -> BoxFuture<'a, Result<Vec<u8>, BrowserError>>;
+
+    // ── DevTools events ───────────────────────────────────────────────────
+
+    /// Subscribe to DevTools events for this page.
+    fn subscribe_events<'a>(
+        &'a self,
+    ) -> BoxFuture<'a, Result<tokio::sync::broadcast::Receiver<DevToolsEvent>, BrowserError>>;
+}
+
+// ── Shared types ────────────────────────────────────────────────────────────
+
+/// Opaque handle to a DOM element.
+///
+/// The internals are backend-specific: CDP stores a node_id + optional
+/// remote objectId; WebDriver stores an element UUID.
+#[derive(Debug, Clone)]
+pub struct ElementHandle {
+    pub(crate) inner: ElementInner,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum ElementInner {
+    Cdp {
+        node_id: i64,
+    },
+    WebDriver {
+        element_id: String,
+    },
+}
+
+/// Bounding box of a DOM element in page-space pixels.
+#[derive(Debug, Clone)]
+pub struct BoundingBox {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// Options for PDF printing via [`PageBackend::print_pdf`].
+#[derive(Debug, Clone, Default)]
+pub struct PrintOptions {
+    pub landscape: bool,
+    pub print_background: bool,
+    pub scale: Option<f64>,
+    pub paper_width: Option<f64>,
+    pub paper_height: Option<f64>,
 }

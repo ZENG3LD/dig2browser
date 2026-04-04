@@ -8,6 +8,7 @@ use std::sync::{
     Arc,
 };
 
+use base64::Engine;
 use futures::future::BoxFuture;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::debug;
@@ -17,8 +18,9 @@ use dig2browser_cookie::Cookie;
 use dig2browser_detect::{LaunchConfig, detect_browser};
 use dig2browser_stealth::{StealthConfig, get_scripts};
 
+use crate::devtools::DevToolsEvent;
 use crate::error::BrowserError;
-use super::{BrowserBackend, PageBackend};
+use super::{BrowserBackend, BoundingBox, ElementHandle, ElementInner, PageBackend, PrintOptions};
 
 // ── Process handle ─────────────────────────────────────────────────────────
 
@@ -241,7 +243,7 @@ impl BrowserBackend for CdpBrowserBackend {
 /// CDP-backed page handle.
 pub(crate) struct CdpPageBackend {
     session: CdpSession,
-    /// Kept for future use (e.g. closing the target explicitly).
+    /// Kept so callers can close the target explicitly if needed.
     target_id: String,
 }
 
@@ -336,6 +338,473 @@ impl PageBackend for CdpPageBackend {
             }
             Ok(())
         })
+    }
+
+    // ── Element interaction ────────────────────────────────────────────────
+
+    fn find_element<'a>(
+        &'a self,
+        selector: &'a str,
+    ) -> BoxFuture<'a, Result<ElementHandle, BrowserError>> {
+        Box::pin(async move {
+            self.session
+                .enable_dom()
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            let doc = self
+                .session
+                .get_document()
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            let node_id = self
+                .session
+                .query_selector(doc.node_id, selector)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?
+                .ok_or_else(|| {
+                    BrowserError::Other(format!("element not found: {selector}"))
+                })?;
+
+            Ok(ElementHandle {
+                inner: ElementInner::Cdp { node_id },
+            })
+        })
+    }
+
+    fn find_elements<'a>(
+        &'a self,
+        selector: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<ElementHandle>, BrowserError>> {
+        Box::pin(async move {
+            self.session
+                .enable_dom()
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            let doc = self
+                .session
+                .get_document()
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            let node_ids = self
+                .session
+                .query_selector_all(doc.node_id, selector)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            let handles = node_ids
+                .into_iter()
+                .map(|node_id| ElementHandle {
+                    inner: ElementInner::Cdp { node_id },
+                })
+                .collect();
+
+            Ok(handles)
+        })
+    }
+
+    fn click_element<'a>(
+        &'a self,
+        element: &'a ElementHandle,
+    ) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move {
+            let node_id = cdp_node_id(element)?;
+
+            // Scroll the element into view first.
+            self.session
+                .scroll_into_view(node_id)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            // Get the bounding box to compute the center.
+            let bbox = self
+                .session
+                .get_box_model(node_id)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            // content quad is [x1,y1, x2,y2, x3,y3, x4,y4].
+            let (cx, cy) = quad_center(&bbox.content);
+
+            self.session
+                .mouse_click(cx, cy)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))
+        })
+    }
+
+    fn type_into_element<'a>(
+        &'a self,
+        element: &'a ElementHandle,
+        text: &'a str,
+    ) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move {
+            let node_id = cdp_node_id(element)?;
+
+            self.session
+                .focus(node_id)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            self.session
+                .type_text(text)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))
+        })
+    }
+
+    fn element_text<'a>(
+        &'a self,
+        element: &'a ElementHandle,
+    ) -> BoxFuture<'a, Result<String, BrowserError>> {
+        Box::pin(async move {
+            let node_id = cdp_node_id(element)?;
+
+            // Resolve to a JS remote object so we can call functions on it.
+            let object_id = self
+                .session
+                .resolve_node(node_id)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            let result = self
+                .session
+                .call(
+                    "Runtime.callFunctionOn",
+                    Some(serde_json::json!({
+                        "objectId": object_id,
+                        "functionDeclaration": "function() { return this.textContent; }",
+                        "returnByValue": true,
+                    })),
+                )
+                .await
+                .map_err(|e| BrowserError::JsEval(e.to_string()))?;
+
+            Ok(result["result"]["value"]
+                .as_str()
+                .unwrap_or("")
+                .to_owned())
+        })
+    }
+
+    fn element_attribute<'a>(
+        &'a self,
+        element: &'a ElementHandle,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<Option<String>, BrowserError>> {
+        Box::pin(async move {
+            let node_id = cdp_node_id(element)?;
+
+            let object_id = self
+                .session
+                .resolve_node(node_id)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            let attr_name = name.to_owned();
+            let result = self
+                .session
+                .call(
+                    "Runtime.callFunctionOn",
+                    Some(serde_json::json!({
+                        "objectId": object_id,
+                        "functionDeclaration": "function(n) { return this.getAttribute(n); }",
+                        "arguments": [{ "value": attr_name }],
+                        "returnByValue": true,
+                    })),
+                )
+                .await
+                .map_err(|e| BrowserError::JsEval(e.to_string()))?;
+
+            let val = &result["result"]["value"];
+            if val.is_null() || val.is_string() && val.as_str() == Some("null") {
+                Ok(None)
+            } else {
+                Ok(val.as_str().map(|s| s.to_owned()))
+            }
+        })
+    }
+
+    fn element_html<'a>(
+        &'a self,
+        element: &'a ElementHandle,
+    ) -> BoxFuture<'a, Result<String, BrowserError>> {
+        Box::pin(async move {
+            let node_id = cdp_node_id(element)?;
+
+            self.session
+                .get_outer_html(node_id)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))
+        })
+    }
+
+    fn element_bounding_box<'a>(
+        &'a self,
+        element: &'a ElementHandle,
+    ) -> BoxFuture<'a, Result<BoundingBox, BrowserError>> {
+        Box::pin(async move {
+            let node_id = cdp_node_id(element)?;
+
+            let model = self
+                .session
+                .get_box_model(node_id)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            // border quad: x1,y1, x2,y2, x3,y3, x4,y4
+            let b = &model.border;
+            if b.len() < 8 {
+                return Err(BrowserError::Other(
+                    "invalid box model: border quad has fewer than 8 values".into(),
+                ));
+            }
+            // top-left corner = (b[0], b[1]), width and height from CDP model.
+            Ok(BoundingBox {
+                x: b[0],
+                y: b[1],
+                width: model.width as f64,
+                height: model.height as f64,
+            })
+        })
+    }
+
+    // ── PDF ───────────────────────────────────────────────────────────────
+
+    fn print_pdf<'a>(
+        &'a self,
+        options: &'a PrintOptions,
+    ) -> BoxFuture<'a, Result<Vec<u8>, BrowserError>> {
+        Box::pin(async move {
+            let mut params = serde_json::json!({
+                "landscape": options.landscape,
+                "printBackground": options.print_background,
+            });
+
+            if let Some(scale) = options.scale {
+                params["scale"] = serde_json::Value::from(scale);
+            }
+            if let Some(w) = options.paper_width {
+                params["paperWidth"] = serde_json::Value::from(w);
+            }
+            if let Some(h) = options.paper_height {
+                params["paperHeight"] = serde_json::Value::from(h);
+            }
+
+            let result = self
+                .session
+                .call("Page.printToPDF", Some(params))
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            let encoded = result["data"]
+                .as_str()
+                .ok_or_else(|| BrowserError::Other("missing data in Page.printToPDF response".into()))?;
+
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|e| BrowserError::Other(format!("base64 decode error: {e}")))?;
+
+            Ok(bytes)
+        })
+    }
+
+    // ── Enhanced screenshots ───────────────────────────────────────────────
+
+    fn screenshot_full_page<'a>(&'a self) -> BoxFuture<'a, Result<Vec<u8>, BrowserError>> {
+        Box::pin(async move {
+            // Get the full page dimensions via JS.
+            let dims = self
+                .session
+                .evaluate("JSON.stringify({ w: document.documentElement.scrollWidth, h: document.documentElement.scrollHeight })")
+                .await
+                .map_err(|e| BrowserError::JsEval(e.to_string()))?;
+
+            let dims_str = dims["value"].as_str().unwrap_or(r#"{"w":1280,"h":800}"#);
+            let dims_val: serde_json::Value =
+                serde_json::from_str(dims_str).unwrap_or(serde_json::json!({"w":1280,"h":800}));
+            let w = dims_val["w"].as_f64().unwrap_or(1280.0);
+            let h = dims_val["h"].as_f64().unwrap_or(800.0);
+
+            let result = self
+                .session
+                .call(
+                    "Page.captureScreenshot",
+                    Some(serde_json::json!({
+                        "format": "png",
+                        "clip": {
+                            "x": 0,
+                            "y": 0,
+                            "width": w,
+                            "height": h,
+                            "scale": 1,
+                        },
+                        "captureBeyondViewport": true,
+                    })),
+                )
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            let encoded = result["data"]
+                .as_str()
+                .ok_or_else(|| BrowserError::Other("missing data in captureScreenshot response".into()))?;
+
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|e| BrowserError::Other(format!("base64 decode error: {e}")))
+        })
+    }
+
+    fn screenshot_element<'a>(
+        &'a self,
+        element: &'a ElementHandle,
+    ) -> BoxFuture<'a, Result<Vec<u8>, BrowserError>> {
+        Box::pin(async move {
+            let node_id = cdp_node_id(element)?;
+
+            self.session
+                .scroll_into_view(node_id)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            let model = self
+                .session
+                .get_box_model(node_id)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            let b = &model.border;
+            if b.len() < 8 {
+                return Err(BrowserError::Other(
+                    "invalid box model: border quad has fewer than 8 values".into(),
+                ));
+            }
+
+            let x = b[0];
+            let y = b[1];
+            let w = model.width as f64;
+            let h = model.height as f64;
+
+            let result = self
+                .session
+                .call(
+                    "Page.captureScreenshot",
+                    Some(serde_json::json!({
+                        "format": "png",
+                        "clip": {
+                            "x": x,
+                            "y": y,
+                            "width": w,
+                            "height": h,
+                            "scale": 1,
+                        },
+                    })),
+                )
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            let encoded = result["data"]
+                .as_str()
+                .ok_or_else(|| BrowserError::Other("missing data in captureScreenshot response".into()))?;
+
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|e| BrowserError::Other(format!("base64 decode error: {e}")))
+        })
+    }
+
+    // ── DevTools events ───────────────────────────────────────────────────
+
+    fn subscribe_events<'a>(
+        &'a self,
+    ) -> BoxFuture<'a, Result<tokio::sync::broadcast::Receiver<DevToolsEvent>, BrowserError>> {
+        Box::pin(async move {
+            // CDP events flow through the client's broadcast channel.
+            // We bridge CdpEvent → DevToolsEvent in a background task and
+            // provide the caller with a broadcast::Receiver<DevToolsEvent>.
+            let (tx, rx) = tokio::sync::broadcast::channel(256);
+            let mut cdp_rx = self.session.client().subscribe();
+
+            tokio::spawn(async move {
+                loop {
+                    match cdp_rx.recv().await {
+                        Ok(event) => {
+                            let dt_event = bridge_cdp_event(event);
+                            if let Some(e) = dt_event {
+                                // If all receivers dropped, stop the bridge.
+                                if tx.send(e).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    }
+                }
+            });
+
+            Ok(rx)
+        })
+    }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Extract the CDP node_id from an ElementHandle, returning an error if the
+/// handle is for a different backend.
+fn cdp_node_id(element: &ElementHandle) -> Result<i64, BrowserError> {
+    match &element.inner {
+        ElementInner::Cdp { node_id } => Ok(*node_id),
+        ElementInner::WebDriver { .. } => Err(BrowserError::Other(
+            "ElementHandle is a WebDriver handle, not a CDP handle".into(),
+        )),
+    }
+}
+
+/// Compute the center of a content/border/etc. quad (8-element slice).
+fn quad_center(quad: &[f64]) -> (f64, f64) {
+    if quad.len() < 8 {
+        return (0.0, 0.0);
+    }
+    let cx = (quad[0] + quad[2] + quad[4] + quad[6]) / 4.0;
+    let cy = (quad[1] + quad[3] + quad[5] + quad[7]) / 4.0;
+    (cx, cy)
+}
+
+/// Map a raw CDP event into a `DevToolsEvent` if it's relevant.
+fn bridge_cdp_event(event: dig2browser_cdp::CdpEvent) -> Option<DevToolsEvent> {
+    use crate::devtools::{ConsoleEvent, NetworkEvent};
+
+    match event.method.as_str() {
+        m if m.starts_with("Network.") => {
+            let params = event.params.unwrap_or(serde_json::Value::Null);
+            let url = params["response"]["url"]
+                .as_str()
+                .or_else(|| params["request"]["url"].as_str())
+                .map(|s| s.to_owned());
+            let status = params["response"]["status"].as_u64().map(|s| s as u16);
+            Some(DevToolsEvent::Network(NetworkEvent {
+                method: event.method,
+                url,
+                status,
+                params,
+            }))
+        }
+        "Runtime.consoleAPICalled" => {
+            let params = event.params.unwrap_or(serde_json::Value::Null);
+            let level = params["type"].as_str().unwrap_or("log").to_owned();
+            let text = params["args"]
+                .as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|v| v["value"].as_str())
+                .unwrap_or("")
+                .to_owned();
+            Some(DevToolsEvent::Console(ConsoleEvent { level, text }))
+        }
+        _ => None,
     }
 }
 

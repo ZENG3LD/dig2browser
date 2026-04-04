@@ -16,18 +16,28 @@
 //! # }
 //! ```
 
+mod actions;
+mod alert;
 mod client;
 mod cookie;
 mod element;
 mod error;
 mod eval;
+mod frame;
 mod nav;
+mod print;
 mod screenshot;
 mod session;
+mod timeout;
 mod types;
 mod window;
 
+pub use actions::ActionChain;
 pub use client::WdClient;
+pub use element::ElementRect;
 pub use error::WdError;
+pub use frame::FrameId;
+pub use print::{PrintMargin, PrintOptions, PrintPage};
 pub use session::WdSession;
+pub use timeout::Timeouts;
 pub use types::{Capabilities, WdCookie, WdElement};

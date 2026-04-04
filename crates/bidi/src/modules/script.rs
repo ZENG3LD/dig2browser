@@ -87,4 +87,40 @@ impl BiDiClient {
             .await?;
         Ok(result)
     }
+
+    /// Evaluate a JavaScript expression in the specified realm.
+    pub async fn evaluate_in_realm(
+        self: &Arc<Self>,
+        expression: &str,
+        realm: &str,
+    ) -> Result<serde_json::Value, BiDiError> {
+        let result = self
+            .call(
+                "script.evaluate",
+                serde_json::json!({
+                    "expression": expression,
+                    "target": { "realm": realm },
+                    "awaitPromise": true,
+                }),
+            )
+            .await?;
+        Ok(result)
+    }
+
+    /// Release remote object handles, freeing memory on the browser side.
+    pub async fn disown(
+        self: &Arc<Self>,
+        handles: Vec<String>,
+        target: ScriptTarget,
+    ) -> Result<(), BiDiError> {
+        self.call(
+            "script.disown",
+            serde_json::json!({
+                "handles": handles,
+                "target": { "context": target.context },
+            }),
+        )
+        .await?;
+        Ok(())
+    }
 }

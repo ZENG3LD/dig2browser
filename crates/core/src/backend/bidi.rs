@@ -15,10 +15,11 @@ use dig2browser_bidi::BiDiClient;
 use dig2browser_cookie::Cookie;
 use dig2browser_detect::{LaunchConfig, BrowserPreference, detect_browser};
 use dig2browser_stealth::{StealthConfig, get_scripts};
-use dig2browser_webdriver::{Capabilities, WdClient, WdSession};
+use dig2browser_webdriver::{Capabilities, WdClient, WdSession, WdElement};
 
+use crate::devtools::DevToolsEvent;
 use crate::error::BrowserError;
-use super::{BrowserBackend, PageBackend};
+use super::{BrowserBackend, BoundingBox, ElementHandle, ElementInner, PageBackend, PrintOptions};
 
 // ── Browser backend ────────────────────────────────────────────────────────
 
@@ -38,8 +39,8 @@ impl BiDiBrowserBackend {
         launch: &LaunchConfig,
         stealth: &StealthConfig,
     ) -> Result<Self, BrowserError> {
-        let binary = detect_browser(BrowserPreference::Firefox)?;
-        debug!("Launching Firefox: {}", binary.path.display());
+        let _binary = detect_browser(BrowserPreference::Firefox)?;
+        debug!("Launching Firefox: {}", _binary.path.display());
 
         // Spawn Firefox with remote debugging + geckodriver compatibility.
         // Firefox requires geckodriver as the WebDriver intermediary.
@@ -315,4 +316,341 @@ impl PageBackend for BiDiPageBackend {
             Ok(())
         })
     }
+
+    // ── Element interaction ────────────────────────────────────────────────
+
+    fn find_element<'a>(
+        &'a self,
+        selector: &'a str,
+    ) -> BoxFuture<'a, Result<ElementHandle, BrowserError>> {
+        Box::pin(async move {
+            self.wd_session
+                .switch_to_window(&self.window_handle)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            let el = self
+                .wd_session
+                .find_element("css selector", selector)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            Ok(ElementHandle {
+                inner: ElementInner::WebDriver {
+                    element_id: el.element_id,
+                },
+            })
+        })
+    }
+
+    fn find_elements<'a>(
+        &'a self,
+        selector: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<ElementHandle>, BrowserError>> {
+        Box::pin(async move {
+            self.wd_session
+                .switch_to_window(&self.window_handle)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            let els = self
+                .wd_session
+                .find_elements("css selector", selector)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            Ok(els
+                .into_iter()
+                .map(|el| ElementHandle {
+                    inner: ElementInner::WebDriver {
+                        element_id: el.element_id,
+                    },
+                })
+                .collect())
+        })
+    }
+
+    fn click_element<'a>(
+        &'a self,
+        element: &'a ElementHandle,
+    ) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move {
+            let wd_el = wd_element(element)?;
+            self.wd_session
+                .switch_to_window(&self.window_handle)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            self.wd_session
+                .click(&wd_el)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))
+        })
+    }
+
+    fn type_into_element<'a>(
+        &'a self,
+        element: &'a ElementHandle,
+        text: &'a str,
+    ) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move {
+            let wd_el = wd_element(element)?;
+            self.wd_session
+                .switch_to_window(&self.window_handle)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            self.wd_session
+                .send_keys(&wd_el, text)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))
+        })
+    }
+
+    fn element_text<'a>(
+        &'a self,
+        element: &'a ElementHandle,
+    ) -> BoxFuture<'a, Result<String, BrowserError>> {
+        Box::pin(async move {
+            let wd_el = wd_element(element)?;
+            self.wd_session
+                .switch_to_window(&self.window_handle)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            self.wd_session
+                .element_text(&wd_el)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))
+        })
+    }
+
+    fn element_attribute<'a>(
+        &'a self,
+        element: &'a ElementHandle,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<Option<String>, BrowserError>> {
+        Box::pin(async move {
+            let wd_el = wd_element(element)?;
+            self.wd_session
+                .switch_to_window(&self.window_handle)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            self.wd_session
+                .element_attribute(&wd_el, name)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))
+        })
+    }
+
+    fn element_html<'a>(
+        &'a self,
+        element: &'a ElementHandle,
+    ) -> BoxFuture<'a, Result<String, BrowserError>> {
+        Box::pin(async move {
+            let wd_el = wd_element(element)?;
+            self.wd_session
+                .switch_to_window(&self.window_handle)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            // Use execute_sync to get outerHTML via the element reference.
+            let el_json = serde_json::json!({
+                "element-6066-11e4-a52e-4f735466cecf": wd_el.element_id
+            });
+            let result = self
+                .wd_session
+                .execute_sync("return arguments[0].outerHTML", vec![el_json])
+                .await
+                .map_err(|e| BrowserError::JsEval(e.to_string()))?;
+
+            Ok(result.as_str().unwrap_or("").to_owned())
+        })
+    }
+
+    fn element_bounding_box<'a>(
+        &'a self,
+        element: &'a ElementHandle,
+    ) -> BoxFuture<'a, Result<BoundingBox, BrowserError>> {
+        Box::pin(async move {
+            let wd_el = wd_element(element)?;
+            self.wd_session
+                .switch_to_window(&self.window_handle)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            let rect = self
+                .wd_session
+                .element_rect(&wd_el)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            Ok(BoundingBox {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+            })
+        })
+    }
+
+    // ── PDF ───────────────────────────────────────────────────────────────
+
+    fn print_pdf<'a>(
+        &'a self,
+        options: &'a PrintOptions,
+    ) -> BoxFuture<'a, Result<Vec<u8>, BrowserError>> {
+        Box::pin(async move {
+            self.wd_session
+                .switch_to_window(&self.window_handle)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            let wd_opts = dig2browser_webdriver::PrintOptions {
+                orientation: if options.landscape {
+                    Some("landscape".to_owned())
+                } else {
+                    Some("portrait".to_owned())
+                },
+                scale: options.scale,
+                background: if options.print_background { Some(true) } else { None },
+                page: options.paper_width.zip(options.paper_height).map(|(w, h)| {
+                    dig2browser_webdriver::PrintPage { width: w, height: h }
+                }),
+                margin: None,
+            };
+
+            let result = self
+                .wd_session
+                .print_pdf(wd_opts)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            Ok(result)
+        })
+    }
+
+    // ── Enhanced screenshots ───────────────────────────────────────────────
+
+    fn screenshot_full_page<'a>(&'a self) -> BoxFuture<'a, Result<Vec<u8>, BrowserError>> {
+        Box::pin(async move {
+            self.wd_session
+                .switch_to_window(&self.window_handle)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            // Scroll to max to trigger lazy loading, then take screenshot.
+            // WebDriver screenshot already returns full-page in Firefox.
+            let _ = self
+                .wd_session
+                .execute_sync(
+                    "window.scrollTo(0, document.body.scrollHeight)",
+                    vec![],
+                )
+                .await;
+
+            // Brief yield so the browser processes the scroll.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            self.wd_session
+                .screenshot()
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))
+        })
+    }
+
+    fn screenshot_element<'a>(
+        &'a self,
+        element: &'a ElementHandle,
+    ) -> BoxFuture<'a, Result<Vec<u8>, BrowserError>> {
+        Box::pin(async move {
+            let wd_el = wd_element(element)?;
+            self.wd_session
+                .switch_to_window(&self.window_handle)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            let bytes = self
+                .wd_session
+                .element_screenshot(&wd_el)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            Ok(bytes)
+        })
+    }
+
+    // ── DevTools events ───────────────────────────────────────────────────
+
+    fn subscribe_events<'a>(
+        &'a self,
+    ) -> BoxFuture<'a, Result<tokio::sync::broadcast::Receiver<DevToolsEvent>, BrowserError>> {
+        Box::pin(async move {
+            // Subscribe to BiDi events and bridge to DevToolsEvent.
+            let (tx, rx) = tokio::sync::broadcast::channel::<DevToolsEvent>(256);
+            let mut bidi_rx = self._bidi.subscribe();
+
+            tokio::spawn(async move {
+                loop {
+                    match bidi_rx.recv().await {
+                        Ok(event) => {
+                            let dt_event = bridge_bidi_event(event);
+                            if let Some(e) = dt_event {
+                                if tx.send(e).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    }
+                }
+            });
+
+            Ok(rx)
+        })
+    }
 }
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Extract a `WdElement` from an `ElementHandle`, returning an error if it's
+/// a CDP handle.
+fn wd_element(element: &ElementHandle) -> Result<WdElement, BrowserError> {
+    match &element.inner {
+        ElementInner::WebDriver { element_id } => Ok(WdElement {
+            element_id: element_id.clone(),
+        }),
+        ElementInner::Cdp { .. } => Err(BrowserError::Other(
+            "ElementHandle is a CDP handle, not a WebDriver handle".into(),
+        )),
+    }
+}
+
+/// Map a raw BiDi event into a `DevToolsEvent` if it's relevant.
+fn bridge_bidi_event(event: dig2browser_bidi::BiDiEvent) -> Option<DevToolsEvent> {
+    use crate::devtools::{ConsoleEvent, NetworkEvent};
+
+    match event.method.as_str() {
+        m if m.starts_with("network.") => {
+            let params = event.params.clone();
+            let url = params["request"]["url"].as_str().map(|s| s.to_owned());
+            let status = params["response"]["status"].as_u64().map(|s| s as u16);
+            Some(DevToolsEvent::Network(NetworkEvent {
+                method: event.method,
+                url,
+                status,
+                params,
+            }))
+        }
+        "log.entryAdded" => {
+            let params = event.params.clone();
+            let level = params["level"].as_str().unwrap_or("log").to_owned();
+            let text = params["text"].as_str().unwrap_or("").to_owned();
+            Some(DevToolsEvent::Console(ConsoleEvent { level, text }))
+        }
+        _ => None,
+    }
+}
+
