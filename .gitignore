@@ -3,3 +3,7 @@
 # Test artifacts
 *.png
 *.pdf
+
+# Bot auth private keys — NEVER commit
+keys/
+*.key

@@ -1,6 +1,6 @@
 # dig2browser
 
-Stealth browser automation library for Rust. Custom CDP + WebDriver + BiDi backends — zero external browser-automation dependencies.
+Stealth browser automation library for Rust with **Web Bot Auth** support. Custom CDP + WebDriver + BiDi backends — zero external browser-automation dependencies.
 
 Multi-browser support: **Chrome**, **Edge**, **Firefox**. Built-in anti-detection with 16 stealth scripts, cookie management (Chrome DPAPI + Firefox plaintext), and agent-friendly DevTools access.
 
@@ -27,6 +27,7 @@ dig2browser/
 │   ├── stealth/    # 16 JS anti-detection scripts (690 LOC)
 │   ├── cookie/     # Chrome DPAPI + Firefox plaintext readers (780 LOC)
 │   ├── detect/     # Browser binary detection + launch args (280 LOC)
+│   ├── bot_auth/   # Web Bot Auth: Ed25519 signing, JWKS, key management (250 LOC)
 │   └── core/       # StealthBrowser, StealthPage, BrowserPool (2400 LOC)
 └── src/lib.rs      # Re-export facade
 ```
@@ -41,7 +42,8 @@ dig2browser (facade)
         ├── bidi
         ├── stealth
         ├── cookie
-        └── detect
+        ├── detect
+        └── bot_auth (web-bot-auth crate)
 ```
 
 No circular dependencies. Leaf crates (`stealth`, `cookie`, `detect`) have zero protocol deps.
@@ -206,6 +208,63 @@ let pdf = page.pdf(PrintOptions {
 std::fs::write("page.pdf", &pdf)?;
 ```
 
+## Web Bot Auth
+
+Cryptographic bot identity using [RFC 9421 HTTP Message Signatures](https://datatracker.ietf.org/doc/html/rfc9421). Instead of stealth evasion, your crawler proves its identity to CDN providers (Cloudflare, Akamai, DataDome, HUMAN Security, AWS) with Ed25519 signatures.
+
+One implementation covers all providers — they all support the same [Web Bot Auth standard](https://developers.cloudflare.com/bots/reference/bot-verification/web-bot-auth/).
+
+### Setup
+
+```rust
+use dig2browser::bot_auth::*;
+
+// 1. Generate a keypair (or load existing)
+let keypair = BotKeyPair::load_or_generate(Path::new("keys/my-bot.key"))?;
+
+// 2. Generate JWKS directory for hosting
+let jwks = JwksDirectory::from_keypair(&keypair);
+jwks.save_to_file(Path::new("public/.well-known/http-message-signatures-directory"))?;
+println!("JWKS:\n{}", jwks.to_json());
+
+// 3. Create identity
+let identity = BotIdentity::new(
+    "my-crawler",
+    "https://github.com/you/my-crawler",
+    "https://you.github.io/.well-known/http-message-signatures-directory",
+    "keys/my-bot.key",
+);
+
+// 4. Sign requests
+let signer = RequestSigner::from_identity(identity)?;
+let headers = signer.sign_request("GET", "https://example.com/data")?;
+
+// 5. Attach to reqwest
+let resp = client.get(url)
+    .header("Signature-Agent", &headers.signature_agent)
+    .header("Signature-Input", &headers.signature_input)
+    .header("Signature", &headers.signature)
+    .send().await?;
+```
+
+### How to Register Your Bot
+
+| Provider | Registration | Docs |
+|----------|-------------|------|
+| **Cloudflare** | [Verified Bots form](https://developers.cloudflare.com/bots/concepts/bot/#verified-bots) | [Web Bot Auth docs](https://developers.cloudflare.com/bots/reference/bot-verification/web-bot-auth/) |
+| **Akamai** | [Bot Registration](https://www.akamai.com/lp/bot-agent-registration) | [Blog post](https://www.akamai.com/blog/security/2025/nov/redefine-trust-web-bot-authentication) |
+| **DataDome** | [Bot Authentication](https://docs.datadome.co/docs/bot-authentication) | Automatic if JWKS hosted |
+| **HUMAN Security** | Contact via site | [Announcement](https://www.humansecurity.com/newsroom/) |
+| **AWS Bedrock** | [AgentCore docs](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/browser-web-bot-auth.html) | Automatic |
+
+**Steps:**
+1. Generate keypair: `BotKeyPair::generate()` or `BotKeyPair::load_or_generate(path)`
+2. Host the JWKS JSON at a public URL (GitHub Pages works: `/.well-known/http-message-signatures-directory`)
+3. Register with each provider using the links above (provide your JWKS URL + bot homepage)
+4. Sign all requests with `RequestSigner` — the 3 headers are added automatically
+
+**Security:** Never commit your private key (`*.key`). Add `keys/` and `*.key` to `.gitignore`.
+
 ## CDP Domains
 
 Hand-written typed helpers for 10 domains:
@@ -287,7 +346,8 @@ Firefox-equivalent of CDP capabilities:
 - [ ] Proxy configuration
 - [ ] HAR export
 - [ ] Trace recording/replay
-- [ ] crates.io publish
+- [x] crates.io publish
+- [x] Web Bot Auth (Ed25519 signing, JWKS, RFC 9421)
 
 ## Support the Project
 
