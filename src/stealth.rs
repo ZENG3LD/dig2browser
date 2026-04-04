@@ -132,14 +132,14 @@ pub fn get_scripts(config: &StealthConfig) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Inject function
+// Inject functions
 // ---------------------------------------------------------------------------
 
-/// Injects all stealth scripts into `page` via `AddScriptToEvaluateOnNewDocument`.
+/// Injects all stealth scripts into a CDP page via `AddScriptToEvaluateOnNewDocument`.
 ///
 /// Call this immediately after creating a page and before any navigation so
 /// the scripts run on every subsequent page load in the tab.
-pub async fn inject_stealth(
+pub(crate) async fn inject_stealth_cdp(
     page: &chromiumoxide::Page,
     config: &StealthConfig,
 ) -> Result<(), BrowserError> {
@@ -159,32 +159,33 @@ pub async fn inject_stealth(
     Ok(())
 }
 
+/// Injects all stealth scripts into a Firefox WebDriver session via `execute`.
+///
+/// Unlike the CDP path (which uses `AddScriptToEvaluateOnNewDocument`), WebDriver
+/// has no persistent preload mechanism. Scripts are concatenated into IIFEs and
+/// executed once after each navigation.
+#[cfg(feature = "firefox")]
+pub(crate) async fn inject_stealth_webdriver(
+    client: &fantoccini::Client,
+    config: &StealthConfig,
+) -> Result<(), BrowserError> {
+    let combined = get_scripts(config)
+        .into_iter()
+        .map(|s| format!("(function() {{ {} }})();", s))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    client
+        .execute(&combined, vec![])
+        .await
+        .map_err(|e| BrowserError::StealthInject(e.to_string()))?;
+    Ok(())
+}
+
 /// Human-like random delay between 100–300 ms.
 pub async fn human_delay() {
     let delay_ms = 100 + (rand::random::<u64>() % 200);
     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-}
-
-/// Simulate a human scrolling the page.
-pub async fn human_scroll(page: &chromiumoxide::Page) -> Result<(), BrowserError> {
-    let script = r#"
-        async function smoothScroll() {
-            const totalHeight = document.body.scrollHeight;
-            const viewportHeight = window.innerHeight;
-            let currentPosition = 0;
-            while (currentPosition < totalHeight) {
-                window.scrollTo(0, currentPosition);
-                currentPosition += viewportHeight * 0.3;
-                await new Promise(resolve => setTimeout(resolve, 100 + Math.random() * 200));
-            }
-            window.scrollTo(0, totalHeight);
-        }
-        smoothScroll();
-    "#;
-    page.evaluate(script)
-        .await
-        .map_err(|e| BrowserError::JsEval(e.to_string()))?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

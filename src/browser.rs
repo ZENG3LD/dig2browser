@@ -1,49 +1,26 @@
-use std::path::PathBuf;
-use std::process::Stdio;
-
-use chromiumoxide::Browser;
-use chromiumoxide::cdp::browser_protocol::emulation::SetTimezoneOverrideParams;
-use futures::StreamExt;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Child;
-
+use crate::backend::CdpBrowser;
+use crate::backend::BrowserInner;
+#[cfg(feature = "firefox")]
+use crate::backend::WebDriverBrowser;
+#[cfg(feature = "firefox")]
+use crate::browser_detect::BrowserPreference;
 use crate::browser_args::LaunchConfig;
-use crate::browser_detect::detect_browser;
 use crate::error::BrowserError;
 use crate::page::StealthPage;
-use crate::stealth::{self, StealthConfig};
-
-// ---------------------------------------------------------------------------
-// Profile dir newtype
-// ---------------------------------------------------------------------------
-
-enum ProfileDir {
-    Ephemeral(PathBuf),
-    Persistent(PathBuf),
-}
-
-impl ProfileDir {
-    fn path(&self) -> &PathBuf {
-        match self {
-            Self::Ephemeral(p) | Self::Persistent(p) => p,
-        }
-    }
-
-    fn is_ephemeral(&self) -> bool {
-        matches!(self, Self::Ephemeral(_))
-    }
-}
+use crate::stealth::StealthConfig;
 
 // ---------------------------------------------------------------------------
 // StealthBrowser
 // ---------------------------------------------------------------------------
 
+/// Multi-backend browser handle.
+///
+/// Dispatches all operations to the correct backend via `BrowserInner`:
+/// - Without the `firefox` feature: always a CDP (Chrome/Edge) backend.
+/// - With `firefox` feature: CDP for Chrome/Edge or WebDriver for Firefox
+///   depending on `LaunchConfig::browser_pref`.
 pub struct StealthBrowser {
-    browser: Browser,
-    _handler: tokio::task::JoinHandle<()>,
-    _process: Option<Child>,
-    profile_dir: ProfileDir,
-    stealth: StealthConfig,
+    inner: BrowserInner,
 }
 
 impl StealthBrowser {
@@ -54,197 +31,153 @@ impl StealthBrowser {
 
     /// Launch with explicit config.
     ///
-    /// Follows the proven pattern from daemon4russian-parser: spawn the browser
-    /// process manually, read stderr for the DevTools WebSocket URL, then
-    /// connect via `Browser::connect` — avoiding the race condition that
-    /// `Browser::launch` has on Windows.
+    /// For Chrome/Edge: spawns the browser process and connects via CDP.
+    /// For Firefox: connects to an already-running geckodriver.
     pub async fn launch_with(
         launch: LaunchConfig,
         stealth: StealthConfig,
     ) -> Result<Self, BrowserError> {
-        // 1. Locate the browser binary.
-        let binary = detect_browser(launch.browser_pref)?;
-
-        // 2. Resolve the profile directory.
-        let (profile_path, is_ephemeral) = launch.profile.resolve()?;
-        let profile_dir = if is_ephemeral {
-            ProfileDir::Ephemeral(profile_path.clone())
+        #[cfg(feature = "firefox")]
+        let inner = if launch.browser_pref == BrowserPreference::Firefox {
+            let b = WebDriverBrowser::connect(&launch, &stealth).await?;
+            BrowserInner::WebDriver(b)
         } else {
-            ProfileDir::Persistent(profile_path.clone())
+            let b = CdpBrowser::launch(&launch, &stealth).await?;
+            BrowserInner::Cdp(b)
         };
 
-        // 3. Pick a debug port.
-        let port = launch.debug_port.unwrap_or_else(LaunchConfig::find_free_port);
+        #[cfg(not(feature = "firefox"))]
+        let inner = {
+            let b = CdpBrowser::launch(&launch, &stealth).await?;
+            BrowserInner::Cdp(b)
+        };
 
-        // 4. Build CLI args — pass locale so Accept-Language header matches JS.
-        let locale = stealth.locale.locale.as_str();
-        let args = launch.build_args(&profile_path, port, Some(locale));
-
-        // 5. Spawn the browser process with stderr piped.
-        tracing::info!(
-            "[dig2browser] Launching {:?} binary={} port={} profile={} args_count={}",
-            binary.kind, binary.path.display(), port, profile_path.display(), args.len()
-        );
-        tracing::info!("[dig2browser] Args: {:?}", &args[..args.len().min(10)]);
-
-        let mut child = tokio::process::Command::new(&binary.path)
-            .args(&args)
-            .stderr(Stdio::piped())
-            .stdout(Stdio::null())
-            .stdin(Stdio::null())
-            .spawn()
-            .map_err(|e| {
-                tracing::error!("[dig2browser] Failed to spawn browser: {e}");
-                BrowserError::Launch(e)
-            })?;
-
-        let child_id = child.id();
-        tracing::info!("[dig2browser] Browser process spawned, PID={:?}", child_id);
-
-        // 6. Read stderr until we find "DevTools listening on ws://".
-        let stderr = child.stderr.take().ok_or_else(|| {
-            BrowserError::Connect("No stderr pipe from browser process".to_string())
-        })?;
-        let mut lines = BufReader::new(stderr).lines();
-
-        const TIMEOUT_SECS: u64 = 15;
-        let ws_url =
-            tokio::time::timeout(std::time::Duration::from_secs(TIMEOUT_SECS), async {
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::info!("[dig2browser] stderr: {}", line);
-                    if let Some(idx) = line.find("ws://") {
-                        let ws = line[idx..].trim().to_string();
-                        if ws.contains("devtools/browser") {
-                            return Ok(ws);
-                        }
-                    }
-                }
-                // Check if process exited
-                let status = child.try_wait();
-                tracing::error!(
-                    "[dig2browser] Browser stderr closed. Process status: {:?}",
-                    status
-                );
-                Err(BrowserError::Connect(
-                    "Browser stderr closed without a DevTools WebSocket URL".to_string(),
-                ))
-            })
-            .await
-            .map_err(|_| {
-                tracing::error!("[dig2browser] Timed out waiting {}s for WS URL", TIMEOUT_SECS);
-                BrowserError::WsUrlTimeout { secs: TIMEOUT_SECS }
-            })??;
-
-        tracing::info!("[dig2browser] DevTools WS: {}", ws_url);
-
-        // 7. Connect chromiumoxide.
-        let (browser, mut handler) = Browser::connect(&ws_url)
-            .await
-            .map_err(|e| BrowserError::Connect(e.to_string()))?;
-
-        // 8. Spawn the CDP event-handler task.
-        let handler_task = tokio::spawn(async move {
-            while let Some(event) = handler.next().await {
-                if let Err(e) = event {
-                    tracing::debug!("[dig2browser] CDP handler: {e}");
-                }
-            }
-        });
-
-        Ok(Self {
-            browser,
-            _handler: handler_task,
-            _process: Some(child),
-            profile_dir,
-            stealth,
-        })
+        Ok(Self { inner })
     }
 
-    /// Open a new page, inject stealth scripts, then navigate to `url`.
+    // -----------------------------------------------------------------------
+    // Page creation
+    // -----------------------------------------------------------------------
+
+    /// Open a new page with stealth scripts injected and navigate to `url`.
     pub async fn new_page(&self, url: &str) -> Result<StealthPage, BrowserError> {
-        let page = self
-            .browser
-            .new_page("about:blank")
-            .await
-            .map_err(|e| BrowserError::Cdp(e.to_string()))?;
-
-        stealth::inject_stealth(&page, &self.stealth).await?;
-        apply_cdp_overrides(&page, &self.stealth).await;
-
-        page.goto(url)
-            .await
-            .map_err(|e| BrowserError::Navigate {
-                url: url.into(),
-                detail: e.to_string(),
-            })?;
-
-        Ok(StealthPage::new(page))
+        self.increment_page_count();
+        match &self.inner {
+            BrowserInner::Cdp(b) => {
+                let page = b.new_page(url).await?;
+                Ok(StealthPage::from_cdp(page))
+            }
+            #[cfg(feature = "firefox")]
+            BrowserInner::WebDriver(b) => {
+                let client = b.new_page(url).await?;
+                Ok(StealthPage::from_webdriver(client))
+            }
+        }
     }
 
     /// Open a new blank page with stealth scripts injected (no navigation).
     pub async fn new_blank_page(&self) -> Result<StealthPage, BrowserError> {
-        let page = self
-            .browser
-            .new_page("about:blank")
-            .await
-            .map_err(|e| BrowserError::Cdp(e.to_string()))?;
-
-        stealth::inject_stealth(&page, &self.stealth).await?;
-        apply_cdp_overrides(&page, &self.stealth).await;
-
-        Ok(StealthPage::new(page))
+        self.increment_page_count();
+        match &self.inner {
+            BrowserInner::Cdp(b) => {
+                let page = b.new_blank_page().await?;
+                Ok(StealthPage::from_cdp(page))
+            }
+            #[cfg(feature = "firefox")]
+            BrowserInner::WebDriver(b) => {
+                // WebDriver has no blank page concept separate from navigation;
+                // open about:blank and inject stealth scripts.
+                let client = b.new_client().await?;
+                client
+                    .goto("about:blank")
+                    .await
+                    .map_err(|e| BrowserError::Navigate {
+                        url: "about:blank".into(),
+                        detail: e.to_string(),
+                    })?;
+                crate::stealth::inject_stealth_webdriver(&client, &b.stealth).await?;
+                Ok(StealthPage::from_webdriver(client))
+            }
+        }
     }
 
-    /// Access the underlying chromiumoxide `Browser` for advanced CDP operations.
-    pub fn raw(&self) -> &Browser {
-        &self.browser
+    // -----------------------------------------------------------------------
+    // Page counter
+    // -----------------------------------------------------------------------
+
+    /// Increment the internal page counter by one.
+    pub fn increment_page_count(&self) {
+        match &self.inner {
+            BrowserInner::Cdp(b) => b.increment_page_count(),
+            #[cfg(feature = "firefox")]
+            BrowserInner::WebDriver(b) => b.increment_page_count(),
+        }
     }
 
-    /// Close the browser and, if the profile was ephemeral, delete its directory.
-    pub async fn close(mut self) -> Result<(), BrowserError> {
-        self.browser
-            .close()
-            .await
-            .map_err(|e| BrowserError::Cdp(e.to_string()))?;
-
-        // Kill child process so we don't leave zombies.
-        if let Some(mut child) = self._process.take() {
-            let _ = child.kill().await;
+    /// Current page navigation count since the last launch or restart.
+    pub fn page_count(&self) -> u32 {
+        match &self.inner {
+            BrowserInner::Cdp(b) => b.page_count(),
+            #[cfg(feature = "firefox")]
+            BrowserInner::WebDriver(b) => b.page_count(),
         }
+    }
 
-        if self.profile_dir.is_ephemeral() {
-            // Best effort — ignore errors.
-            let _ = tokio::fs::remove_dir_all(self.profile_dir.path()).await;
+    /// Returns `true` when the page counter has exceeded `restart_after_pages`.
+    pub fn needs_restart(&self) -> bool {
+        match &self.inner {
+            BrowserInner::Cdp(b) => b.needs_restart(),
+            #[cfg(feature = "firefox")]
+            BrowserInner::WebDriver(b) => b.needs_restart(),
         }
+    }
 
+    // -----------------------------------------------------------------------
+    // Restart
+    // -----------------------------------------------------------------------
+
+    /// Restart the browser.
+    ///
+    /// For CDP: kills and re-launches the Chrome/Edge process.
+    /// For WebDriver: resets the page counter (sessions are stateless).
+    pub async fn restart(&mut self) -> Result<(), BrowserError> {
+        tracing::info!(
+            "[dig2browser] Restarting browser after {} pages",
+            self.page_count()
+        );
+        match &mut self.inner {
+            BrowserInner::Cdp(b) => b.restart().await,
+            #[cfg(feature = "firefox")]
+            BrowserInner::WebDriver(b) => b.restart().await,
+        }?;
+        tracing::info!("[dig2browser] Browser restarted successfully");
         Ok(())
     }
-}
 
-/// Apply CDP-level overrides that cannot be patched reliably with JS alone.
-///
-/// Currently handles:
-/// - `Emulation.setTimezoneOverride` — sets the timezone Chrome uses for V8's
-///   `Date` object and `Intl` APIs. JS-only timezone patches cannot override
-///   `Date().toString()` output, which encodes the OS timezone abbreviation.
-///
-/// Failures are logged and ignored — a page without these overrides is still
-/// usable, just slightly more detectable.
-async fn apply_cdp_overrides(page: &chromiumoxide::Page, stealth: &StealthConfig) {
-    if let Some(tz) = &stealth.locale.timezone {
-        let params = SetTimezoneOverrideParams::new(tz.clone());
-        if let Err(e) = page.execute(params).await {
-            tracing::warn!("[dig2browser] setTimezoneOverride failed: {e}");
+    // -----------------------------------------------------------------------
+    // Close
+    // -----------------------------------------------------------------------
+
+    /// Close the browser and clean up resources.
+    pub async fn close(self) -> Result<(), BrowserError> {
+        match self.inner {
+            BrowserInner::Cdp(b) => b.close().await,
+            #[cfg(feature = "firefox")]
+            BrowserInner::WebDriver(b) => b.close().await,
         }
     }
-}
 
-impl Drop for StealthBrowser {
-    fn drop(&mut self) {
-        // Best-effort kill: if the process is still alive when the struct is
-        // dropped without an explicit close() call, terminate it immediately.
-        if let Some(child) = self._process.as_mut() {
-            let _ = child.start_kill();
+    // -----------------------------------------------------------------------
+    // Raw access (CDP-only)
+    // -----------------------------------------------------------------------
+
+    /// Access the underlying chromiumoxide `Browser` for advanced CDP operations.
+    ///
+    /// Only available when the `firefox` feature is disabled (Chrome-only builds).
+    #[cfg(not(feature = "firefox"))]
+    pub fn raw(&self) -> &chromiumoxide::Browser {
+        match &self.inner {
+            BrowserInner::Cdp(b) => &b.browser,
         }
     }
 }

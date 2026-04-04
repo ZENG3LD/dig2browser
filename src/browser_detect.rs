@@ -7,6 +7,10 @@ pub enum BrowserPreference {
     Auto,
     ChromeOnly,
     EdgeOnly,
+    /// Routes to the WebDriver (geckodriver) backend.
+    /// Requires geckodriver running at the configured URL.
+    #[cfg(feature = "firefox")]
+    Firefox,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,6 +18,8 @@ pub enum BrowserKind {
     Chrome,
     Edge,
     Chromium,
+    #[cfg(feature = "firefox")]
+    Firefox,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +41,8 @@ pub fn detect_browser(pref: BrowserPreference) -> Result<BrowserBinary, BrowserE
         ],
         BrowserPreference::ChromeOnly => vec![(chrome_paths, BrowserKind::Chrome)],
         BrowserPreference::EdgeOnly => vec![(edge_paths, BrowserKind::Edge)],
+        #[cfg(feature = "firefox")]
+        BrowserPreference::Firefox => vec![(get_firefox_paths(), BrowserKind::Firefox)],
     };
 
     for (paths, kind) in search_order {
@@ -87,6 +95,30 @@ fn get_edge_paths() -> Vec<String> {
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
             paths.push(format!(r"{}\Microsoft\Edge\Application\msedge.exe", local));
         }
+    }
+
+    paths
+}
+
+/// Returns candidate paths for the Firefox binary.
+///
+/// Checks `FIREFOX_PATH` env var first, then OS-specific defaults.
+#[cfg(feature = "firefox")]
+pub fn get_firefox_paths() -> Vec<String> {
+    let mut paths = Vec::new();
+
+    if let Ok(v) = std::env::var("FIREFOX_PATH") {
+        paths.push(v);
+    }
+
+    if cfg!(target_os = "windows") {
+        paths.push(r"C:\Program Files\Mozilla Firefox\firefox.exe".into());
+        paths.push(r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe".into());
+    } else if cfg!(target_os = "macos") {
+        paths.push("/Applications/Firefox.app/Contents/MacOS/firefox".into());
+    } else {
+        paths.push("/usr/bin/firefox".into());
+        paths.push("/usr/bin/firefox-esr".into());
     }
 
     paths

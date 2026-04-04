@@ -2,12 +2,17 @@
 
 [package]
 name = "dig2browser"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
+[features]
+default = []
+firefox = ["dep:fantoccini"]
+
 [dependencies]
+fantoccini = { version = "0.22", optional = true }
 tokio = { version = "1", features = ["full"] }
-chromiumoxide = { path = "chromiumoxide-patched", default-features = false }
+chromiumoxide = { version = "0.9", default-features = false }
 futures = "0.3"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

@@ -1,3 +1,4 @@
+pub(crate) mod backend;
 pub mod error;
 pub mod browser_detect;
 pub mod browser_args;

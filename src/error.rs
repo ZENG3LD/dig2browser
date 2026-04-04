@@ -37,6 +37,14 @@ pub enum BrowserError {
 
     #[error("{0}")]
     Other(String),
+
+    #[cfg(feature = "firefox")]
+    #[error("GeckoDriver connection failed: {0}")]
+    GeckoDriver(String),
+
+    #[cfg(feature = "firefox")]
+    #[error("WebDriver command failed: {0}")]
+    WebDriver(String),
 }
 
 #[derive(Debug, Error)]

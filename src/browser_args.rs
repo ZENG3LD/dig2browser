@@ -18,6 +18,12 @@ pub struct LaunchConfig {
     pub debug_port: Option<u16>,
     pub extra_args: Vec<String>,
     pub browser_pref: BrowserPreference,
+    /// Restart Chrome after this many page navigations to reclaim leaked memory.
+    /// Set to `0` to disable automatic restarts.
+    pub restart_after_pages: u32,
+    /// GeckoDriver URL. Only used when `browser_pref = Firefox`.
+    /// Default: `"http://localhost:4444"`.
+    pub geckodriver_url: String,
 }
 
 impl Default for LaunchConfig {
@@ -29,6 +35,8 @@ impl Default for LaunchConfig {
             debug_port: None,
             extra_args: Vec::new(),
             browser_pref: BrowserPreference::Auto,
+            restart_after_pages: 500,
+            geckodriver_url: "http://localhost:4444".into(),
         }
     }
 }
@@ -78,6 +86,8 @@ impl LaunchConfig {
         args.push("--use-angle=d3d11".into());
         args.push("--no-sandbox".into());
         args.push("--disable-dev-shm-usage".into());
+        // Cap the on-disk cache to 100 MB so long-running daemons don't accumulate GBs.
+        args.push("--disk-cache-size=104857600".into());
         // Override the default User-Agent which contains "HeadlessChrome" —
         // many sites reject it at the HTTP level before any JS runs.
         args.push("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36".into());
