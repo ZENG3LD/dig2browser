@@ -583,6 +583,15 @@ impl PageBackend for BiDiPageBackend {
         })
     }
 
+    fn set_extra_http_headers<'a>(
+        &'a self,
+        _headers: std::collections::HashMap<String, String>,
+    ) -> BoxFuture<'a, Result<(), BrowserError>> {
+        // BiDi has no direct equivalent of Network.setExtraHTTPHeaders.
+        // Return Ok(()) so callers can use the same API regardless of backend.
+        Box::pin(async move { Ok(()) })
+    }
+
     // ── DevTools events ───────────────────────────────────────────────────
 
     fn subscribe_events<'a>(

@@ -48,4 +48,17 @@ impl CdpSession {
         self.call("Network.deleteCookies", Some(params)).await?;
         Ok(())
     }
+
+    /// Set extra HTTP headers that will be sent with every request from this page.
+    ///
+    /// Headers are merged with any existing extra headers. To clear previously
+    /// set headers, pass an empty map.
+    pub async fn set_extra_http_headers(
+        &self,
+        headers: std::collections::HashMap<String, String>,
+    ) -> Result<(), CdpError> {
+        let params = json!({ "headers": headers });
+        self.call("Network.setExtraHTTPHeaders", Some(params)).await?;
+        Ok(())
+    }
 }

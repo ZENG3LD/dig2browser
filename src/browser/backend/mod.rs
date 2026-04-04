@@ -125,6 +125,14 @@ pub trait PageBackend: Send + Sync {
         element: &'a ElementHandle,
     ) -> BoxFuture<'a, Result<Vec<u8>, BrowserError>>;
 
+    /// Set extra HTTP headers sent with every request issued by this page.
+    ///
+    /// Merges with any previously set headers. Pass an empty map to clear.
+    fn set_extra_http_headers<'a>(
+        &'a self,
+        headers: std::collections::HashMap<String, String>,
+    ) -> BoxFuture<'a, Result<(), BrowserError>>;
+
     // ── DevTools events ───────────────────────────────────────────────────
 
     /// Subscribe to DevTools events for this page.

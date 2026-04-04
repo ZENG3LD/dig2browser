@@ -111,6 +111,18 @@ impl StealthPage {
         self.backend.set_cookies(&jar.0).await
     }
 
+    /// Set extra HTTP headers that will be sent with every request from this page.
+    ///
+    /// On the CDP backend (Chrome/Edge) this calls `Network.setExtraHTTPHeaders`.
+    /// On the BiDi backend (Firefox) this is a no-op — BiDi has no direct
+    /// equivalent, so the call succeeds silently.
+    pub async fn set_extra_http_headers(
+        &self,
+        headers: std::collections::HashMap<String, String>,
+    ) -> Result<(), BrowserError> {
+        self.backend.set_extra_http_headers(headers).await
+    }
+
     /// Find the first element matching the CSS `selector`.
     pub async fn find(&self, selector: &str) -> Result<Element, BrowserError> {
         let handle = self.backend.find_element(selector).await?;

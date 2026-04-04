@@ -764,6 +764,18 @@ impl PageBackend for CdpPageBackend {
         })
     }
 
+    fn set_extra_http_headers<'a>(
+        &'a self,
+        headers: std::collections::HashMap<String, String>,
+    ) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move {
+            self.session
+                .set_extra_http_headers(headers)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))
+        })
+    }
+
     // ── DevTools events ───────────────────────────────────────────────────
 
     fn subscribe_events<'a>(
