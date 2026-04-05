@@ -3,17 +3,20 @@
 //! Usage:
 //!   dev-fetch <URL> [--fingerprint path.json] [--headed] [--wait-selector "#id"]
 //!              [--save-html out.html] [--save-screenshot out.png] [--profile ./profile]
+//!              [--network-log] [--cookies] [--console] [--eval "JS"] [--dom "selector"]
+//!              [--keep-open SECONDS]
 //!
 //! Prints a summary to stderr and writes HTML to stdout (unless --save-html is used).
 
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use dig2browser::{
     BrowserPreference, BrowserProfile, LaunchConfig, LocaleProfile, StealthBrowser, StealthConfig,
     StealthLevel,
 };
+use dig2browser::DevToolsEvent;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -46,6 +49,30 @@ struct Cli {
     /// Persistent browser profile directory
     #[arg(long)]
     profile: Option<PathBuf>,
+
+    /// Show network request/response log after page load
+    #[arg(long)]
+    network_log: bool,
+
+    /// Dump all cookies after page load
+    #[arg(long)]
+    cookies: bool,
+
+    /// Show console messages (log/warn/error) captured during load
+    #[arg(long)]
+    console: bool,
+
+    /// Execute JavaScript and print the result
+    #[arg(long)]
+    eval: Option<String>,
+
+    /// Find elements matching a CSS selector and print their outer HTML
+    #[arg(long)]
+    dom: Option<String>,
+
+    /// Keep the browser open for N seconds (useful with --headed for manual inspection)
+    #[arg(long, value_name = "SECONDS")]
+    keep_open: Option<u64>,
 }
 
 // ── Fingerprint config ────────────────────────────────────────────────────────
@@ -155,23 +182,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t0 = Instant::now();
     let browser = StealthBrowser::launch_with(launch, stealth).await?;
 
-    // Navigate.
-    let page = if let Some(selector) = &cli.wait_selector {
-        let p = browser.new_blank_page().await?;
-        p.goto_and_wait(&cli.url, selector, std::time::Duration::from_secs(30))
-            .await?;
-        p
+    // Always use new_blank_page so we can subscribe to devtools before navigation.
+    let page = browser.new_blank_page().await?;
+
+    // Subscribe to devtools events before navigation to capture everything.
+    let need_devtools = cli.network_log || cli.console;
+    let mut devtools = if need_devtools {
+        Some(page.devtools().await?)
     } else {
-        browser.new_page(&cli.url).await?
+        None
     };
+
+    // Navigate.
+    if let Some(selector) = &cli.wait_selector {
+        page.goto_and_wait(&cli.url, selector, Duration::from_secs(30))
+            .await?;
+    } else {
+        page.goto(&cli.url).await?;
+    }
 
     let fetch_ms = t0.elapsed().as_millis();
 
     // Capture HTML and screenshot.
     let html = page.html().await?;
     let screenshot = page.screenshot().await?;
-
-    browser.close().await?;
 
     // Summary to stderr.
     let title = extract_title(&html).unwrap_or_else(|| "(no title)".to_owned());
@@ -180,6 +214,80 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("HTML size:  {} bytes", html.len());
     eprintln!("PNG size:   {} bytes", screenshot.len());
     eprintln!("Fetch time: {} ms", fetch_ms);
+
+    // Drain all captured devtools events once into typed vecs.
+    let mut network_events = Vec::new();
+    let mut console_events = Vec::new();
+    if let Some(ref mut dt) = devtools {
+        while let Some(event) = dt.try_next() {
+            match event {
+                DevToolsEvent::Network(net) => network_events.push(net),
+                DevToolsEvent::Console(con) => console_events.push(con),
+            }
+        }
+    }
+
+    // Network log.
+    if cli.network_log {
+        eprintln!("\n=== Network Log ({} requests) ===", network_events.len());
+        for net in &network_events {
+            let status = net
+                .status
+                .map(|s: u16| s.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let url = net.url.as_deref().unwrap_or("-");
+            eprintln!("  {} {} {}", net.method, status, url);
+        }
+    }
+
+    // Console messages.
+    if cli.console {
+        eprintln!("\n=== Console ({} messages) ===", console_events.len());
+        for con in &console_events {
+            eprintln!("  [{}] {}", con.level, con.text);
+        }
+    }
+
+    // Cookies.
+    if cli.cookies {
+        let jar = page.get_cookies().await?;
+        eprintln!("\n=== Cookies ({}) ===", jar.len());
+        for c in jar.iter() {
+            let secure = if c.is_secure { " secure" } else { "" };
+            let httponly = if c.is_httponly { " httponly" } else { "" };
+            eprintln!(
+                "  {}={} [domain={} path={}{}{}]",
+                c.name, c.value, c.domain, c.path, secure, httponly
+            );
+        }
+    }
+
+    // Eval.
+    if let Some(js) = &cli.eval {
+        let result = page.eval(js).await?;
+        eprintln!("\n=== Eval Result ===");
+        eprintln!("{}", serde_json::to_string_pretty(&result)?);
+    }
+
+    // DOM query.
+    if let Some(selector) = &cli.dom {
+        let elements = page.find_all(selector).await?;
+        eprintln!(
+            "\n=== DOM: {} ({} matches) ===",
+            selector,
+            elements.len()
+        );
+        for (i, el) in elements.iter().enumerate() {
+            let el_html = el.html().await?;
+            eprintln!("[{}] {}", i, el_html);
+        }
+    }
+
+    // Keep open.
+    if let Some(seconds) = cli.keep_open {
+        eprintln!("\nKeeping browser open for {} seconds...", seconds);
+        tokio::time::sleep(Duration::from_secs(seconds)).await;
+    }
 
     // Persist outputs.
     if let Some(html_path) = &cli.save_html {
@@ -196,6 +304,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if cli.save_html.is_none() && cli.save_screenshot.is_none() {
         print!("{}", html);
     }
+
+    browser.close().await?;
 
     Ok(())
 }

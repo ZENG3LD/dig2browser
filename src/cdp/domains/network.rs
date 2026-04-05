@@ -61,4 +61,31 @@ impl CdpSession {
         self.call("Network.setExtraHTTPHeaders", Some(params)).await?;
         Ok(())
     }
+
+    /// Enable Network domain events (requestWillBeSent, responseReceived, etc.)
+    pub async fn enable_network(&self) -> Result<(), CdpError> {
+        self.call("Network.enable", None).await?;
+        Ok(())
+    }
+
+    /// Get the response body for a completed request.
+    ///
+    /// Returns `(body, base64_encoded)`. When `base64_encoded` is `true` the
+    /// body string is Base64-encoded binary data.
+    pub async fn get_response_body(&self, request_id: &str) -> Result<(String, bool), CdpError> {
+        let result = self.call(
+            "Network.getResponseBody",
+            Some(json!({ "requestId": request_id })),
+        ).await?;
+        let body = result
+            .get("body")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let base64_encoded = result
+            .get("base64Encoded")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        Ok((body, base64_encoded))
+    }
 }
