@@ -1,6 +1,6 @@
 [package]
 name = "dig2browser"
-version = "0.4.4"
+version = "0.4.5"
 edition = "2021"
 license = "MIT"
 description = "Stealth browser automation with Web Bot Auth — CDP, WebDriver, BiDi backends"
@@ -13,11 +13,16 @@ readme = "README.md"
 name = "keygen"
 path = "src/bin/keygen.rs"
 
+[[bin]]
+name = "dev-fetch"
+path = "src/bin/dev_fetch.rs"
+
 [lib]
 name = "dig2browser"
 path = "src/lib.rs"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 reqwest = { version = "0.12", features = ["json"] }
