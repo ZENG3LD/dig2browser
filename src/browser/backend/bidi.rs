@@ -238,8 +238,17 @@ impl PageBackend for BiDiPageBackend {
                 .await
                 .map_err(|e| BrowserError::JsEval(e.to_string()))?;
 
+            // WebDriver execute/sync wraps the script in a function body,
+            // so bare expressions like "document.title" return undefined.
+            // Auto-prepend "return" for expression-style scripts.
+            let script = if needs_return_prefix(js) {
+                format!("return {js}")
+            } else {
+                js.to_owned()
+            };
+
             self.wd_session
-                .execute_sync(js, vec![])
+                .execute_sync(&script, vec![])
                 .await
                 .map_err(|e| BrowserError::JsEval(e.to_string()))
         })
@@ -665,3 +674,27 @@ fn bridge_bidi_event(event: crate::bidi::BiDiEvent) -> Option<DevToolsEvent> {
     }
 }
 
+/// Returns `true` if the JS snippet is a bare expression that needs `return`
+/// prepended for WebDriver `execute/sync` (which wraps scripts in a function body).
+///
+/// Statements like `return ...`, `var ...`, `let ...`, `const ...`, `if ...`,
+/// `for ...`, `while ...`, `try ...`, `throw ...`, `{...}` are left as-is.
+fn needs_return_prefix(js: &str) -> bool {
+    let trimmed = js.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // Already has return, or is a statement.
+    let statement_prefixes = [
+        "return ", "return;", "var ", "let ", "const ", "if ", "if(", "for ", "for(",
+        "while ", "while(", "do ", "do{", "switch ", "switch(", "try ", "try{",
+        "throw ", "function ", "class ", "async ", "await ", "{",
+    ];
+    let lower = trimmed.to_ascii_lowercase();
+    for prefix in &statement_prefixes {
+        if lower.starts_with(prefix) {
+            return false;
+        }
+    }
+    true
+}
