@@ -287,7 +287,7 @@ Hand-written typed helpers for 10 domains:
 | **Target** | create, attach, close, list |
 | **Page** | navigate, content, screenshot, PDF, addScript, frameTree |
 | **Runtime** | evaluate, callFunctionOn, addBinding |
-| **Network** | getCookies, setCookie, deleteCookies |
+| **Network** | enable, getCookies, setCookie, deleteCookies, getResponseBody |
 | **Fetch** | enable, continue, fail, fulfill, rewrite headers |
 | **DOM** | querySelector, getBoxModel, resolveNode, outerHTML, focus, scrollIntoView |
 | **Input** | mouse click/move, keyboard type/press, touch |
@@ -325,6 +325,61 @@ Firefox-equivalent of CDP capabilities:
 | Chrome | CDP | Full (pre-nav injection) | Production |
 | Edge | CDP | Full (pre-nav injection) | Production |
 | Firefox | WebDriver BiDi | Full (preloadScript) | Production |
+
+## CLI Tools
+
+dig2browser ships two standalone binaries:
+
+### `keygen` — Generate Ed25519 keypair for Web Bot Auth
+
+```bash
+cargo run --bin keygen -- keys/my-bot.key
+```
+
+### `dev-fetch` — DevTools in your terminal
+
+Fetch a URL through the stealth browser and inspect everything — no code needed.
+
+```bash
+# Basic: fetch URL, show title/size/time
+dev-fetch https://example.com
+
+# Full DevTools inspection
+dev-fetch https://cloud.vk.com/pricing \
+  --fingerprint russian.json \
+  --network-log \
+  --cookies \
+  --console \
+  --save-html out.html \
+  --save-screenshot out.png
+
+# Execute JS
+dev-fetch https://example.com --eval "document.title"
+
+# DOM inspection
+dev-fetch https://example.com --dom "div.pricing-card"
+
+# Headed mode + keep open for manual inspection
+dev-fetch https://example.com --headed --keep-open 60
+
+# With persistent profile (reuse cookies from cookie-auth)
+dev-fetch https://yandex.cloud --profile /tmp/dig2crawl-profiles/yandex.cloud --cookies
+```
+
+| Flag | Description |
+|------|-------------|
+| `--fingerprint <PATH>` | JSON fingerprint config (browser, locale, timezone, viewport, stealth level) |
+| `--headed` | Visible browser window |
+| `--wait-selector <CSS>` | Wait for element before capturing |
+| `--save-html <PATH>` | Save HTML to file |
+| `--save-screenshot <PATH>` | Save screenshot PNG |
+| `--profile <PATH>` | Persistent browser profile directory |
+| `--network-log` | Show all network requests/responses |
+| `--cookies` | Dump cookies after page load |
+| `--console` | Show console.log/warn/error messages |
+| `--eval <JS>` | Execute JavaScript and print result |
+| `--dom <selector>` | Find elements and print outer HTML |
+| `--keep-open <SECONDS>` | Keep browser open (useful with --headed) |
 
 ## Requirements
 
