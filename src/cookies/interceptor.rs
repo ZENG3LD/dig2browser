@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use crate::detect::{BrowserPreference, detect_browser};
+use crate::detect::args::LaunchConfig;
 
 use crate::cookies::decrypt::derive_aes_key;
 use crate::cookies::sqlite::read_cookies;
@@ -42,21 +43,44 @@ impl InterceptConfig {
 /// Open a visible browser for the user to log in, then close.
 /// Profile is saved to `profile_dir` — no cookie reading needed.
 /// Use this when the headless daemon will reuse the same profile directory.
+///
+/// Uses the same Chrome flags as `LaunchConfig::build_args()` (anti-detection,
+/// user-agent, locale) but WITHOUT `--headless=new`, so the browser fingerprint
+/// stored in cookies matches what `BrowserPool` will present later.
+///
+/// Pass `locale` (e.g. `Some("ru-RU")`) to match `StealthConfig::russian()`.
+/// Defaults to `"en-US"` when `None`.
 pub async fn open_auth_session(
     start_url: &str,
     profile_dir: &std::path::Path,
     browser_pref: BrowserPreference,
 ) -> Result<(), CookieError> {
+    open_auth_session_with_locale(start_url, profile_dir, browser_pref, None).await
+}
+
+/// Like [`open_auth_session`] but with explicit locale control.
+pub async fn open_auth_session_with_locale(
+    start_url: &str,
+    profile_dir: &std::path::Path,
+    browser_pref: BrowserPreference,
+    locale: Option<&str>,
+) -> Result<(), CookieError> {
     let binary = detect_browser(browser_pref).map_err(CookieError::Detect)?;
 
     std::fs::create_dir_all(profile_dir)?;
 
-    let args: Vec<String> = vec![
-        "--no-first-run".into(),
-        "--disable-default-apps".into(),
-        format!("--user-data-dir={}", profile_dir.display()),
-        start_url.to_string(),
-    ];
+    // Build the same args that BrowserPool/LaunchConfig would use,
+    // but with headless=false so the user gets a visible window.
+    let launch = LaunchConfig {
+        headless: false,
+        profile: crate::detect::args::BrowserProfile::Persistent(profile_dir.to_path_buf()),
+        browser_pref,
+        ..LaunchConfig::default()
+    };
+    let port = LaunchConfig::find_free_port();
+    let mut args = launch.build_args(profile_dir, port, locale);
+    // Append the start URL as the last positional argument.
+    args.push(start_url.to_string());
 
     println!("[dig2browser] Opening browser at: {}", start_url);
     println!("[dig2browser] Log in, pass captchas, then CLOSE the browser window.");
@@ -108,12 +132,17 @@ pub async fn intercept_cookies(config: &InterceptConfig) -> Result<CookieJar, Co
     };
 
     // Step 3: build args for visible (non-headless) browser.
-    let args: Vec<String> = vec![
-        "--no-first-run".into(),
-        "--disable-default-apps".into(),
-        format!("--user-data-dir={}", profile_dir.display()),
-        config.start_url.clone(),
-    ];
+    // Use the same flags as LaunchConfig::build_args() so the fingerprint matches
+    // what BrowserPool will present later.
+    let launch = LaunchConfig {
+        headless: false,
+        profile: crate::detect::args::BrowserProfile::Persistent(profile_dir.clone()),
+        browser_pref: config.browser_pref,
+        ..LaunchConfig::default()
+    };
+    let port = LaunchConfig::find_free_port();
+    let mut args = launch.build_args(&profile_dir, port, None);
+    args.push(config.start_url.clone());
 
     // Step 4: print instructions and launch.
     println!("[dig2browser] Opening browser at: {}", config.start_url);

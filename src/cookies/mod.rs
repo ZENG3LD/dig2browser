@@ -8,7 +8,7 @@ pub mod interceptor;
 pub mod sqlite;
 pub mod types;
 
-pub use interceptor::{intercept_cookies, open_auth_session, InterceptConfig};
+pub use interceptor::{intercept_cookies, open_auth_session, open_auth_session_with_locale, InterceptConfig};
 pub use types::{Cookie, CookieJar};
 
 use crate::detect::DetectError;
