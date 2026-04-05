@@ -383,6 +383,18 @@ dev-fetch https://yandex.cloud --profile /tmp/dig2crawl-profiles/yandex.cloud --
 | `--dom <selector>` | Find elements and print outer HTML |
 | `--keep-open <SECONDS>` | Keep browser open (useful with --headed) |
 
+## Process Lifecycle
+
+Browser processes are automatically cleaned up — no zombie Chrome/Edge left behind:
+
+| Layer | Mechanism | Covers |
+|-------|-----------|--------|
+| **Graceful** | `browser.close()` sends `Browser.close` CDP command + `child.kill()` | Normal exit |
+| **kill_on_drop** | `tokio::process::Command::kill_on_drop(true)` | Panic, early return, forgotten close |
+| **Drop safety net** | `CdpBrowserBackend::drop()` calls `start_kill()` | Edge cases where Child drop doesn't fire |
+
+For Firefox/BiDi: geckodriver manages Firefox lifecycle. `DELETE /session` tells geckodriver to terminate Firefox.
+
 ## Requirements
 
 - **Chrome/Edge**: No external driver needed — connects directly via CDP

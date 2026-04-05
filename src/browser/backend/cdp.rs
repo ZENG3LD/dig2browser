@@ -40,6 +40,11 @@ pub(crate) struct CdpBrowserBackend {
 
 impl Drop for CdpBrowserBackend {
     fn drop(&mut self) {
+        // kill_on_drop(true) handles the common case, but start_kill() here
+        // acts as a safety net for any edge case where the Child's drop
+        // behaviour might not fire (e.g. if Child was somehow replaced).
+        // start_kill() is non-blocking — it sends the signal without waiting.
+        let _ = self._child.start_kill();
         if self.profile_ephemeral {
             let _ = std::fs::remove_dir_all(&self.profile_dir);
         }
@@ -70,6 +75,10 @@ impl CdpBrowserBackend {
             .stderr(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stdin(std::process::Stdio::null())
+            // Ensure Chrome is killed if this process exits without calling close()
+            // (panic, early return, forgotten drop). tokio sends SIGKILL/TerminateProcess
+            // automatically when the Child is dropped with kill_on_drop set.
+            .kill_on_drop(true)
             .spawn()
             .map_err(|e| BrowserError::Launch(e.to_string()))?;
 
