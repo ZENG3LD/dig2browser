@@ -15,7 +15,7 @@ use crate::cdp::session::CdpSession;
 use crate::cdp::types::{CdpEvent, CdpInbound, CdpOutbound, CdpOutboundFrame};
 
 /// Broadcast channel capacity for inbound CDP events.
-const EVENT_CHANNEL_CAPACITY: usize = 256;
+const EVENT_CHANNEL_CAPACITY: usize = 4096;
 /// Outbound mpsc channel capacity.
 const OUTBOUND_CHANNEL_CAPACITY: usize = 128;
 

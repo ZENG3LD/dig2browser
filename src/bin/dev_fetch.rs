@@ -215,6 +215,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("PNG size:   {} bytes", screenshot.len());
     eprintln!("Fetch time: {} ms", fetch_ms);
 
+    // Give late async events (SPA XHR, lazy resources) time to arrive.
+    if need_devtools {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
     // Drain all captured devtools events once into typed vecs.
     let mut network_events = Vec::new();
     let mut console_events = Vec::new();

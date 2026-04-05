@@ -785,7 +785,7 @@ impl PageBackend for CdpPageBackend {
             // CDP events flow through the client's broadcast channel.
             // We bridge CdpEvent → DevToolsEvent in a background task and
             // provide the caller with a broadcast::Receiver<DevToolsEvent>.
-            let (tx, rx) = tokio::sync::broadcast::channel(256);
+            let (tx, rx) = tokio::sync::broadcast::channel(4096);
             let mut cdp_rx = self.session.client().subscribe();
 
             tokio::spawn(async move {
