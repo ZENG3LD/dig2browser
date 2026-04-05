@@ -372,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "dig2browser"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "aes-gcm",
  "base64",
