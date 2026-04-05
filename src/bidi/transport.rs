@@ -37,7 +37,7 @@ impl BiDiClient {
         let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<BiDiOutbound>(256);
-        let (event_tx, _) = broadcast::channel::<BiDiEvent>(256);
+        let (event_tx, _) = broadcast::channel::<BiDiEvent>(4096);
         let event_tx_clone = event_tx.clone();
 
         let pending: Arc<PendingMap> = Arc::new(DashMap::new());

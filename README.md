@@ -139,6 +139,8 @@ page.page().goto("https://example.com").await?;
 
 ### DevTools Events
 
+Works on all three browsers — CDP events on Chrome/Edge, BiDi events on Firefox.
+
 ```rust
 let mut devtools = page.devtools().await?;
 while let Some(event) = devtools.next_event().await {
@@ -313,7 +315,7 @@ Firefox-equivalent of CDP capabilities:
 | Module | Capabilities |
 |--------|-------------|
 | **script** | `addPreloadScript` (pre-navigation injection), evaluate, callFunction |
-| **network** | `addIntercept`, continueRequest, provideResponse, failRequest |
+| **network** | `subscribeNetwork` (events), `addIntercept`, continueRequest, provideResponse, failRequest |
 | **browsingContext** | navigate, getTree, create/close, screenshot, print |
 | **input** | performActions, releaseActions |
 | **log** | subscribe to console/error events |

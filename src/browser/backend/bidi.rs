@@ -83,10 +83,13 @@ impl BiDiBrowserBackend {
 
         // Pre-register stealth scripts as preload scripts so they fire on every
         // navigation in any browsing context.
+        //
+        // BiDi `script.addPreloadScript` expects a *function declaration* string
+        // (e.g. `function() { ... }`) — NOT an IIFE expression. The browser
+        // parses + calls the function automatically.
         let scripts = get_scripts(stealth);
         for script in &scripts {
-            // Wrap as IIFE for preload compatibility.
-            let wrapped = format!("(function() {{ {} }})();", script);
+            let wrapped = format!("function() {{ {} }}", script);
             bidi.add_preload_script(&wrapped, None)
                 .await
                 .map_err(|e| BrowserError::StealthInject(e.to_string()))?;
@@ -607,8 +610,18 @@ impl PageBackend for BiDiPageBackend {
         &'a self,
     ) -> BoxFuture<'a, Result<tokio::sync::broadcast::Receiver<DevToolsEvent>, BrowserError>> {
         Box::pin(async move {
+            // Tell Firefox to actually send network + log events.
+            self._bidi
+                .subscribe_network(None)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+            self._bidi
+                .subscribe_log(None)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
             // Subscribe to BiDi events and bridge to DevToolsEvent.
-            let (tx, rx) = tokio::sync::broadcast::channel::<DevToolsEvent>(256);
+            let (tx, rx) = tokio::sync::broadcast::channel::<DevToolsEvent>(4096);
             let mut bidi_rx = self._bidi.subscribe();
 
             tokio::spawn(async move {

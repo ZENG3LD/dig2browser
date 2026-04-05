@@ -3,6 +3,32 @@ use std::sync::Arc;
 use crate::bidi::{error::BiDiError, transport::BiDiClient};
 
 impl BiDiClient {
+    /// Subscribe to network events, optionally scoped to specific browsing
+    /// contexts.
+    ///
+    /// After calling this, `network.beforeRequestSent`, `network.responseStarted`,
+    /// and `network.responseCompleted` events will flow through
+    /// [`BiDiClient::subscribe`].
+    pub async fn subscribe_network(
+        self: &Arc<Self>,
+        contexts: Option<Vec<String>>,
+    ) -> Result<(), BiDiError> {
+        let mut params = serde_json::json!({
+            "events": [
+                "network.beforeRequestSent",
+                "network.responseStarted",
+                "network.responseCompleted",
+            ],
+        });
+
+        if let Some(ctxs) = contexts {
+            params["contexts"] = serde_json::json!(ctxs);
+        }
+
+        self.call("session.subscribe", params).await?;
+        Ok(())
+    }
+
     /// Register a network intercept for the given phases and URL patterns.
     ///
     /// Returns the opaque intercept id.
