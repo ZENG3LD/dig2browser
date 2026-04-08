@@ -182,6 +182,20 @@ impl CdpSession {
         Ok(bytes)
     }
 
+    /// Disable Content Security Policy on the page so that scripts injected
+    /// via `Runtime.evaluate` work even on CSP-locked sites.
+    ///
+    /// Must be called before `Page.navigate` to take effect on the initial
+    /// document. Calling after navigation is still useful for future navigations.
+    pub async fn set_bypass_csp(&self, enabled: bool) -> Result<(), CdpError> {
+        self.call(
+            "Page.setBypassCSP",
+            Some(json!({ "enabled": enabled })),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Enable the Page domain (required before receiving Page events).
     pub async fn enable_page(&self) -> Result<(), CdpError> {
         self.call("Page.enable", None).await?;

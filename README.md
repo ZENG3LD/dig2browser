@@ -443,6 +443,13 @@ If you find this tool useful, consider supporting development:
 | BTC | Bitcoin | `bc1qjgzthxja8umt5tvrp5tfcf9zeepmhn0f6mnt40` |
 | SOL | Solana | `DZJjmH8Cs5wEafz5Ua86wBBkurSA4xdWXa3LWnBUR94c` |
 
+## Changelog
+
+### 0.4.11
+
+- `StealthPage::set_bypass_csp(enabled: bool)` — CDP backend calls `Page.setBypassCSP`, allowing `Runtime.evaluate` script injection on CSP-locked sites. BiDi backend is a silent no-op.
+- `StealthPage::add_script_to_evaluate_on_new_document(source: &str) -> String` — CDP backend calls `Page.addScriptToEvaluateOnNewDocument` and returns the `identifier` (use for removal). BiDi backend is a silent no-op returning `""`.
+
 ## License
 
 MIT

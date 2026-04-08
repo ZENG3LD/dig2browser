@@ -123,6 +123,37 @@ impl StealthPage {
         self.backend.set_extra_http_headers(headers).await
     }
 
+    /// Disable Content Security Policy enforcement on this page.
+    ///
+    /// On the CDP backend (Chrome/Edge) this calls `Page.setBypassCSP`.
+    /// This allows `Runtime.evaluate` to inject scripts on CSP-locked sites.
+    /// On the BiDi backend (Firefox) this is a no-op.
+    ///
+    /// Call this before navigating to the target URL so the bypass is active
+    /// for the initial document load.
+    pub async fn set_bypass_csp(&self, enabled: bool) -> Result<(), BrowserError> {
+        self.backend.set_bypass_csp(enabled).await
+    }
+
+    /// Register a script to run on every new document before any page JS.
+    ///
+    /// On the CDP backend (Chrome/Edge) this calls
+    /// `Page.addScriptToEvaluateOnNewDocument` and returns the `identifier`
+    /// from the response (needed to remove the script later).
+    /// On the BiDi backend (Firefox) this is a no-op returning an empty string.
+    ///
+    /// This is the correct way to make injected scripts survive navigation:
+    /// combine with `eval` for the current page (idempotent script guard ensures
+    /// no double-injection).
+    pub async fn add_script_to_evaluate_on_new_document(
+        &self,
+        source: &str,
+    ) -> Result<String, BrowserError> {
+        self.backend
+            .add_script_to_evaluate_on_new_document(source)
+            .await
+    }
+
     /// Find the first element matching the CSS `selector`.
     pub async fn find(&self, selector: &str) -> Result<Element, BrowserError> {
         let handle = self.backend.find_element(selector).await?;

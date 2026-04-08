@@ -604,6 +604,22 @@ impl PageBackend for BiDiPageBackend {
         Box::pin(async move { Ok(()) })
     }
 
+    fn set_bypass_csp<'a>(&'a self, _enabled: bool) -> BoxFuture<'a, Result<(), BrowserError>> {
+        // Page.setBypassCSP is a CDP-only feature. BiDi has no equivalent.
+        // Return Ok(()) so callers can use the same API regardless of backend.
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn add_script_to_evaluate_on_new_document<'a>(
+        &'a self,
+        _source: &'a str,
+    ) -> BoxFuture<'a, Result<String, BrowserError>> {
+        // BiDi equivalent is addPreloadScript, which is already used internally for stealth.
+        // The public StealthPage::add_script_to_evaluate_on_new_document is CDP-only.
+        // Return empty identifier string so callers are not broken.
+        Box::pin(async move { Ok(String::new()) })
+    }
+
     // ── DevTools events ───────────────────────────────────────────────────
 
     fn subscribe_events<'a>(

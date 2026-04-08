@@ -133,6 +133,23 @@ pub trait PageBackend: Send + Sync {
         headers: std::collections::HashMap<String, String>,
     ) -> BoxFuture<'a, Result<(), BrowserError>>;
 
+    /// Disable Content Security Policy enforcement so that injected scripts
+    /// work on CSP-locked pages.
+    ///
+    /// On the CDP backend calls `Page.setBypassCSP`. On the BiDi backend
+    /// this is a no-op (returns `Ok(())`).
+    fn set_bypass_csp<'a>(&'a self, enabled: bool) -> BoxFuture<'a, Result<(), BrowserError>>;
+
+    /// Register a script to run on every new document before any page JS runs.
+    ///
+    /// On the CDP backend calls `Page.addScriptToEvaluateOnNewDocument` and
+    /// returns the `identifier` string from the response.
+    /// On the BiDi backend this is a no-op (returns an empty string).
+    fn add_script_to_evaluate_on_new_document<'a>(
+        &'a self,
+        source: &'a str,
+    ) -> BoxFuture<'a, Result<String, BrowserError>>;
+
     // ── DevTools events ───────────────────────────────────────────────────
 
     /// Subscribe to DevTools events for this page.

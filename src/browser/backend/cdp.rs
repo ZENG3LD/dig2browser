@@ -785,6 +785,27 @@ impl PageBackend for CdpPageBackend {
         })
     }
 
+    fn set_bypass_csp<'a>(&'a self, enabled: bool) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move {
+            self.session
+                .set_bypass_csp(enabled)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))
+        })
+    }
+
+    fn add_script_to_evaluate_on_new_document<'a>(
+        &'a self,
+        source: &'a str,
+    ) -> BoxFuture<'a, Result<String, BrowserError>> {
+        Box::pin(async move {
+            self.session
+                .add_script_on_new_document(source)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))
+        })
+    }
+
     // ── DevTools events ───────────────────────────────────────────────────
 
     fn subscribe_events<'a>(
