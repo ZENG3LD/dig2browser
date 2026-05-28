@@ -330,7 +330,7 @@ Firefox-equivalent of CDP capabilities:
 
 ## CLI Tools
 
-dig2browser ships two standalone binaries:
+dig2browser ships three standalone binaries:
 
 ### `keygen` — Generate Ed25519 keypair for Web Bot Auth
 
@@ -383,6 +383,39 @@ dev-fetch https://yandex.cloud --profile /tmp/dig2crawl-profiles/yandex.cloud --
 | `--dom <selector>` | Find elements and print outer HTML |
 | `--keep-open <SECONDS>` | Keep browser open (useful with --headed) |
 
+### `dig2-wasm-test` — run `cargo test` in a real browser, zero setup
+
+A native [`wasm-bindgen-test`](https://docs.rs/wasm-bindgen-test/) runner. Runs `cargo test --target wasm32-unknown-unknown` inside a real headless browser **without** `wasm-pack`, `wasm-bindgen-cli`, or a manually-installed driver on `PATH` — it auto-detects the browser, downloads the matching WebDriver, drives it, and reports results back to cargo.
+
+Set it as the cargo runner in the crate under test:
+
+```toml
+# .cargo/config.toml
+[target.wasm32-unknown-unknown]
+runner = "dig2-wasm-test"
+```
+
+Then just:
+
+```bash
+cargo test --target wasm32-unknown-unknown
+```
+
+`dig2-wasm-test` (invoked by cargo with the compiled `.wasm`):
+
+1. Generates the wasm-bindgen JS shim in-process (no external `wasm-bindgen` binary).
+2. Serves the shim + test harness from an ephemeral loopback HTTP server.
+3. Auto-detects an installed browser (**Chrome → Firefox → Edge**), reads its version.
+4. Downloads the matching driver (chromedriver via Chrome-for-Testing, geckodriver latest, msedgedriver) into `~/.cache/dig2browser/drivers/` and caches it.
+5. Spawns the driver, runs the tests headless, scrapes the result, and forwards the exit code (0 = all passed). Driver + browser are killed cleanly on exit.
+
+| Env var | Effect |
+|---------|--------|
+| `DIG2_WASM_BROWSER` | Force `chrome` / `firefox` / `edge` instead of auto-detect |
+| `WASM_BINDGEN_TEST_TIMEOUT` | Per-run timeout in seconds (default 20) |
+
+> **Version coupling:** the test crate's `wasm-bindgen` version must match the `wasm-bindgen-cli-support` version dig2browser is built against (currently **0.2.114**). A mismatch yields a clear "schema version mismatch" error — pin `wasm-bindgen = "=0.2.114"` in the test crate.
+
 ## Process Lifecycle
 
 Browser processes are automatically cleaned up — no zombie Chrome/Edge left behind:
@@ -430,6 +463,7 @@ For Firefox/BiDi: geckodriver manages Firefox lifecycle. `DELETE /session` tells
 - [ ] Trace recording/replay
 - [x] crates.io publish
 - [x] Web Bot Auth (Ed25519 signing, JWKS, RFC 9421)
+- [x] Native `wasm-bindgen-test` runner (`dig2-wasm-test`) — `cargo test --target wasm32` in a real browser, zero setup
 
 ## Support the Project
 
@@ -444,6 +478,12 @@ If you find this tool useful, consider supporting development:
 | SOL | Solana | `DZJjmH8Cs5wEafz5Ua86wBBkurSA4xdWXa3LWnBUR94c` |
 
 ## Changelog
+
+### 0.4.12
+
+- New `dig2-wasm-test` binary — a native `wasm-bindgen-test` runner for `cargo test --target wasm32-unknown-unknown`. No `wasm-pack` / `wasm-bindgen-cli` / manually-installed driver required: auto-detects Chrome/Firefox/Edge, auto-downloads + caches the matching WebDriver, generates the shim in-process via `wasm-bindgen-cli-support`, serves it from a loopback HTTP server, drives the headless browser, and forwards the exit code. See the "CLI Tools" section.
+- New `wasmtest` module exposing the runner internals (`shim`, `harness`, `server`, `driver`, `download`).
+- New `detect::version::browser_version` — reads the installed Chrome/Edge version on Windows.
 
 ### 0.4.11
 

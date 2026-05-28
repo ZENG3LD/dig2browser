@@ -1,6 +1,6 @@
 [package]
 name = "dig2browser"
-version = "0.4.11"
+version = "0.4.12"
 edition = "2021"
 license = "MIT"
 description = "Stealth browser automation with Web Bot Auth — CDP, WebDriver, BiDi backends"
@@ -16,6 +16,10 @@ path = "src/bin/keygen.rs"
 [[bin]]
 name = "dev-fetch"
 path = "src/bin/dev_fetch.rs"
+
+[[bin]]
+name = "dig2-wasm-test"
+path = "src/bin/dig2_wasm_test.rs"
 
 [lib]
 name = "dig2browser"
@@ -43,6 +47,9 @@ aes-gcm = "0.10"
 base64 = "0.22"
 futures = "0.3"
 dashmap = "6"
+wasm-bindgen-cli-support = "=0.2.114"
+tiny_http = "0.12"
+zip = "2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [

@@ -6,6 +6,7 @@ pub mod stealth;
 pub mod cookies;
 pub mod detect;
 pub mod browser;
+pub mod wasmtest;
 
 // Re-export main types at crate root
 pub use browser::*;

@@ -4,6 +4,7 @@
 
 pub mod args;
 pub mod binary;
+pub mod version;
 
 pub use args::{BrowserProfile, LaunchConfig};
 pub use binary::{BrowserBinary, BrowserKind, BrowserPreference, detect_browser, get_firefox_paths};
