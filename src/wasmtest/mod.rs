@@ -28,8 +28,8 @@
 //! | Variable | Effect |
 //! |----------|--------|
 //! | `DIG2_WASM_BROWSER` | Force `chrome` / `firefox` / `edge` instead of auto-detect |
-//! | `WASM_BINDGEN_TEST_TIMEOUT` | Per-run timeout in seconds (default 20) |
-//! | `DIG2_WASM_PER_TEST_TIMEOUT` | Per-test timeout in seconds (opt-in; 0 = disabled) |
+//! | `WASM_BINDGEN_TEST_TIMEOUT` | Per-run global timeout in seconds (default 20) |
+//! | `DIG2_WASM_PER_TEST_TIMEOUT` | Stall watchdog: seconds of no `#output` progress before exit 124 (0 or unset = disabled) |
 //! | `DIG2_WASM_HEADLESS` | Set to `0` or `false` to run browser in headed mode (debug) |
 //! | `CHROMEDRIVER` | Path to a pre-installed chromedriver binary (skip download) |
 //! | `MSEDGEDRIVER` | Path to a pre-installed msedgedriver binary (skip download) |
@@ -105,13 +105,22 @@ pub async fn run(wasm_path: &Path, filter_args: &[String]) -> Result<i32, WasmTe
     // 1. Read wasm bytes.
     let wasm_bytes = std::fs::read(wasm_path)?;
 
-    // 2. Create unique temp dir.
+    // 2. Create unique temp dir for shim + harness files.
     let tmp = std::env::temp_dir().join(format!("dig2wasm-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&tmp)?;
 
-    // 3. Run inner logic; always clean up tmp on exit.
-    let result = run_inner(wasm_path, &wasm_bytes, &tmp, filter_args).await;
+    // 3. Create a unique browser profile dir to prevent profile-lock collisions
+    //    when the runner is invoked back-to-back or in parallel.  Chrome and
+    //    Edge hold an exclusive lock on the user-data-dir; sharing the default
+    //    profile with a still-exiting prior instance causes the new launch to
+    //    fail immediately after "resolving driver…".
+    let profile = std::env::temp_dir().join(format!("dig2wasm-profile-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&profile)?;
+
+    // 4. Run inner logic; always clean up both dirs on exit (best-effort).
+    let result = run_inner(wasm_path, &wasm_bytes, &tmp, &profile, filter_args).await;
     let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::remove_dir_all(&profile);
     result
 }
 
@@ -119,6 +128,7 @@ async fn run_inner(
     wasm_path: &Path,
     wasm_bytes: &[u8],
     tmp: &std::path::Path,
+    profile: &std::path::Path,
     filter_args: &[String],
 ) -> Result<i32, WasmTestError> {
     use crate::detect::{detect_browser, BrowserPreference};
@@ -156,8 +166,12 @@ async fn run_inner(
     let shim = shim::generate_shim(wasm_path, tmp)?;
     let stem = shim.js_filename.trim_end_matches(".js").to_string();
 
-    // 8. Read per-test timeout env (GAP-3).
-    let per_test_timeout_secs: Option<u64> = std::env::var("DIG2_WASM_PER_TEST_TIMEOUT")
+    // 8. Read per-test stall watchdog env.
+    //    When > 0, the runner-side poll loop will exit 124 if #output stops
+    //    advancing for this many seconds without a "test result:" line
+    //    appearing (i.e. a single test is hung).  No JS-level wrapper is
+    //    emitted; wrapping exported fns breaks WasmBindgenTestContext accounting.
+    let per_test_stall_secs: Option<u64> = std::env::var("DIG2_WASM_PER_TEST_TIMEOUT")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|&n| n > 0);
@@ -172,13 +186,7 @@ async fn run_inner(
     std::fs::write(tmp.join("index.html"), harness::render_html(spec.nocapture))?;
     std::fs::write(
         tmp.join("run.js"),
-        harness::render_run_js(
-            &stem,
-            &included,
-            spec.include_ignored,
-            filtered_count,
-            per_test_timeout_secs,
-        ),
+        harness::render_run_js(&stem, &included, spec.include_ignored, filtered_count),
     )?;
 
     // 11. Start static server (kept alive until end of scope).
@@ -220,8 +228,9 @@ async fn run_inner(
     // 16. Spawn driver with retry (GAP-4b: retry loop is inside spawn).
     let mut drv = driver::spawn(&driver_path, kind).await?;
 
-    // 17. Build capabilities (GAP-5: headless param).
-    let caps = driver::headless_caps(kind, &browser.path, headless);
+    // 17. Build capabilities — pass the unique profile dir so Chrome/Edge don't
+    //     collide on the default profile when runs overlap (FIX-1).
+    let caps = driver::headless_caps(kind, &browser.path, headless, profile);
 
     // 18. Open WebDriver session.
     let client = crate::webdriver::WdClient::new(&drv.url());
@@ -237,6 +246,19 @@ async fn run_inner(
         .map_err(|e| WasmTestError::WebDriver(e.to_string()))?;
 
     // 20. Poll for test result.
+    //
+    //     Two independent timeout mechanisms run concurrently:
+    //
+    //     a) Global timeout (`WASM_BINDGEN_TEST_TIMEOUT`, default 20s) — the
+    //        whole run must complete within this wall-clock budget.
+    //
+    //     b) Stall watchdog (`DIG2_WASM_PER_TEST_TIMEOUT`, opt-in) — if the
+    //        `#output` text stops advancing (no new characters) for this many
+    //        seconds AND `test result:` has not appeared, the runner treats the
+    //        session as stalled and exits 124.  Because wasm runs single-
+    //        threaded there is no way to skip the stuck test; the watchdog
+    //        surfaces the hang quickly with a clear diagnostic instead of
+    //        letting the global timeout swallow it silently.
     let timeout_secs: u64 = std::env::var("WASM_BINDGEN_TEST_TIMEOUT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -246,7 +268,13 @@ async fn run_inner(
     let poll_interval = std::time::Duration::from_millis(100);
     let timeout_dur = std::time::Duration::from_secs(timeout_secs);
 
-    let (output_text, timed_out) = loop {
+    // Stall watchdog state: track the last time #output content changed.
+    let stall_dur = per_test_stall_secs.map(std::time::Duration::from_secs);
+    let mut last_output_change = std::time::Instant::now();
+    let mut last_output_len: usize = 0;
+
+    // exit_reason: None = completed, Some(true) = global timeout, Some(false) = stall
+    let (output_text, exit_reason) = loop {
         tokio::time::sleep(poll_interval).await;
 
         let val = session
@@ -259,12 +287,26 @@ async fn run_inner(
 
         let text = val.as_str().unwrap_or_default().to_string();
 
-        if text.contains("test result:") {
-            break (text, false);
+        // Track progress for stall watchdog.
+        if text.len() != last_output_len {
+            last_output_len = text.len();
+            last_output_change = std::time::Instant::now();
         }
 
+        if text.contains("test result:") {
+            break (text, None);
+        }
+
+        // Global timeout.
         if start.elapsed() >= timeout_dur {
-            break (text, true);
+            break (text, Some(true));
+        }
+
+        // Stall watchdog: no progress for stall_dur and still no result.
+        if let Some(sd) = stall_dur {
+            if last_output_change.elapsed() >= sd {
+                break (text, Some(false));
+            }
         }
     };
 
@@ -283,12 +325,24 @@ async fn run_inner(
     }
 
     // 23. Determine exit code.
-    if timed_out && !output_text.contains("test result:") {
-        eprintln!(
-            "dig2-wasm-test: timed out after {timeout_secs}s waiting for test result"
-        );
-        // Exit code 124 = conventional timeout code (GAP-6).
-        return Ok(124);
+    match exit_reason {
+        Some(true) => {
+            // Global timeout.
+            eprintln!(
+                "dig2-wasm-test: timed out after {timeout_secs}s waiting for test result"
+            );
+            // Exit code 124 = conventional timeout code (GAP-6).
+            return Ok(124);
+        }
+        Some(false) => {
+            // Stall watchdog fired.
+            let stall_n = per_test_stall_secs.unwrap_or(0);
+            eprintln!(
+                "dig2-wasm-test: stalled — no test progress for {stall_n}s (last output above)"
+            );
+            return Ok(124);
+        }
+        None => {}
     }
 
     match harness::parse_output(&output_text) {

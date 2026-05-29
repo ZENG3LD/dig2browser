@@ -80,43 +80,20 @@ pub fn render_html(nocapture: bool) -> String {
 /// `include_ignored` — forward to `cx.include_ignored(...)`.
 /// `filtered_count` — number of tests excluded by name filters; forwarded to
 ///   `cx.filtered_count(...)`.
-/// `per_test_timeout_secs` — when `Some(n)` and `n > 0`, each test function
-///   is wrapped in a `Promise.race` against a `n`-second rejection timeout so
-///   a single hung test fails instead of stalling the whole suite.  `None` or
-///   `Some(0)` → no wrapping (current behavior, zero risk).
+///
+/// Per-test stall detection is handled by the runner (`run_inner` in
+/// `mod.rs`) via the `DIG2_WASM_PER_TEST_TIMEOUT` env var: if `#output` stops
+/// advancing for that many seconds the runner exits 124.  No JS-level
+/// `Promise.race` wrapper is emitted here — wrapping the exported test fns
+/// breaks `WasmBindgenTestContext`'s per-test accounting and causes it to
+/// report `0 passed; 0 failed`.
 pub fn render_run_js(
     stem: &str,
     test_exports: &[String],
     include_ignored: bool,
     filtered_count: usize,
-    per_test_timeout_secs: Option<u64>,
 ) -> String {
     let include_ignored_js = if include_ignored { "true" } else { "false" };
-
-    // Build the per-test timeout wrapper (GAP-3).
-    // When active we emit a helper and wrap every test via it.
-    let (timeout_helper, map_expr) = match per_test_timeout_secs {
-        Some(secs) if secs > 0 => {
-            let ms = secs * 1000;
-            let helper = format!(
-                r#"
-function withTimeout(fn, ms) {{
-    return function() {{
-        const testPromise = fn();
-        const timeoutPromise = new Promise((_resolve, reject) => {{
-            setTimeout(() => reject(new Error('test timed out after {secs}s')), {ms});
-        }});
-        return Promise.race([testPromise, timeoutPromise]);
-    }};
-}}
-"#
-            );
-            // Wrap each resolved wasm export: s => withTimeout(wasm[s], <ms>)
-            let map = format!("test.map(s => withTimeout(wasm[s], {ms}))");
-            (helper, map)
-        }
-        _ => (String::new(), "test.map(s => wasm[s])".to_string()),
-    };
 
     let mut out = format!(
         r#"import {{
@@ -130,7 +107,7 @@ function withTimeout(fn, ms) {{
 }} from './{stem}.js';
 
 document.getElementById('output').textContent = "Loading Wasm module...";
-{timeout_helper}
+
 async function main(test) {{
     const wasm = await init('./{stem}_bg.wasm');
 
@@ -144,7 +121,7 @@ async function main(test) {{
     cx.include_ignored({include_ignored_js});
     cx.filtered_count({filtered_count});
 
-    await cx.run({map_expr});
+    await cx.run(test.map(s => wasm[s]));
 }}
 
 const tests = [];
@@ -287,7 +264,7 @@ mod tests {
     #[test]
     fn render_run_js_contains_filtered_count() {
         let tests = vec!["__wbgt_foo_abc".to_string()];
-        let js = render_run_js("my_crate", &tests, false, 3, None);
+        let js = render_run_js("my_crate", &tests, false, 3);
         assert!(
             js.contains("cx.filtered_count(3)"),
             "expected filtered_count(3) in run.js"
@@ -295,58 +272,40 @@ mod tests {
     }
 
     #[test]
-    fn render_run_js_no_timeout_uses_direct_map() {
+    fn render_run_js_always_uses_direct_map() {
         let tests = vec!["__wbgt_foo_abc".to_string()];
-        let js = render_run_js("my_crate", &tests, false, 0, None);
+        let js = render_run_js("my_crate", &tests, false, 0);
         assert!(
             js.contains("test.map(s => wasm[s])"),
-            "expected direct map without wrapper"
+            "expected direct map expression"
         );
         assert!(
             !js.contains("withTimeout"),
-            "expected no withTimeout when disabled"
+            "withTimeout must never appear — stall detection is runner-side"
         );
     }
 
+    /// Confirm the JS never contains Promise.race / withTimeout regardless of
+    /// what the caller intends — stall detection lives in the Rust poll loop.
     #[test]
-    fn render_run_js_zero_timeout_uses_direct_map() {
-        let tests = vec!["__wbgt_foo_abc".to_string()];
-        let js = render_run_js("my_crate", &tests, false, 0, Some(0));
-        assert!(
-            js.contains("test.map(s => wasm[s])"),
-            "Some(0) should not enable wrapping"
-        );
-    }
-
-    #[test]
-    fn render_run_js_with_timeout_emits_wrapper() {
-        let tests = vec!["__wbgt_foo_abc".to_string()];
-        let js = render_run_js("my_crate", &tests, false, 0, Some(5));
-        assert!(
-            js.contains("withTimeout"),
-            "expected withTimeout helper when secs > 0"
-        );
-        assert!(
-            js.contains("5000"),
-            "expected timeout in milliseconds (5000)"
-        );
-        assert!(
-            js.contains("test.map(s => withTimeout(wasm[s], 5000))"),
-            "expected wrapped map expression"
-        );
+    fn render_run_js_never_emits_promise_race_wrapper() {
+        let tests = vec!["__wbgt_a".to_string(), "__wbgt_b".to_string()];
+        let js = render_run_js("my_crate", &tests, false, 0);
+        assert!(!js.contains("Promise.race"), "no Promise.race in generated JS");
+        assert!(!js.contains("withTimeout"), "no withTimeout in generated JS");
     }
 
     #[test]
     fn render_run_js_include_ignored_false() {
         let tests: Vec<String> = vec![];
-        let js = render_run_js("stem", &tests, false, 0, None);
+        let js = render_run_js("stem", &tests, false, 0);
         assert!(js.contains("cx.include_ignored(false)"));
     }
 
     #[test]
     fn render_run_js_include_ignored_true() {
         let tests: Vec<String> = vec![];
-        let js = render_run_js("stem", &tests, true, 0, None);
+        let js = render_run_js("stem", &tests, true, 0);
         assert!(js.contains("cx.include_ignored(true)"));
     }
 }

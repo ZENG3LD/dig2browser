@@ -184,7 +184,17 @@ async fn wait_ready(mut child: Child, port: u16) -> Result<SpawnedDriver, WasmTe
 /// `headless` — when `true` (default), adds the headless flag(s) appropriate
 ///   for the browser.  When `false` (env `DIG2_WASM_HEADLESS=0`), the browser
 ///   opens a visible window — useful for debugging a hung test.
-pub fn headless_caps(kind: DriverKind, browser_binary: &Path, headless: bool) -> Capabilities {
+/// `profile_dir` — unique temporary directory for the browser profile.
+///   Chrome and Edge each hold a lock on their user-data-dir; passing a unique
+///   per-run path prevents back-to-back or overlapping runs from colliding on
+///   the default profile.  For Firefox, geckodriver manages its own temp
+///   profile internally so this parameter is ignored.
+pub fn headless_caps(
+    kind: DriverKind,
+    browser_binary: &Path,
+    headless: bool,
+    profile_dir: &Path,
+) -> Capabilities {
     let binary_str = browser_binary.to_string_lossy();
 
     match kind {
@@ -193,6 +203,7 @@ pub fn headless_caps(kind: DriverKind, browser_binary: &Path, headless: bool) ->
             if let Some(am) = caps.always_match.as_mut() {
                 am["goog:chromeOptions"]["binary"] = json!(binary_str);
                 let mut args = vec![
+                    format!("--user-data-dir={}", profile_dir.display()),
                     "--disable-gpu".to_string(),
                     "--no-sandbox".to_string(),
                     "--disable-dev-shm-usage".to_string(),
@@ -209,6 +220,7 @@ pub fn headless_caps(kind: DriverKind, browser_binary: &Path, headless: bool) ->
             if let Some(am) = caps.always_match.as_mut() {
                 am["ms:edgeOptions"]["binary"] = json!(binary_str);
                 let mut args = vec![
+                    format!("--user-data-dir={}", profile_dir.display()),
                     "--disable-gpu".to_string(),
                     "--no-sandbox".to_string(),
                     "--disable-dev-shm-usage".to_string(),
@@ -221,6 +233,8 @@ pub fn headless_caps(kind: DriverKind, browser_binary: &Path, headless: bool) ->
             caps
         }
         DriverKind::Geckodriver => {
+            // geckodriver creates and cleans up its own temporary profile;
+            // no --user-data-dir equivalent is needed here.
             let mut caps = Capabilities::firefox();
             if let Some(am) = caps.always_match.as_mut() {
                 am["moz:firefoxOptions"]["binary"] = json!(binary_str);
@@ -259,10 +273,12 @@ mod tests {
 
     #[test]
     fn headless_caps_chrome_has_correct_keys() {
+        let profile = Path::new("/tmp/dig2wasm-profile-test");
         let caps = headless_caps(
             DriverKind::Chromedriver,
             Path::new("/usr/bin/google-chrome"),
             true,
+            profile,
         );
         let val = serde_json::to_value(&caps).expect("serialize caps");
         let opts = &val["alwaysMatch"]["goog:chromeOptions"];
@@ -270,14 +286,20 @@ mod tests {
         let args = opts["args"].as_array().expect("args is array");
         let has_headless = args.iter().any(|a| a == "--headless=new");
         assert!(has_headless, "expected --headless=new in chrome args");
+        let has_profile = args
+            .iter()
+            .any(|a| a.as_str().map_or(false, |s| s.starts_with("--user-data-dir=")));
+        assert!(has_profile, "expected --user-data-dir in chrome args");
     }
 
     #[test]
     fn headless_caps_chrome_no_headless_flag_when_false() {
+        let profile = Path::new("/tmp/dig2wasm-profile-test");
         let caps = headless_caps(
             DriverKind::Chromedriver,
             Path::new("/usr/bin/google-chrome"),
             false,
+            profile,
         );
         let val = serde_json::to_value(&caps).expect("serialize caps");
         let args = val["alwaysMatch"]["goog:chromeOptions"]["args"]
@@ -289,10 +311,12 @@ mod tests {
 
     #[test]
     fn headless_caps_firefox_has_correct_keys() {
+        let profile = Path::new("/tmp/dig2wasm-profile-test");
         let caps = headless_caps(
             DriverKind::Geckodriver,
             Path::new("/usr/bin/firefox"),
             true,
+            profile,
         );
         let val = serde_json::to_value(&caps).expect("serialize caps");
         let opts = &val["alwaysMatch"]["moz:firefoxOptions"];
@@ -304,10 +328,12 @@ mod tests {
 
     #[test]
     fn headless_caps_firefox_no_headless_flag_when_false() {
+        let profile = Path::new("/tmp/dig2wasm-profile-test");
         let caps = headless_caps(
             DriverKind::Geckodriver,
             Path::new("/usr/bin/firefox"),
             false,
+            profile,
         );
         let val = serde_json::to_value(&caps).expect("serialize caps");
         let args = val["alwaysMatch"]["moz:firefoxOptions"]["args"]
@@ -319,10 +345,12 @@ mod tests {
 
     #[test]
     fn headless_caps_edge_has_correct_keys() {
+        let profile = Path::new(r"C:\Temp\dig2wasm-profile-test");
         let caps = headless_caps(
             DriverKind::Msedgedriver,
             Path::new(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
             true,
+            profile,
         );
         let val = serde_json::to_value(&caps).expect("serialize caps");
         let opts = &val["alwaysMatch"]["ms:edgeOptions"];
@@ -333,5 +361,9 @@ mod tests {
         let args = opts["args"].as_array().expect("args is array");
         let has_headless = args.iter().any(|a| a == "--headless=new");
         assert!(has_headless, "expected --headless=new in edge args");
+        let has_profile = args
+            .iter()
+            .any(|a| a.as_str().map_or(false, |s| s.starts_with("--user-data-dir=")));
+        assert!(has_profile, "expected --user-data-dir in edge args");
     }
 }

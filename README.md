@@ -444,11 +444,13 @@ stripped before comparing, so `--exact ws_binance` matches
 |---------|--------|
 | `DIG2_WASM_BROWSER` | Force `chrome` / `firefox` / `edge` instead of auto-detect |
 | `WASM_BINDGEN_TEST_TIMEOUT` | Per-run global timeout in seconds (default 20) |
-| `DIG2_WASM_PER_TEST_TIMEOUT` | Per-test timeout in seconds — hung test fails instead of stalling the suite (0 = disabled, default) |
+| `DIG2_WASM_PER_TEST_TIMEOUT` | Stall watchdog: if `#output` stops advancing for this many seconds and no `test result:` has appeared, the runner exits 124 and prints the last output so you can see which test was last running. `0` or unset = disabled. Note: because wasm runs single-threaded the hung test cannot be skipped — the watchdog surfaces the hang quickly instead of waiting for the global timeout. |
 | `DIG2_WASM_HEADLESS` | Set to `0` or `false` to open a visible browser window (useful to eyeball a hung test) |
 | `CHROMEDRIVER` | Path to a pre-installed chromedriver binary — skips auto-download |
 | `MSEDGEDRIVER` | Path to a pre-installed msedgedriver binary — skips auto-download |
 | `GECKODRIVER` | Path to a pre-installed geckodriver binary — skips auto-download |
+
+Each run uses an **isolated temporary browser profile** (e.g. `%TEMP%\dig2wasm-profile-<uuid>`). Chrome and Edge hold an exclusive lock on their user-data-dir; without isolation, back-to-back or parallel runs would fail immediately after "resolving driver…" because a still-exiting prior instance holds the profile lock. The profile dir is created before the browser launches and removed on exit (best-effort, same as the harness temp dir).
 
 #### Exit codes
 
@@ -456,7 +458,7 @@ stripped before comparing, so `--exact ws_binance` matches
 |------|---------|
 | 0 | All tests passed |
 | 1 | Test failures, parse error, or driver/browser error |
-| 124 | Global timeout elapsed without a `test result:` line |
+| 124 | Global timeout elapsed **or** stall watchdog fired (no test progress for `DIG2_WASM_PER_TEST_TIMEOUT` seconds) |
 
 > **Version coupling:** the test crate's `wasm-bindgen` version must match the `wasm-bindgen-cli-support` version dig2browser is built against (currently **0.2.114**). A mismatch yields a clear "schema version mismatch" error — pin `wasm-bindgen = "=0.2.114"` in the test crate.
 
