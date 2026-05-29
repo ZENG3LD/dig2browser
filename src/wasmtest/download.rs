@@ -18,10 +18,41 @@ use crate::wasmtest::WasmTestError;
 /// can be matched.  Pass `None` for Geckodriver (latest is always used).
 ///
 /// Returns the path to the cached binary.
+///
+/// ## User-supplied driver (env vars)
+///
+/// Before attempting any cache lookup or download the following environment
+/// variables are checked (matching wasm-pack's convention):
+///
+/// | Variable | Driver |
+/// |----------|--------|
+/// | `CHROMEDRIVER` | Chromedriver |
+/// | `MSEDGEDRIVER` | Msedgedriver |
+/// | `GECKODRIVER` | Geckodriver |
+///
+/// If set and the path exists on disk the function returns it immediately,
+/// skipping the download entirely.
 pub async fn ensure_driver(
     kind: DriverKind,
     browser_version: Option<&str>,
 ) -> Result<PathBuf, WasmTestError> {
+    // GAP-4a: honour user-supplied driver env vars (matches wasm-pack convention).
+    let env_var = match kind {
+        DriverKind::Chromedriver => "CHROMEDRIVER",
+        DriverKind::Msedgedriver => "MSEDGEDRIVER",
+        DriverKind::Geckodriver => "GECKODRIVER",
+    };
+    if let Ok(path_str) = std::env::var(env_var) {
+        let path = PathBuf::from(&path_str);
+        if path.exists() {
+            return Ok(path);
+        }
+        // Env var set but path does not exist — warn and fall through to download.
+        eprintln!(
+            "dig2-wasm-test: {env_var}={path_str} does not exist on disk — falling back to auto-download"
+        );
+    }
+
     let version_label = browser_version.unwrap_or("latest");
     let cache = cache_dir(kind, version_label)?;
 

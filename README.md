@@ -409,10 +409,54 @@ cargo test --target wasm32-unknown-unknown
 4. Downloads the matching driver (chromedriver via Chrome-for-Testing, geckodriver latest, msedgedriver) into `~/.cache/dig2browser/drivers/` and caches it.
 5. Spawns the driver, runs the tests headless, scrapes the result, and forwards the exit code (0 = all passed). Driver + browser are killed cleanly on exit.
 
+#### Test-name filters
+
+```bash
+# Run only tests whose name contains "ws_binance"
+cargo test --target wasm32-unknown-unknown -- ws_binance
+
+# Exact match
+cargo test --target wasm32-unknown-unknown -- --exact ws_binance
+
+# Show console.log output inline
+cargo test --target wasm32-unknown-unknown -- --nocapture
+
+# Include #[ignore]d tests
+cargo test --target wasm32-unknown-unknown -- --include-ignored
+```
+
+Positional arguments (not starting with `--`) are test-name substring filters.
+With `--exact`, the trailing wasm-bindgen hash segment (`_<hexsuffix>`) is
+stripped before comparing, so `--exact ws_binance` matches
+`__wbgt_ws_binance_a1b2c3`.
+
+| Flag | Effect |
+|------|--------|
+| `<name>` (positional) | Substring filter — only tests whose name contains `<name>` are run |
+| `--exact` | Exact match instead of substring (hash suffix stripped) |
+| `--nocapture` | Route `console.log` / `console.error` etc. to stdout |
+| `--include-ignored` | Also run `#[ignore]`d tests |
+| `--ignored` | Same as `--include-ignored` |
+
+#### Environment variables
+
 | Env var | Effect |
 |---------|--------|
 | `DIG2_WASM_BROWSER` | Force `chrome` / `firefox` / `edge` instead of auto-detect |
-| `WASM_BINDGEN_TEST_TIMEOUT` | Per-run timeout in seconds (default 20) |
+| `WASM_BINDGEN_TEST_TIMEOUT` | Per-run global timeout in seconds (default 20) |
+| `DIG2_WASM_PER_TEST_TIMEOUT` | Per-test timeout in seconds — hung test fails instead of stalling the suite (0 = disabled, default) |
+| `DIG2_WASM_HEADLESS` | Set to `0` or `false` to open a visible browser window (useful to eyeball a hung test) |
+| `CHROMEDRIVER` | Path to a pre-installed chromedriver binary — skips auto-download |
+| `MSEDGEDRIVER` | Path to a pre-installed msedgedriver binary — skips auto-download |
+| `GECKODRIVER` | Path to a pre-installed geckodriver binary — skips auto-download |
+
+#### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | All tests passed |
+| 1 | Test failures, parse error, or driver/browser error |
+| 124 | Global timeout elapsed without a `test result:` line |
 
 > **Version coupling:** the test crate's `wasm-bindgen` version must match the `wasm-bindgen-cli-support` version dig2browser is built against (currently **0.2.114**). A mismatch yields a clear "schema version mismatch" error — pin `wasm-bindgen = "=0.2.114"` in the test crate.
 

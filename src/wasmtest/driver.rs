@@ -54,38 +54,74 @@ impl SpawnedDriver {
     }
 }
 
+/// Pick a free ephemeral port by binding `:0` and immediately releasing it.
+fn pick_free_port() -> Result<u16, WasmTestError> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    Ok(listener.local_addr()?.port())
+    // listener dropped here
+}
+
 /// Spawn a WebDriver subprocess and wait until it is ready.
 ///
 /// `driver_path` — path to the driver binary on disk.
 /// `kind` — which driver variant (used to select the correct ready-signal).
+///
+/// The bind-and-drop port-pick has an inherent TOCTOU race: after a quick
+/// `taskkill` the old driver's port may sit in `TIME_WAIT` and the new driver
+/// fails to bind.  To handle back-to-back runs robustly the spawn + ready-wait
+/// is retried up to **3 times**, picking a fresh port each attempt.  Only the
+/// error from the last attempt is returned.
 pub async fn spawn(
     driver_path: &Path,
     _kind: DriverKind,
 ) -> Result<SpawnedDriver, WasmTestError> {
-    // Pick a free ephemeral port.
-    let port = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        listener.local_addr()?.port()
-        // listener is dropped here, freeing the port for the driver.
-    };
+    const MAX_SPAWN_RETRIES: u32 = 3;
+    let mut last_err = WasmTestError::Driver("spawn not attempted".into());
 
-    let mut cmd = tokio::process::Command::new(driver_path);
-    cmd.arg(format!("--port={port}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
+    for attempt in 0..MAX_SPAWN_RETRIES {
+        if attempt > 0 {
+            // Brief back-off before retry — lets TIME_WAIT sockets expire.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
 
-    #[cfg(windows)]
-    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        let port = match pick_free_port() {
+            Ok(p) => p,
+            Err(e) => {
+                last_err = e;
+                continue;
+            }
+        };
 
-    let child = cmd.spawn().map_err(|e| {
-        WasmTestError::Driver(format!(
-            "failed to spawn {}: {e}",
-            driver_path.display()
-        ))
-    })?;
+        let mut cmd = tokio::process::Command::new(driver_path);
+        cmd.arg(format!("--port={port}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
 
-    wait_ready(child, port).await
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+
+        let child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = WasmTestError::Driver(format!(
+                    "failed to spawn {}: {e}",
+                    driver_path.display()
+                ));
+                continue;
+            }
+        };
+
+        match wait_ready(child, port).await {
+            Ok(driver) => return Ok(driver),
+            Err(e) => {
+                last_err = e;
+                // Retry with a fresh port.
+            }
+        }
+    }
+
+    Err(last_err)
 }
 
 /// Poll the driver's `/status` endpoint until it reports ready or 10s elapses.
@@ -141,11 +177,14 @@ async fn wait_ready(mut child: Child, port: u16) -> Result<SpawnedDriver, WasmTe
     ))
 }
 
-/// Build W3C capabilities for a headless wasm test run.
+/// Build W3C capabilities for a wasm test run.
 ///
-/// Sets the browser binary path and the correct headless arguments for
-/// the given driver kind.
-pub fn headless_caps(kind: DriverKind, browser_binary: &Path) -> Capabilities {
+/// `kind` — driver variant (selects capability namespace).
+/// `browser_binary` — path to the browser executable.
+/// `headless` — when `true` (default), adds the headless flag(s) appropriate
+///   for the browser.  When `false` (env `DIG2_WASM_HEADLESS=0`), the browser
+///   opens a visible window — useful for debugging a hung test.
+pub fn headless_caps(kind: DriverKind, browser_binary: &Path, headless: bool) -> Capabilities {
     let binary_str = browser_binary.to_string_lossy();
 
     match kind {
@@ -153,12 +192,15 @@ pub fn headless_caps(kind: DriverKind, browser_binary: &Path) -> Capabilities {
             let mut caps = Capabilities::chrome();
             if let Some(am) = caps.always_match.as_mut() {
                 am["goog:chromeOptions"]["binary"] = json!(binary_str);
-                am["goog:chromeOptions"]["args"] = json!([
-                    "--headless=new",
-                    "--disable-gpu",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage"
-                ]);
+                let mut args = vec![
+                    "--disable-gpu".to_string(),
+                    "--no-sandbox".to_string(),
+                    "--disable-dev-shm-usage".to_string(),
+                ];
+                if headless {
+                    args.insert(0, "--headless=new".to_string());
+                }
+                am["goog:chromeOptions"]["args"] = json!(args);
             }
             caps
         }
@@ -166,12 +208,15 @@ pub fn headless_caps(kind: DriverKind, browser_binary: &Path) -> Capabilities {
             let mut caps = Capabilities::edge();
             if let Some(am) = caps.always_match.as_mut() {
                 am["ms:edgeOptions"]["binary"] = json!(binary_str);
-                am["ms:edgeOptions"]["args"] = json!([
-                    "--headless=new",
-                    "--disable-gpu",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage"
-                ]);
+                let mut args = vec![
+                    "--disable-gpu".to_string(),
+                    "--no-sandbox".to_string(),
+                    "--disable-dev-shm-usage".to_string(),
+                ];
+                if headless {
+                    args.insert(0, "--headless=new".to_string());
+                }
+                am["ms:edgeOptions"]["args"] = json!(args);
             }
             caps
         }
@@ -179,7 +224,8 @@ pub fn headless_caps(kind: DriverKind, browser_binary: &Path) -> Capabilities {
             let mut caps = Capabilities::firefox();
             if let Some(am) = caps.always_match.as_mut() {
                 am["moz:firefoxOptions"]["binary"] = json!(binary_str);
-                am["moz:firefoxOptions"]["args"] = json!(["-headless"]);
+                let args: Vec<&str> = if headless { vec!["-headless"] } else { vec![] };
+                am["moz:firefoxOptions"]["args"] = json!(args);
             }
             caps
         }
@@ -216,6 +262,7 @@ mod tests {
         let caps = headless_caps(
             DriverKind::Chromedriver,
             Path::new("/usr/bin/google-chrome"),
+            true,
         );
         let val = serde_json::to_value(&caps).expect("serialize caps");
         let opts = &val["alwaysMatch"]["goog:chromeOptions"];
@@ -226,10 +273,26 @@ mod tests {
     }
 
     #[test]
+    fn headless_caps_chrome_no_headless_flag_when_false() {
+        let caps = headless_caps(
+            DriverKind::Chromedriver,
+            Path::new("/usr/bin/google-chrome"),
+            false,
+        );
+        let val = serde_json::to_value(&caps).expect("serialize caps");
+        let args = val["alwaysMatch"]["goog:chromeOptions"]["args"]
+            .as_array()
+            .expect("args is array");
+        let has_headless = args.iter().any(|a| a == "--headless=new");
+        assert!(!has_headless, "should NOT have --headless=new when headless=false");
+    }
+
+    #[test]
     fn headless_caps_firefox_has_correct_keys() {
         let caps = headless_caps(
             DriverKind::Geckodriver,
             Path::new("/usr/bin/firefox"),
+            true,
         );
         let val = serde_json::to_value(&caps).expect("serialize caps");
         let opts = &val["alwaysMatch"]["moz:firefoxOptions"];
@@ -240,10 +303,26 @@ mod tests {
     }
 
     #[test]
+    fn headless_caps_firefox_no_headless_flag_when_false() {
+        let caps = headless_caps(
+            DriverKind::Geckodriver,
+            Path::new("/usr/bin/firefox"),
+            false,
+        );
+        let val = serde_json::to_value(&caps).expect("serialize caps");
+        let args = val["alwaysMatch"]["moz:firefoxOptions"]["args"]
+            .as_array()
+            .expect("args is array");
+        let has_headless = args.iter().any(|a| a == "-headless");
+        assert!(!has_headless, "should NOT have -headless when headless=false");
+    }
+
+    #[test]
     fn headless_caps_edge_has_correct_keys() {
         let caps = headless_caps(
             DriverKind::Msedgedriver,
             Path::new(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
+            true,
         );
         let val = serde_json::to_value(&caps).expect("serialize caps");
         let opts = &val["alwaysMatch"]["ms:edgeOptions"];
