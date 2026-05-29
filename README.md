@@ -446,6 +446,8 @@ stripped before comparing, so `--exact ws_binance` matches
 | `WASM_BINDGEN_TEST_TIMEOUT` | Per-run global timeout in seconds (default 20) |
 | `DIG2_WASM_PER_TEST_TIMEOUT` | Stall watchdog: if `#output` stops advancing for this many seconds and no `test result:` has appeared, the runner exits 124 and prints the last output so you can see which test was last running. `0` or unset = disabled. Note: because wasm runs single-threaded the hung test cannot be skipped — the watchdog surfaces the hang quickly instead of waiting for the global timeout. |
 | `DIG2_WASM_HEADLESS` | Set to `0` or `false` to open a visible browser window (useful to eyeball a hung test) |
+| `DIG2_WASM_ESTABLISH_TIMEOUT` | Seconds allowed for the browser/driver establishment phase (`new_session` + initial `goto`). Default **60**. If the browser or driver wedges during startup the run is aborted and exits **124** instead of hanging forever. Example: `DIG2_WASM_ESTABLISH_TIMEOUT=30` to fail faster on slow CI. |
+| `DIG2_WASM_BROWSER_ARGS` | Space-separated extra browser flags appended **after** the built-in flags (`--headless=new`, `--disable-gpu`, `--no-sandbox`, `--disable-dev-shm-usage`, `--user-data-dir=…`) for Chrome and Edge, and after `-headless` for Firefox. Useful for memory/crash tuning under heavy load, e.g. `DIG2_WASM_BROWSER_ARGS="--js-flags=--max-old-space-size=4096 --disable-features=NetworkService"`. Args must not contain spaces. Empty/unset = current behavior. |
 | `CHROMEDRIVER` | Path to a pre-installed chromedriver binary — skips auto-download |
 | `MSEDGEDRIVER` | Path to a pre-installed msedgedriver binary — skips auto-download |
 | `GECKODRIVER` | Path to a pre-installed geckodriver binary — skips auto-download |
@@ -458,7 +460,7 @@ Each run uses an **isolated temporary browser profile** (e.g. `%TEMP%\dig2wasm-p
 |------|---------|
 | 0 | All tests passed |
 | 1 | Test failures, parse error, or driver/browser error |
-| 124 | Global timeout elapsed **or** stall watchdog fired (no test progress for `DIG2_WASM_PER_TEST_TIMEOUT` seconds) |
+| 124 | Global timeout elapsed **or** stall watchdog fired (no test progress for `DIG2_WASM_PER_TEST_TIMEOUT` seconds) **or** establishment timeout (`DIG2_WASM_ESTABLISH_TIMEOUT`) exceeded during `new_session`/`goto` |
 
 > **Version coupling:** the test crate's `wasm-bindgen` version must match the `wasm-bindgen-cli-support` version dig2browser is built against (currently **0.2.114**). A mismatch yields a clear "schema version mismatch" error — pin `wasm-bindgen = "=0.2.114"` in the test crate.
 

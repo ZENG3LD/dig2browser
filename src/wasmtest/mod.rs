@@ -31,6 +31,8 @@
 //! | `WASM_BINDGEN_TEST_TIMEOUT` | Per-run global timeout in seconds (default 20) |
 //! | `DIG2_WASM_PER_TEST_TIMEOUT` | Stall watchdog: seconds of no `#output` progress before exit 124 (0 or unset = disabled) |
 //! | `DIG2_WASM_HEADLESS` | Set to `0` or `false` to run browser in headed mode (debug) |
+//! | `DIG2_WASM_ESTABLISH_TIMEOUT` | Seconds allowed for browser/driver establishment (`new_session` + `goto`). Default 60. Exceeding returns exit code 124. |
+//! | `DIG2_WASM_BROWSER_ARGS` | Space-separated extra browser flags appended after built-in flags (e.g. `--js-flags=--max-old-space-size=4096`). Args must not contain spaces. |
 //! | `CHROMEDRIVER` | Path to a pre-installed chromedriver binary (skip download) |
 //! | `MSEDGEDRIVER` | Path to a pre-installed msedgedriver binary (skip download) |
 //! | `GECKODRIVER` | Path to a pre-installed geckodriver binary (skip download) |
@@ -182,6 +184,20 @@ async fn run_inner(
         _ => true,
     };
 
+    // 9b. Read establishment timeout (FEATURE 1).
+    //     Applies to the new_session + goto phase.  Default 60s.
+    let establish_secs: u64 = std::env::var("DIG2_WASM_ESTABLISH_TIMEOUT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+
+    // 9c. Read extra browser args (FEATURE 3).
+    //     Space-separated; args must not contain spaces themselves.
+    let extra_browser_args: Vec<String> = std::env::var("DIG2_WASM_BROWSER_ARGS")
+        .ok()
+        .map(|s| s.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default();
+
     // 10. Write harness files.
     std::fs::write(tmp.join("index.html"), harness::render_html(spec.nocapture))?;
     std::fs::write(
@@ -230,22 +246,63 @@ async fn run_inner(
 
     // 17. Build capabilities — pass the unique profile dir so Chrome/Edge don't
     //     collide on the default profile when runs overlap (FIX-1).
-    let caps = driver::headless_caps(kind, &browser.path, headless, profile);
+    //     Also forward any extra browser args (FEATURE 3).
+    let caps = driver::headless_caps(kind, &browser.path, headless, profile, &extra_browser_args);
 
-    // 18. Open WebDriver session.
-    let client = crate::webdriver::WdClient::new(&drv.url());
-    let session = client
-        .new_session(caps)
-        .await
-        .map_err(|e| WasmTestError::WebDriver(e.to_string()))?;
+    // 18. Open WebDriver session + navigate — wrapped in an establishment timeout
+    //     (FEATURE 1).  If the browser or driver wedges during new_session or
+    //     goto, the overall establishment phase is capped at `establish_secs`.
+    //     On timeout: kill the driver first, then return exit code 124.
+    //
+    // FEATURE 2 — robust teardown: all paths that return after the driver is
+    // spawned must kill the driver.  We use a `DriverGuard` that kills on Drop,
+    // so early-return paths (establishment timeout, session errors, poll errors)
+    // are all covered without explicit kill calls on every branch.
+    // Capture the URL before the mutable borrow in the guard.
+    let drv_url = drv.url();
 
-    // 19. Navigate to the harness page.
-    session
-        .goto(&server.url())
-        .await
-        .map_err(|e| WasmTestError::WebDriver(e.to_string()))?;
+    struct DriverGuard<'a>(&'a mut driver::SpawnedDriver);
+    impl Drop for DriverGuard<'_> {
+        fn drop(&mut self) {
+            self.0.kill();
+        }
+    }
+    let _drv_guard = DriverGuard(&mut drv);
 
-    // 20. Poll for test result.
+    let client = crate::webdriver::WdClient::new(&drv_url);
+    let establish_dur = std::time::Duration::from_secs(establish_secs);
+
+    // 18a. new_session with establishment timeout.
+    let session = match tokio::time::timeout(establish_dur, client.new_session(caps)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(WasmTestError::WebDriver(e.to_string())),
+        Err(_) => {
+            eprintln!(
+                "dig2-wasm-test: browser/driver establishment timed out after {establish_secs}s"
+            );
+            // _drv_guard Drop will kill the driver.
+            return Ok(124);
+        }
+    };
+
+    // 18b. goto with establishment timeout.
+    match tokio::time::timeout(establish_dur, session.goto(&server.url())).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            // FEATURE 2: close session before driver guard kills the driver.
+            let _ = session.close().await;
+            return Err(WasmTestError::WebDriver(e.to_string()));
+        }
+        Err(_) => {
+            let _ = session.close().await;
+            eprintln!(
+                "dig2-wasm-test: browser/driver establishment timed out after {establish_secs}s"
+            );
+            return Ok(124);
+        }
+    }
+
+    // 19. Poll for test result.
     //
     //     Two independent timeout mechanisms run concurrently:
     //
@@ -277,9 +334,13 @@ async fn run_inner(
     let (output_text, exit_reason) = loop {
         tokio::time::sleep(poll_interval).await;
 
+        // Null-tolerant: the page may not have parsed the harness DOM yet on the
+        // first polls (navigation commits before load completes). Return "" instead
+        // of throwing "Cannot read properties of null" — keep polling until #output
+        // appears with the test-result line.
         let val = session
             .execute_sync(
-                "return document.getElementById('output').textContent",
+                "var o = document.getElementById('output'); return o ? o.textContent : '';",
                 vec![],
             )
             .await
@@ -310,21 +371,22 @@ async fn run_inner(
         }
     };
 
-    // 21. Best-effort session close.
+    // 20. FEATURE 2: close session before driver guard kills the driver, so
+    //     the browser receives a clean shutdown signal first.
     let _ = session.close().await;
 
-    // Keep server and driver alive until here.
+    // Keep server alive until output is printed; driver guard kills driver on
+    // drop at end of scope (or already killed on early return above).
     drop(server);
-    drv.kill();
 
-    // 22. Print output to stdout.
+    // 21. Print output to stdout.
     if !output_text.ends_with('\n') {
         println!("{output_text}");
     } else {
         print!("{output_text}");
     }
 
-    // 23. Determine exit code.
+    // 22. Determine exit code.
     match exit_reason {
         Some(true) => {
             // Global timeout.

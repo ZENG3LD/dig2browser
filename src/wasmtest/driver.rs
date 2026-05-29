@@ -189,11 +189,18 @@ async fn wait_ready(mut child: Child, port: u16) -> Result<SpawnedDriver, WasmTe
 ///   per-run path prevents back-to-back or overlapping runs from colliding on
 ///   the default profile.  For Firefox, geckodriver manages its own temp
 ///   profile internally so this parameter is ignored.
+/// `extra_args` — additional browser flags appended after the built-in flags
+///   for Chrome and Edge (e.g. `--js-flags=--max-old-space-size=4096`).
+///   Comes from `DIG2_WASM_BROWSER_ARGS` (split on whitespace) when called
+///   from `run_inner`; pass an empty slice for the default behavior.
+///   Firefox: extra args are appended to `moz:firefoxOptions.args` as well.
+///   Note: args must not contain spaces themselves (splitting is on whitespace).
 pub fn headless_caps(
     kind: DriverKind,
     browser_binary: &Path,
     headless: bool,
     profile_dir: &Path,
+    extra_args: &[String],
 ) -> Capabilities {
     let binary_str = browser_binary.to_string_lossy();
 
@@ -211,6 +218,7 @@ pub fn headless_caps(
                 if headless {
                     args.insert(0, "--headless=new".to_string());
                 }
+                args.extend_from_slice(extra_args);
                 am["goog:chromeOptions"]["args"] = json!(args);
             }
             caps
@@ -228,6 +236,7 @@ pub fn headless_caps(
                 if headless {
                     args.insert(0, "--headless=new".to_string());
                 }
+                args.extend_from_slice(extra_args);
                 am["ms:edgeOptions"]["args"] = json!(args);
             }
             caps
@@ -238,7 +247,12 @@ pub fn headless_caps(
             let mut caps = Capabilities::firefox();
             if let Some(am) = caps.always_match.as_mut() {
                 am["moz:firefoxOptions"]["binary"] = json!(binary_str);
-                let args: Vec<&str> = if headless { vec!["-headless"] } else { vec![] };
+                let mut args: Vec<String> = if headless {
+                    vec!["-headless".to_string()]
+                } else {
+                    vec![]
+                };
+                args.extend_from_slice(extra_args);
                 am["moz:firefoxOptions"]["args"] = json!(args);
             }
             caps
@@ -279,6 +293,7 @@ mod tests {
             Path::new("/usr/bin/google-chrome"),
             true,
             profile,
+            &[],
         );
         let val = serde_json::to_value(&caps).expect("serialize caps");
         let opts = &val["alwaysMatch"]["goog:chromeOptions"];
@@ -300,6 +315,7 @@ mod tests {
             Path::new("/usr/bin/google-chrome"),
             false,
             profile,
+            &[],
         );
         let val = serde_json::to_value(&caps).expect("serialize caps");
         let args = val["alwaysMatch"]["goog:chromeOptions"]["args"]
@@ -317,6 +333,7 @@ mod tests {
             Path::new("/usr/bin/firefox"),
             true,
             profile,
+            &[],
         );
         let val = serde_json::to_value(&caps).expect("serialize caps");
         let opts = &val["alwaysMatch"]["moz:firefoxOptions"];
@@ -334,6 +351,7 @@ mod tests {
             Path::new("/usr/bin/firefox"),
             false,
             profile,
+            &[],
         );
         let val = serde_json::to_value(&caps).expect("serialize caps");
         let args = val["alwaysMatch"]["moz:firefoxOptions"]["args"]
@@ -351,6 +369,7 @@ mod tests {
             Path::new(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
             true,
             profile,
+            &[],
         );
         let val = serde_json::to_value(&caps).expect("serialize caps");
         let opts = &val["alwaysMatch"]["ms:edgeOptions"];
@@ -365,5 +384,92 @@ mod tests {
             .iter()
             .any(|a| a.as_str().map_or(false, |s| s.starts_with("--user-data-dir=")));
         assert!(has_profile, "expected --user-data-dir in edge args");
+    }
+
+    #[test]
+    fn headless_caps_extra_args_appended_chrome() {
+        let profile = Path::new("/tmp/dig2wasm-profile-test");
+        let extra = vec![
+            "--js-flags=--max-old-space-size=4096".to_string(),
+            "--disable-features=NetworkService".to_string(),
+        ];
+        let caps = headless_caps(
+            DriverKind::Chromedriver,
+            Path::new("/usr/bin/google-chrome"),
+            true,
+            profile,
+            &extra,
+        );
+        let val = serde_json::to_value(&caps).expect("serialize caps");
+        let args = val["alwaysMatch"]["goog:chromeOptions"]["args"]
+            .as_array()
+            .expect("args is array");
+        let arg_strs: Vec<&str> = args.iter().filter_map(|a| a.as_str()).collect();
+        assert!(
+            arg_strs.contains(&"--js-flags=--max-old-space-size=4096"),
+            "extra arg must appear in chrome args; got: {arg_strs:?}"
+        );
+        assert!(
+            arg_strs.contains(&"--disable-features=NetworkService"),
+            "second extra arg must appear in chrome args; got: {arg_strs:?}"
+        );
+        // Built-in flags must still be present.
+        assert!(arg_strs.contains(&"--headless=new"), "headless must still be set");
+        assert!(
+            arg_strs.iter().any(|a| a.starts_with("--user-data-dir=")),
+            "--user-data-dir must still be set"
+        );
+        // Extra args come AFTER built-ins.
+        let headless_pos = arg_strs.iter().position(|&a| a == "--headless=new").unwrap();
+        let extra_pos = arg_strs
+            .iter()
+            .position(|&a| a == "--js-flags=--max-old-space-size=4096")
+            .unwrap();
+        assert!(extra_pos > headless_pos, "extra args must be after built-in flags");
+    }
+
+    #[test]
+    fn headless_caps_extra_args_appended_edge() {
+        let profile = Path::new(r"C:\Temp\dig2wasm-profile-test");
+        let extra = vec!["--js-flags=--max-old-space-size=2048".to_string()];
+        let caps = headless_caps(
+            DriverKind::Msedgedriver,
+            Path::new(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
+            true,
+            profile,
+            &extra,
+        );
+        let val = serde_json::to_value(&caps).expect("serialize caps");
+        let args = val["alwaysMatch"]["ms:edgeOptions"]["args"]
+            .as_array()
+            .expect("args is array");
+        let arg_strs: Vec<&str> = args.iter().filter_map(|a| a.as_str()).collect();
+        assert!(
+            arg_strs.contains(&"--js-flags=--max-old-space-size=2048"),
+            "extra arg must appear in edge args; got: {arg_strs:?}"
+        );
+    }
+
+    #[test]
+    fn headless_caps_extra_args_appended_firefox() {
+        let profile = Path::new("/tmp/dig2wasm-profile-test");
+        let extra = vec!["--safe-mode".to_string()];
+        let caps = headless_caps(
+            DriverKind::Geckodriver,
+            Path::new("/usr/bin/firefox"),
+            true,
+            profile,
+            &extra,
+        );
+        let val = serde_json::to_value(&caps).expect("serialize caps");
+        let args = val["alwaysMatch"]["moz:firefoxOptions"]["args"]
+            .as_array()
+            .expect("args is array");
+        let arg_strs: Vec<&str> = args.iter().filter_map(|a| a.as_str()).collect();
+        assert!(
+            arg_strs.contains(&"--safe-mode"),
+            "extra arg must appear in firefox args; got: {arg_strs:?}"
+        );
+        assert!(arg_strs.contains(&"-headless"), "-headless must still be set");
     }
 }
