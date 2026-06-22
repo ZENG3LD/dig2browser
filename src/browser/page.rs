@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::cookies::CookieJar;
 
 use crate::browser::backend::{BoundingBox, ElementHandle, PageBackend, PrintOptions};
-use crate::browser::devtools::PageDevTools;
+use crate::browser::devtools::{DevToolsEvent, PageDevTools};
 use crate::browser::error::BrowserError;
 use crate::browser::wait::WaitBuilder;
 
@@ -192,6 +192,257 @@ impl StealthPage {
     pub async fn devtools(&self) -> Result<PageDevTools, BrowserError> {
         let rx = self.backend.subscribe_events().await?;
         Ok(PageDevTools::new(rx))
+    }
+
+    // ── Task 1: Raw input by coordinates ─────────────────────────────────────
+
+    /// Click at viewport coordinates (CSS pixels).
+    ///
+    /// Synthesizes `mousePressed` + `mouseReleased` for the left button.
+    pub async fn click_at(&self, x: f64, y: f64) -> Result<(), BrowserError> {
+        self.backend.click_at(x, y).await
+    }
+
+    /// Right-click at viewport coordinates.
+    ///
+    /// Synthesizes `mousePressed` + `mouseReleased` for the right button.
+    pub async fn right_click_at(&self, x: f64, y: f64) -> Result<(), BrowserError> {
+        self.backend.right_click_at(x, y).await
+    }
+
+    /// Move the mouse to viewport coordinates without clicking.
+    ///
+    /// Fires a `mouseMoved` event for hover/tooltip testing.
+    pub async fn mouse_move(&self, x: f64, y: f64) -> Result<(), BrowserError> {
+        self.backend.mouse_move_to(x, y).await
+    }
+
+    /// Press-drag-release from `(x1, y1)` to `(x2, y2)`.
+    ///
+    /// Synthesizes `mousePressed` → several `mouseMoved` steps → `mouseReleased`
+    /// so drag-handlers fire correctly.
+    pub async fn drag(&self, x1: f64, y1: f64, x2: f64, y2: f64) -> Result<(), BrowserError> {
+        self.backend.drag(x1, y1, x2, y2).await
+    }
+
+    /// Dispatch a scroll-wheel event at `(x, y)` with CSS-pixel deltas.
+    pub async fn wheel(&self, x: f64, y: f64, dx: f64, dy: f64) -> Result<(), BrowserError> {
+        self.backend.wheel(x, y, dx, dy).await
+    }
+
+    /// Press a key by name.
+    ///
+    /// Accepts standard DOM key names (`"Enter"`, `"Escape"`, `"ArrowLeft"`,
+    /// `"Tab"`, `"Backspace"`) or a single printable character (`"a"`, `"A"`, …).
+    /// Synthesizes `keyDown` + `keyUp`.
+    pub async fn key_press(&self, key: &str) -> Result<(), BrowserError> {
+        self.backend.key_press(key).await
+    }
+
+    /// Hold modifiers and press a key — e.g. `(&["Control"], "r")` for Ctrl+R.
+    ///
+    /// Modifier names: `"Alt"`, `"Control"`, `"Meta"`, `"Shift"`.
+    pub async fn key_chord(&self, modifiers: &[&str], key: &str) -> Result<(), BrowserError> {
+        self.backend.key_chord(modifiers, key).await
+    }
+
+    // ── Task 2: Viewport / device emulation ──────────────────────────────────
+
+    /// Override the viewport dimensions and device pixel ratio.
+    ///
+    /// Calls `Emulation.setDeviceMetricsOverride`. Affects CSS media queries,
+    /// `window.innerWidth/Height`, and screenshot dimensions.
+    pub async fn set_viewport(
+        &self,
+        width: u32,
+        height: u32,
+        device_scale_factor: f64,
+    ) -> Result<(), BrowserError> {
+        self.backend
+            .set_viewport(width, height, device_scale_factor)
+            .await
+    }
+
+    /// Clear a previous `set_viewport` override.
+    ///
+    /// Calls `Emulation.clearDeviceMetricsOverride`.
+    pub async fn clear_viewport_override(&self) -> Result<(), BrowserError> {
+        self.backend.clear_viewport_override().await
+    }
+
+    // ── Task 3: DOM inspection ────────────────────────────────────────────────
+
+    /// Walk the DOM below `selector` (up to `max_depth` levels) and return a
+    /// JSON tree of `{tag, id, classes, rect:[x,y,w,h], children:[…]}` nodes.
+    ///
+    /// Useful for layout debugging without screenshots.
+    pub async fn dom_tree(
+        &self,
+        selector: &str,
+        max_depth: u32,
+    ) -> Result<serde_json::Value, BrowserError> {
+        let js = format!(
+            r#"
+(function() {{
+    function walk(el, depth) {{
+        if (!el || depth < 0) return null;
+        var r = el.getBoundingClientRect();
+        var node = {{
+            tag: el.tagName ? el.tagName.toLowerCase() : '',
+            id: el.id || '',
+            classes: el.className ? el.className.split(' ').filter(Boolean) : [],
+            rect: [r.left, r.top, r.width, r.height],
+            children: []
+        }};
+        if (depth > 0) {{
+            for (var i = 0; i < el.children.length; i++) {{
+                var child = walk(el.children[i], depth - 1);
+                if (child) node.children.push(child);
+            }}
+        }}
+        return node;
+    }}
+    var root = document.querySelector({selector_json});
+    if (!root) return null;
+    return walk(root, {max_depth});
+}})()
+"#,
+            selector_json = serde_json::to_string(selector)
+                .map_err(|e| BrowserError::JsEval(e.to_string()))?,
+            max_depth = max_depth
+        );
+        let val = self.backend.eval(&js).await?;
+        Ok(val)
+    }
+
+    /// Get the bounding rect `(x, y, width, height)` of the first element
+    /// matching `selector`, or `None` if the element was not found.
+    pub async fn element_rect(
+        &self,
+        selector: &str,
+    ) -> Result<Option<(f64, f64, f64, f64)>, BrowserError> {
+        let js = format!(
+            r#"
+(function() {{
+    var el = document.querySelector({selector_json});
+    if (!el) return null;
+    var r = el.getBoundingClientRect();
+    return JSON.stringify([r.left, r.top, r.width, r.height]);
+}})()
+"#,
+            selector_json = serde_json::to_string(selector)
+                .map_err(|e| BrowserError::JsEval(e.to_string()))?,
+        );
+        let val = self.backend.eval(&js).await?;
+        if val.is_null() {
+            return Ok(None);
+        }
+        // The value is a JSON-encoded array string.
+        let arr_str = val.as_str().unwrap_or("null");
+        let arr: Vec<f64> = serde_json::from_str(arr_str)
+            .map_err(|e| BrowserError::JsEval(format!("element_rect parse error: {e}")))?;
+        if arr.len() < 4 {
+            return Ok(None);
+        }
+        Ok(Some((arr[0], arr[1], arr[2], arr[3])))
+    }
+
+    // ── Task 4: Performance + paint timing ────────────────────────────────────
+
+    /// Return Navigation Timing and Resource Timing entries as JSON.
+    pub async fn performance_entries(&self) -> Result<serde_json::Value, BrowserError> {
+        let js = r#"
+(function() {
+    var nav = performance.getEntriesByType('navigation');
+    var res = performance.getEntriesByType('resource');
+    return JSON.stringify({ navigation: nav, resources: res });
+})()
+"#;
+        let val = self.backend.eval(js).await?;
+        let s = val.as_str().unwrap_or("{}");
+        serde_json::from_str(s).map_err(|e| BrowserError::JsEval(format!("performance_entries parse error: {e}")))
+    }
+
+    /// Return the current `performance.now()` reading in milliseconds.
+    pub async fn now_ms(&self) -> Result<f64, BrowserError> {
+        let val = self.backend.eval("performance.now()").await?;
+        val.as_f64()
+            .ok_or_else(|| BrowserError::JsEval("performance.now() did not return a number".into()))
+    }
+
+    /// Count `requestAnimationFrame` callbacks fired over `duration_ms` milliseconds.
+    ///
+    /// Resolves once the timer expires and returns the frame count.
+    pub async fn count_frames(&self, duration_ms: u64) -> Result<u64, BrowserError> {
+        // Kick off the counter in the page, then poll for the result.
+        let start_js = format!(
+            r#"
+(function() {{
+    window.__d2b_frame_count = 0;
+    window.__d2b_frame_done = false;
+    function tick() {{
+        window.__d2b_frame_count++;
+        if (!window.__d2b_frame_done) requestAnimationFrame(tick);
+    }}
+    requestAnimationFrame(tick);
+    setTimeout(function() {{ window.__d2b_frame_done = true; }}, {duration_ms});
+}})()
+"#
+        );
+        self.backend.eval(&start_js).await?;
+        // Wait for duration + a bit of padding.
+        tokio::time::sleep(Duration::from_millis(duration_ms + 200)).await;
+        let val = self.backend.eval("window.__d2b_frame_count || 0").await?;
+        Ok(val.as_u64().unwrap_or(0))
+    }
+
+    // ── Task 5: Raw CDP escape hatch ─────────────────────────────────────────
+
+    /// Send a raw CDP method on this page's session and return the `result` object.
+    ///
+    /// Use this for anything not yet wrapped by the typed API.
+    pub async fn cdp_call(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, BrowserError> {
+        self.backend.cdp_call(method, params).await
+    }
+
+    // ── Task 6: Network log streaming ────────────────────────────────────────
+
+    /// Drain queued network events since the last call.
+    ///
+    /// Returns a `Vec` of `{method, url, status?, mime?, timestamp}` objects.
+    /// Requires that `devtools()` has been called first (events are produced by
+    /// the same background bridge).
+    pub async fn drain_network(&self) -> Result<Vec<serde_json::Value>, BrowserError> {
+        let mut dt = self.devtools().await?;
+        let mut events = Vec::new();
+        while let Some(ev) = dt.try_next() {
+            if let DevToolsEvent::Network(n) = ev {
+                let status = n.status.map(|s| serde_json::Value::Number(s.into()));
+                let mime = n.params["response"]["mimeType"]
+                    .as_str()
+                    .map(|s| serde_json::Value::String(s.to_owned()));
+                let ts = n.params["timestamp"].clone();
+                let mut obj = serde_json::json!({
+                    "method": n.method,
+                    "url": n.url,
+                });
+                if let Some(s) = status {
+                    obj["status"] = s;
+                }
+                if let Some(m) = mime {
+                    obj["mime"] = m;
+                }
+                if !ts.is_null() {
+                    obj["timestamp"] = ts;
+                }
+                events.push(obj);
+            }
+        }
+        Ok(events)
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "dig2browser"
-version = "0.4.15"
+version = "0.4.16"
 edition = "2021"
 license = "MIT"
 description = "Stealth browser automation with Web Bot Auth — CDP, WebDriver, BiDi backends"
@@ -16,6 +16,14 @@ path = "src/bin/keygen.rs"
 [[bin]]
 name = "dev-fetch"
 path = "src/bin/dev_fetch.rs"
+
+[[bin]]
+name = "dev-attach"
+path = "src/bin/dev_attach.rs"
+
+[[bin]]
+name = "dev-launch-debug"
+path = "src/bin/dev_launch_debug.rs"
 
 [[bin]]
 name = "dig2-wasm-test"

@@ -13,6 +13,11 @@ use crate::browser::error::BrowserError;
 
 /// A running browser instance capable of creating new pages.
 pub trait BrowserBackend: Send + Sync {
+    /// Attempt to downcast to the concrete CDP backend for attach-mode operations.
+    /// Returns `None` on non-CDP backends (BiDi, etc.).
+    fn as_any_cdp(&self) -> Option<&cdp::CdpBrowserBackend> {
+        None
+    }
     /// Open a new page/tab, navigate to `url`, and return a page handle.
     fn new_page<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<Box<dyn PageBackend>, BrowserError>>;
 
@@ -149,6 +154,67 @@ pub trait PageBackend: Send + Sync {
         &'a self,
         source: &'a str,
     ) -> BoxFuture<'a, Result<String, BrowserError>>;
+
+    // ── Raw input by coordinates ──────────────────────────────────────────
+
+    /// Left-click at viewport coordinates.
+    fn click_at<'a>(&'a self, x: f64, y: f64) -> BoxFuture<'a, Result<(), BrowserError>>;
+
+    /// Right-click at viewport coordinates.
+    fn right_click_at<'a>(&'a self, x: f64, y: f64) -> BoxFuture<'a, Result<(), BrowserError>>;
+
+    /// Move mouse to viewport coordinates (hover).
+    fn mouse_move_to<'a>(&'a self, x: f64, y: f64) -> BoxFuture<'a, Result<(), BrowserError>>;
+
+    /// Press-drag-release from `(x1,y1)` to `(x2,y2)`.
+    fn drag<'a>(
+        &'a self,
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+    ) -> BoxFuture<'a, Result<(), BrowserError>>;
+
+    /// Scroll-wheel event at `(x, y)` with CSS-pixel deltas.
+    fn wheel<'a>(
+        &'a self,
+        x: f64,
+        y: f64,
+        dx: f64,
+        dy: f64,
+    ) -> BoxFuture<'a, Result<(), BrowserError>>;
+
+    /// Press a key by DOM key name (keyDown + keyUp).
+    fn key_press<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), BrowserError>>;
+
+    /// Hold modifiers and press a key.
+    fn key_chord<'a>(
+        &'a self,
+        modifiers: &'a [&'a str],
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<(), BrowserError>>;
+
+    // ── Viewport / device emulation ───────────────────────────────────────
+
+    /// Override viewport size + device pixel ratio.
+    fn set_viewport<'a>(
+        &'a self,
+        width: u32,
+        height: u32,
+        device_scale_factor: f64,
+    ) -> BoxFuture<'a, Result<(), BrowserError>>;
+
+    /// Clear a previous viewport override.
+    fn clear_viewport_override<'a>(&'a self) -> BoxFuture<'a, Result<(), BrowserError>>;
+
+    // ── Raw CDP escape hatch ──────────────────────────────────────────────
+
+    /// Send a raw CDP method on this page's session and return the `result` object.
+    fn cdp_call<'a>(
+        &'a self,
+        method: &'a str,
+        params: Option<serde_json::Value>,
+    ) -> BoxFuture<'a, Result<serde_json::Value, BrowserError>>;
 
     // ── DevTools events ───────────────────────────────────────────────────
 

@@ -99,6 +99,83 @@ impl CdpSession {
         Ok(())
     }
 
+    /// Dispatch a wheel (scroll) event at `(x, y)` with the given deltas.
+    ///
+    /// Maps to `Input.dispatchMouseEvent` with `type: "mouseWheel"`.
+    pub async fn dispatch_wheel(
+        &self,
+        x: f64,
+        y: f64,
+        dx: f64,
+        dy: f64,
+    ) -> Result<(), CdpError> {
+        self.call(
+            "Input.dispatchMouseEvent",
+            Some(json!({
+                "type": "mouseWheel",
+                "x": x,
+                "y": y,
+                "deltaX": dx,
+                "deltaY": dy,
+                "button": "none",
+                "clickCount": 0,
+            })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Dispatch a raw mouse event with modifier keys.
+    ///
+    /// `modifiers` is a bitmask: 1=Alt, 2=Ctrl, 4=Meta, 8=Shift.
+    pub async fn dispatch_mouse_event_with_modifiers(
+        &self,
+        event_type: &str,
+        x: f64,
+        y: f64,
+        button: &str,
+        click_count: u32,
+        modifiers: u32,
+    ) -> Result<(), CdpError> {
+        self.call(
+            "Input.dispatchMouseEvent",
+            Some(json!({
+                "type": event_type,
+                "x": x,
+                "y": y,
+                "button": button,
+                "clickCount": click_count,
+                "modifiers": modifiers,
+            })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Dispatch a raw key event with modifier keys.
+    ///
+    /// `modifiers` is a bitmask: 1=Alt, 2=Ctrl, 4=Meta, 8=Shift.
+    pub async fn dispatch_key_event_with_modifiers(
+        &self,
+        event_type: &str,
+        key: &str,
+        code: &str,
+        text: Option<&str>,
+        modifiers: u32,
+    ) -> Result<(), CdpError> {
+        let mut params = json!({
+            "type": event_type,
+            "key": key,
+            "code": code,
+            "modifiers": modifiers,
+        });
+        if let Some(t) = text {
+            params["text"] = serde_json::Value::String(t.to_owned());
+        }
+        self.call("Input.dispatchKeyEvent", Some(params)).await?;
+        Ok(())
+    }
+
     /// Dispatch a touch event.
     ///
     /// `event_type` is one of `"touchStart"`, `"touchEnd"`, `"touchMove"`, `"touchCancel"`.

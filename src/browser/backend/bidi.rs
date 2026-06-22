@@ -620,6 +620,96 @@ impl PageBackend for BiDiPageBackend {
         Box::pin(async move { Ok(String::new()) })
     }
 
+    // ── Raw input by coordinates (no-op on BiDi — WebDriver has no Input domain) ──
+
+    fn click_at<'a>(&'a self, x: f64, y: f64) -> BoxFuture<'a, Result<(), BrowserError>> {
+        let js = format!("document.elementFromPoint({x}, {y})?.click()");
+        Box::pin(async move {
+            self.wd_session
+                .execute_sync(&js, vec![])
+                .await
+                .map(|_| ())
+                .map_err(|e| BrowserError::Other(e.to_string()))
+        })
+    }
+
+    fn right_click_at<'a>(&'a self, _x: f64, _y: f64) -> BoxFuture<'a, Result<(), BrowserError>> {
+        // BiDi has no right-click by coordinates; no-op.
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn mouse_move_to<'a>(&'a self, _x: f64, _y: f64) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn drag<'a>(
+        &'a self,
+        _x1: f64,
+        _y1: f64,
+        _x2: f64,
+        _y2: f64,
+    ) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn wheel<'a>(
+        &'a self,
+        _x: f64,
+        _y: f64,
+        _dx: f64,
+        _dy: f64,
+    ) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn key_press<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), BrowserError>> {
+        let script = format!("document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', {{key: {key_json}, bubbles: true}}));", key_json = serde_json::to_string(key).unwrap_or_else(|_| "\"\"".into()));
+        Box::pin(async move {
+            self.wd_session
+                .execute_sync(&script, vec![])
+                .await
+                .map(|_| ())
+                .map_err(|e| BrowserError::Other(e.to_string()))
+        })
+    }
+
+    fn key_chord<'a>(
+        &'a self,
+        _modifiers: &'a [&'a str],
+        _key: &'a str,
+    ) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    // ── Viewport emulation ────────────────────────────────────────────────
+
+    fn set_viewport<'a>(
+        &'a self,
+        _width: u32,
+        _height: u32,
+        _device_scale_factor: f64,
+    ) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn clear_viewport_override<'a>(&'a self) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    // ── Raw CDP escape hatch (not available on BiDi) ──────────────────────
+
+    fn cdp_call<'a>(
+        &'a self,
+        _method: &'a str,
+        _params: Option<serde_json::Value>,
+    ) -> BoxFuture<'a, Result<serde_json::Value, BrowserError>> {
+        Box::pin(async move {
+            Err(BrowserError::Other(
+                "cdp_call is not supported on the BiDi (Firefox) backend".into(),
+            ))
+        })
+    }
+
     // ── DevTools events ───────────────────────────────────────────────────
 
     fn subscribe_events<'a>(

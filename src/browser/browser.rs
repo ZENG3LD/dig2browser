@@ -9,6 +9,24 @@ use crate::browser::backend::{BrowserBackend, cdp::CdpBrowserBackend, bidi::BiDi
 use crate::browser::error::BrowserError;
 use crate::browser::page::StealthPage;
 
+/// Query `http://127.0.0.1:{port}/json/version` and return the browser-level
+/// `webSocketDebuggerUrl`. The browser must have been launched with
+/// `--remote-debugging-port=<port>`.
+pub async fn discover_ws_url(port: u16) -> Result<String, BrowserError> {
+    let url = format!("http://127.0.0.1:{port}/json/version");
+    let resp = reqwest::get(&url)
+        .await
+        .map_err(|e| BrowserError::Connect(format!("GET {url}: {e}")))?;
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| BrowserError::Connect(format!("parse json: {e}")))?;
+    body.get("webSocketDebuggerUrl")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_owned())
+        .ok_or_else(|| BrowserError::Connect("no webSocketDebuggerUrl in /json/version".into()))
+}
+
 /// A running browser instance with anti-detection stealth applied.
 ///
 /// # Example
@@ -60,6 +78,46 @@ impl StealthBrowser {
             backend,
             _launch: launch,
             _stealth: stealth,
+        })
+    }
+
+    /// Attach to an already-running Chrome/Edge instance.
+    ///
+    /// Obtain `ws_url` via [`discover_ws_url`] or the browser's own stderr
+    /// ("DevTools listening on ws://…"). The browser is NOT killed when this
+    /// instance is dropped or closed.
+    pub async fn attach(ws_url: String) -> Result<Self, BrowserError> {
+        let launch = LaunchConfig::default();
+        let stealth = StealthConfig::default();
+        let b = CdpBrowserBackend::attach(ws_url, launch.clone(), stealth.clone()).await?;
+        Ok(Self {
+            backend: Box::new(b),
+            _launch: launch,
+            _stealth: stealth,
+        })
+    }
+
+    /// List all open page targets (tabs) in an attached/launched browser.
+    /// Returns `(target_id, url)` pairs. Only works on the CDP backend.
+    pub async fn pages(&self) -> Result<Vec<(String, String)>, BrowserError> {
+        let cdp = self
+            .backend
+            .as_any_cdp()
+            .ok_or_else(|| BrowserError::Connect("pages() is only available on the CDP backend".into()))?;
+        cdp.list_pages().await
+    }
+
+    /// Attach to an existing open tab by `target_id` (from [`StealthBrowser::pages`]).
+    /// Returns a `StealthPage` connected to that tab without creating a new one.
+    /// Does NOT inject stealth scripts — the page is already running.
+    pub async fn attach_page(&self, target_id: &str) -> Result<StealthPage, BrowserError> {
+        let cdp = self
+            .backend
+            .as_any_cdp()
+            .ok_or_else(|| BrowserError::Connect("attach_page() is only available on the CDP backend".into()))?;
+        let page = cdp.attach_to_existing_page(target_id).await?;
+        Ok(StealthPage {
+            backend: Arc::from(Box::new(page) as Box<dyn crate::browser::backend::PageBackend>),
         })
     }
 

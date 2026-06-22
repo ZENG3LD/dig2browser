@@ -31,8 +31,9 @@ pub(crate) struct CdpBrowserBackend {
     launch: LaunchConfig,
     stealth: StealthConfig,
     page_count: AtomicU32,
-    /// Child process — kept alive for the lifetime of this backend.
-    _child: tokio::process::Child,
+    /// Child process — `Some` when we launched the browser ourselves, `None`
+    /// in attach mode (we must not kill a browser the user opened manually).
+    _child: Option<tokio::process::Child>,
     /// Profile dir path, deleted on drop if ephemeral.
     profile_dir: std::path::PathBuf,
     profile_ephemeral: bool,
@@ -40,11 +41,14 @@ pub(crate) struct CdpBrowserBackend {
 
 impl Drop for CdpBrowserBackend {
     fn drop(&mut self) {
-        // kill_on_drop(true) handles the common case, but start_kill() here
-        // acts as a safety net for any edge case where the Child's drop
-        // behaviour might not fire (e.g. if Child was somehow replaced).
-        // start_kill() is non-blocking — it sends the signal without waiting.
-        let _ = self._child.start_kill();
+        // Only kill/clean-up when we own the child (launch mode).
+        if let Some(ref mut child) = self._child {
+            // kill_on_drop(true) handles the common case, but start_kill() here
+            // acts as a safety net for any edge case where the Child's drop
+            // behaviour might not fire (e.g. if Child was somehow replaced).
+            // start_kill() is non-blocking — it sends the signal without waiting.
+            let _ = child.start_kill();
+        }
         if self.profile_ephemeral {
             let _ = std::fs::remove_dir_all(&self.profile_dir);
         }
@@ -103,9 +107,85 @@ impl CdpBrowserBackend {
             launch: launch.clone(),
             stealth: stealth.clone(),
             page_count: AtomicU32::new(0),
-            _child: child,
+            _child: Some(child),
             profile_dir,
             profile_ephemeral,
+        })
+    }
+
+    /// Attach to an already-running Chrome/Edge that was launched with
+    /// `--remote-debugging-port=NNNN`. Connect to a browser-level WebSocket
+    /// directly (obtain it via [`discover_ws_url`] first).
+    ///
+    /// Attach mode never kills the user's browser when this backend is dropped.
+    pub(crate) async fn attach(
+        ws_url: String,
+        launch: LaunchConfig,
+        stealth: StealthConfig,
+    ) -> Result<Self, BrowserError> {
+        let client = CdpClient::connect(&ws_url)
+            .await
+            .map_err(|e| BrowserError::Connect(e.to_string()))?;
+        let root = client.root_session();
+        Ok(Self {
+            client,
+            root,
+            launch,
+            stealth,
+            page_count: AtomicU32::new(0),
+            _child: None, // not our child — do not kill on drop
+            profile_dir: std::path::PathBuf::new(),
+            profile_ephemeral: false,
+        })
+    }
+
+    /// List all open page targets (tabs). Returns `(target_id, url)` pairs.
+    pub(crate) async fn list_pages(&self) -> Result<Vec<(String, String)>, BrowserError> {
+        let targets = self
+            .root
+            .get_targets()
+            .await
+            .map_err(|e| BrowserError::Connect(e.to_string()))?;
+        Ok(targets
+            .into_iter()
+            .filter(|t| t.r#type == "page")
+            .map(|t| (t.target_id, t.url))
+            .collect())
+    }
+
+    /// Attach to an existing page target (open tab) by its `target_id`.
+    /// Does NOT inject stealth scripts — the page is already running.
+    pub(crate) async fn attach_to_existing_page(
+        &self,
+        target_id: &str,
+    ) -> Result<CdpPageBackend, BrowserError> {
+        let session_id = self
+            .root
+            .attach_to_target(target_id)
+            .await
+            .map_err(|e| BrowserError::Connect(e.to_string()))?;
+
+        let session = CdpSession::with_session_id(session_id, Arc::clone(&self.client));
+
+        // Enable required domains so events and eval work.
+        session
+            .call("Page.enable", None)
+            .await
+            .map_err(|e| BrowserError::Connect(e.to_string()))?;
+        session
+            .call("Network.enable", None)
+            .await
+            .map_err(|e| BrowserError::Connect(e.to_string()))?;
+        session
+            .call("Runtime.enable", None)
+            .await
+            .map_err(|e| BrowserError::Connect(e.to_string()))?;
+
+        self.page_count.fetch_add(1, Ordering::Relaxed);
+
+        Ok(CdpPageBackend {
+            session,
+            target_id: target_id.to_owned(),
         })
     }
 
@@ -254,6 +334,10 @@ impl CdpBrowserBackend {
 }
 
 impl BrowserBackend for CdpBrowserBackend {
+    fn as_any_cdp(&self) -> Option<&CdpBrowserBackend> {
+        Some(self)
+    }
+
     fn new_page<'a>(
         &'a self,
         url: &'a str,
@@ -275,8 +359,10 @@ impl BrowserBackend for CdpBrowserBackend {
         Box::pin(async move {
             // Ask the browser to close gracefully via CDP.
             let _ = self.root.call("Browser.close", None).await;
-            // Then kill the process if still running.
-            let _ = self._child.kill().await;
+            // Then kill the process if still running (only in launch mode).
+            if let Some(ref mut child) = self._child {
+                let _ = child.kill().await;
+            }
             if self.profile_ephemeral {
                 let _ = std::fs::remove_dir_all(&self.profile_dir);
                 self.profile_ephemeral = false; // prevent double-cleanup in Drop
@@ -806,6 +892,176 @@ impl PageBackend for CdpPageBackend {
         })
     }
 
+    // ── Raw input by coordinates ──────────────────────────────────────────
+
+    fn click_at<'a>(&'a self, x: f64, y: f64) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move {
+            self.session
+                .mouse_click(x, y)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))
+        })
+    }
+
+    fn right_click_at<'a>(&'a self, x: f64, y: f64) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move {
+            self.session
+                .dispatch_mouse_event("mousePressed", x, y, "right", 1)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+            self.session
+                .dispatch_mouse_event("mouseReleased", x, y, "right", 1)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))
+        })
+    }
+
+    fn mouse_move_to<'a>(&'a self, x: f64, y: f64) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move {
+            self.session
+                .mouse_move(x, y)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))
+        })
+    }
+
+    fn drag<'a>(
+        &'a self,
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+    ) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move {
+            // Press at source.
+            self.session
+                .dispatch_mouse_event("mousePressed", x1, y1, "left", 1)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            // Interpolate 10 move steps.
+            let steps = 10u32;
+            for i in 1..=steps {
+                let t = i as f64 / steps as f64;
+                let mx = x1 + (x2 - x1) * t;
+                let my = y1 + (y2 - y1) * t;
+                self.session
+                    .dispatch_mouse_event("mouseMoved", mx, my, "left", 0)
+                    .await
+                    .map_err(|e| BrowserError::Other(e.to_string()))?;
+            }
+
+            // Release at destination.
+            self.session
+                .dispatch_mouse_event("mouseReleased", x2, y2, "left", 1)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))
+        })
+    }
+
+    fn wheel<'a>(
+        &'a self,
+        x: f64,
+        y: f64,
+        dx: f64,
+        dy: f64,
+    ) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move {
+            self.session
+                .dispatch_wheel(x, y, dx, dy)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))
+        })
+    }
+
+    fn key_press<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move {
+            let code = key_name_to_code(key);
+            let text = if key.chars().count() == 1 {
+                Some(key)
+            } else {
+                None
+            };
+            self.session
+                .dispatch_key_event("keyDown", key, &code, text)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+            self.session
+                .dispatch_key_event("keyUp", key, &code, None)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))
+        })
+    }
+
+    fn key_chord<'a>(
+        &'a self,
+        modifiers: &'a [&'a str],
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move {
+            let modifier_mask = modifiers_to_mask(modifiers);
+            let code = key_name_to_code(key);
+            self.session
+                .dispatch_key_event_with_modifiers("keyDown", key, &code, None, modifier_mask)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+            self.session
+                .dispatch_key_event_with_modifiers("keyUp", key, &code, None, modifier_mask)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))
+        })
+    }
+
+    // ── Viewport / device emulation ───────────────────────────────────────
+
+    fn set_viewport<'a>(
+        &'a self,
+        width: u32,
+        height: u32,
+        device_scale_factor: f64,
+    ) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move {
+            self.session
+                .call(
+                    "Emulation.setDeviceMetricsOverride",
+                    Some(serde_json::json!({
+                        "width": width,
+                        "height": height,
+                        "deviceScaleFactor": device_scale_factor,
+                        "mobile": false,
+                    })),
+                )
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    fn clear_viewport_override<'a>(&'a self) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move {
+            self.session
+                .call("Emulation.clearDeviceMetricsOverride", None)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    // ── Raw CDP escape hatch ──────────────────────────────────────────────
+
+    fn cdp_call<'a>(
+        &'a self,
+        method: &'a str,
+        params: Option<serde_json::Value>,
+    ) -> BoxFuture<'a, Result<serde_json::Value, BrowserError>> {
+        Box::pin(async move {
+            self.session
+                .call(method, params)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))
+        })
+    }
+
     // ── DevTools events ───────────────────────────────────────────────────
 
     fn subscribe_events<'a>(
@@ -896,6 +1152,70 @@ fn bridge_cdp_event(event: crate::cdp::CdpEvent) -> Option<DevToolsEvent> {
         }
         _ => None,
     }
+}
+
+/// Map a DOM key name to a CDP `code` field.
+///
+/// Single characters map to `"Key{Upper}"` or special values; named keys get
+/// their standard code string.
+fn key_name_to_code(key: &str) -> String {
+    match key {
+        "Enter" => "Enter".to_owned(),
+        "Escape" => "Escape".to_owned(),
+        "Backspace" => "Backspace".to_owned(),
+        "Tab" => "Tab".to_owned(),
+        "Space" | " " => "Space".to_owned(),
+        "ArrowLeft" => "ArrowLeft".to_owned(),
+        "ArrowRight" => "ArrowRight".to_owned(),
+        "ArrowUp" => "ArrowUp".to_owned(),
+        "ArrowDown" => "ArrowDown".to_owned(),
+        "Home" => "Home".to_owned(),
+        "End" => "End".to_owned(),
+        "PageUp" => "PageUp".to_owned(),
+        "PageDown" => "PageDown".to_owned(),
+        "Delete" => "Delete".to_owned(),
+        "Insert" => "Insert".to_owned(),
+        "F1" => "F1".to_owned(),
+        "F2" => "F2".to_owned(),
+        "F3" => "F3".to_owned(),
+        "F4" => "F4".to_owned(),
+        "F5" => "F5".to_owned(),
+        "F6" => "F6".to_owned(),
+        "F7" => "F7".to_owned(),
+        "F8" => "F8".to_owned(),
+        "F9" => "F9".to_owned(),
+        "F10" => "F10".to_owned(),
+        "F11" => "F11".to_owned(),
+        "F12" => "F12".to_owned(),
+        other => {
+            // Single printable character → "KeyA", "Digit1", etc.
+            let ch = other.chars().next().unwrap_or('?');
+            if ch.is_ascii_alphabetic() {
+                format!("Key{}", ch.to_ascii_uppercase())
+            } else if ch.is_ascii_digit() {
+                format!("Digit{ch}")
+            } else {
+                other.to_owned()
+            }
+        }
+    }
+}
+
+/// Convert a slice of modifier names into the CDP modifier bitmask.
+///
+/// CDP bitmask: 1=Alt, 2=Ctrl, 4=Meta, 8=Shift.
+fn modifiers_to_mask(modifiers: &[&str]) -> u32 {
+    let mut mask = 0u32;
+    for m in modifiers {
+        match *m {
+            "Alt" => mask |= 1,
+            "Control" | "Ctrl" => mask |= 2,
+            "Meta" | "Command" => mask |= 4,
+            "Shift" => mask |= 8,
+            _ => {}
+        }
+    }
+    mask
 }
 
 // Suppress lint: target_id is kept for future use (explicit target close).
