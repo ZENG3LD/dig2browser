@@ -10,7 +10,9 @@ use dig2browser_protocol::{
 use tokio::sync::Mutex;
 
 pub use dig2browser_protocol::{
-    FailureClass, ResponseStatus, StationStatus, DEFAULT_STATION_PIPE,
+    CaptureCompleteness, CollectionTask, CollectionTaskResult, EvidenceCapture,
+    FailureClass, ResponseStatus, StationStatus, TaskCapturePolicy, TaskReply,
+    TaskStep, DEFAULT_STATION_PIPE,
 };
 
 const MIN_TIMEOUT: Duration = Duration::from_millis(100);
@@ -123,6 +125,19 @@ impl StationClient {
             html: response.html,
             png: response.png,
         })
+    }
+
+    pub async fn run_task(
+        &self,
+        profile_id: impl Into<String>,
+        task: CollectionTask,
+    ) -> Result<CollectionTaskResult, ClientError> {
+        let request = WorkerRequest::task(self.take_request_id(), profile_id, task);
+        let response = self.call(request).await?;
+        require_ok(&response)?;
+        response
+            .decode_task_result()
+            .map_err(|_| ClientError::InvalidResponse)
     }
 
     /// Capture while periodically yielding control to the caller for lease
@@ -276,6 +291,14 @@ impl BlockingStationClient {
         self.runtime.block_on(self.client.capture(profile_id, url))
     }
 
+    pub fn run_task(
+        &self,
+        profile_id: impl Into<String>,
+        task: CollectionTask,
+    ) -> Result<CollectionTaskResult, ClientError> {
+        self.runtime.block_on(self.client.run_task(profile_id, task))
+    }
+
     pub fn capture_with_progress<E, F>(
         &self,
         profile_id: impl Into<String>,
@@ -413,5 +436,6 @@ mod tests {
         assert_eq!(RequestKind::Health as u8, 2);
         assert_eq!(RequestKind::Shutdown as u8, 3);
         assert_eq!(RequestKind::Status as u8, 4);
+        assert_eq!(RequestKind::Task as u8, 5);
     }
 }

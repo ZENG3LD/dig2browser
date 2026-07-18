@@ -42,6 +42,10 @@ struct Cli {
     drain_seconds: u64,
     #[arg(long, default_value_t = false)]
     allow_remote_shutdown: bool,
+    #[arg(long, default_value_t = false)]
+    allow_interactive_tasks: bool,
+    #[arg(long, default_value_t = false)]
+    allow_scripted_tasks: bool,
 }
 
 #[cfg(windows)]
@@ -82,7 +86,9 @@ async fn run(cli: Cli) -> Result<ServerReport, DaemonError> {
         cli.max_connections,
         Duration::from_secs(cli.drain_seconds),
     )?
-    .allow_remote_shutdown(cli.allow_remote_shutdown);
+    .allow_remote_shutdown(cli.allow_remote_shutdown)
+    .allow_interactive_tasks(cli.allow_interactive_tasks)
+    .allow_scripted_tasks(cli.allow_scripted_tasks);
     let station = BrowserStation::new(station_config);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {

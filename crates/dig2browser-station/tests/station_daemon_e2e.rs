@@ -10,7 +10,10 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use dig2browser::identity::ProfileOwnershipGuard;
-use dig2browser_client::{ClientConfig, FailureClass, StationClient, StationStatus};
+use dig2browser_client::{
+    ClientConfig, ClientError, CollectionTask, FailureClass, ResponseStatus,
+    StationClient, StationStatus, TaskCapturePolicy, TaskReply, TaskStep,
+};
 use tokio::io::AsyncReadExt;
 
 struct FixtureServer {
@@ -207,6 +210,66 @@ async fn stationd_serves_concurrent_clients_and_drains_real_chromium_e2e() {
     assert_eq!(after_success.captures_failed, 0);
     assert_eq!(after_success.last_failure_class, FailureClass::None);
 
+    let task_url = fixture.url("/typed-task");
+    let task = CollectionTask::new(vec![
+        TaskStep::Navigate {
+            url: task_url.clone(),
+        },
+        TaskStep::Wait {
+            duration: Duration::from_millis(50),
+        },
+        TaskStep::Evaluate {
+            script: "({marker: 'task-script'})".to_owned(),
+        },
+        TaskStep::ReadSelectorText {
+            selector: "main".to_owned(),
+        },
+        TaskStep::Wheel {
+            x: 1.0,
+            y: 1.0,
+            delta_x: 0.0,
+            delta_y: 10.0,
+        },
+        TaskStep::Capture {
+            policy: TaskCapturePolicy::EvidenceViewport,
+        },
+    ])
+    .expect("valid typed daemon task");
+    let task_result = observer
+        .run_task("typed-task-profile", task)
+        .await
+        .expect("run typed task through client and station daemon");
+    assert_eq!(task_result.replies().len(), 6);
+    assert_eq!(
+        task_result.replies()[2],
+        TaskReply::ScriptJson("{\"marker\":\"task-script\"}".to_owned())
+    );
+    assert_eq!(
+        task_result.replies()[3],
+        TaskReply::Text("typed-task".to_owned())
+    );
+    let TaskReply::Capture(task_capture) = &task_result.replies()[5] else {
+        panic!("typed task did not return evidence capture");
+    };
+    assert_eq!(task_capture.requested_url, task_url);
+    assert_eq!(task_capture.final_url, task_url);
+    assert_eq!(task_capture.http_status, Some(200));
+    assert_eq!(task_capture.title, "typed-task");
+    assert_eq!(task_capture.ready_state, "complete");
+    assert!(String::from_utf8_lossy(&task_capture.html)
+        .contains("data-daemon-e2e=\"typed-task\""));
+    assert_eq!(&task_capture.png[..8], b"\x89PNG\r\n\x1a\n");
+    assert_eq!(
+        task_capture.html_sha256,
+        dig2browser::digest::sha256_bytes(&task_capture.html)
+    );
+    assert_eq!(
+        task_capture.png_sha256,
+        Some(dig2browser::digest::sha256_bytes(&task_capture.png))
+    );
+    assert_eq!(task_capture.protocol_version, dig2browser_protocol::PROTOCOL_VERSION);
+    assert!(task_capture.collector_version.starts_with("dig2browser-station/"));
+
     assert!(
         observer
             .capture("failure-profile", fixture.url("/force-close"))
@@ -215,9 +278,9 @@ async fn stationd_serves_concurrent_clients_and_drains_real_chromium_e2e() {
         "forced connection close unexpectedly produced a capture"
     );
     let after_failure = observer.status().await.expect("read failed status");
-    assert_eq!(after_failure.captures_started, 3);
+    assert_eq!(after_failure.captures_started, 4);
     assert_eq!(after_failure.captures_in_flight, 0);
-    assert_eq!(after_failure.captures_succeeded, 2);
+    assert_eq!(after_failure.captures_succeeded, 3);
     assert_eq!(after_failure.captures_failed, 1);
     assert_eq!(after_failure.last_failure_class, FailureClass::CaptureFailed);
     assert!(after_failure.last_failure_unix_ms > 0);
@@ -234,6 +297,86 @@ async fn stationd_serves_concurrent_clients_and_drains_real_chromium_e2e() {
     assert!(stdout.contains("\"outcome\":\"clean\""));
     assert!(stdout.contains("\"stop_reason\":\"remote_request\""));
     assert!(stdout.contains("\"drain_timed_out\":false"));
+    remove_tree(&profiles).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stationd_denies_active_task_capabilities_by_default_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-stationd-restricted-e2e-{unique}");
+    let profiles = e2e_temp_base().join(format!(
+        "dig2browser-stationd-restricted-e2e-{unique}"
+    ));
+    std::fs::create_dir_all(&profiles).expect("create restricted E2E profiles root");
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+    let mut daemon = spawn_stationd_with_task_permissions(
+        stationd,
+        &pipe_name,
+        &profiles,
+        false,
+    );
+    let client = StationClient::connect(
+        ClientConfig::new(
+            &pipe_name,
+            Duration::from_secs(15),
+            Duration::from_secs(90),
+        )
+        .expect("valid restricted client config"),
+    )
+    .await
+    .expect("connect restricted task client");
+    let interactive_task = CollectionTask::new(vec![
+        TaskStep::Navigate {
+            url: fixture.url("/restricted-interaction"),
+        },
+        TaskStep::ClickSelector {
+            selector: "main".to_owned(),
+        },
+        TaskStep::Capture {
+            policy: TaskCapturePolicy::EvidenceViewport,
+        },
+    ])
+    .expect("valid restricted interaction task");
+    assert!(matches!(
+        client
+            .run_task("restricted-profile", interactive_task)
+            .await,
+        Err(ClientError::Remote {
+            status: ResponseStatus::Invalid,
+            ..
+        })
+    ));
+    let scripted_task = CollectionTask::new(vec![
+        TaskStep::Navigate {
+            url: fixture.url("/restricted-script"),
+        },
+        TaskStep::Evaluate {
+            script: "document.title".to_owned(),
+        },
+        TaskStep::Capture {
+            policy: TaskCapturePolicy::EvidenceViewport,
+        },
+    ])
+    .expect("valid restricted script task");
+    assert!(matches!(
+        client.run_task("restricted-profile", scripted_task).await,
+        Err(ClientError::Remote {
+            status: ResponseStatus::Invalid,
+            ..
+        })
+    ));
+    let status = client.status().await.expect("restricted station status");
+    assert_eq!(status.resident_identities, 0);
+    client.shutdown().await.expect("shutdown restricted station");
+    let exit = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("restricted daemon exit timeout")
+        .expect("wait for restricted daemon");
+    assert!(exit.success(), "restricted station failed: {exit}");
+    let (_, stderr) = read_child_output(&mut daemon).await;
+    assert!(stderr.is_empty(), "restricted station wrote stderr: {stderr}");
     remove_tree(&profiles).await;
 }
 
@@ -373,8 +516,17 @@ async fn read_child_output(child: &mut tokio::process::Child) -> (String, String
 }
 
 fn spawn_stationd(stationd: &str, pipe_name: &str, profiles: &Path) -> tokio::process::Child {
-    tokio::process::Command::new(stationd)
-        .args([
+    spawn_stationd_with_task_permissions(stationd, pipe_name, profiles, true)
+}
+
+fn spawn_stationd_with_task_permissions(
+    stationd: &str,
+    pipe_name: &str,
+    profiles: &Path,
+    allow_active_tasks: bool,
+) -> tokio::process::Child {
+    let mut command = tokio::process::Command::new(stationd);
+    command.args([
             "--pipe-name",
             pipe_name,
             "--profiles-root",
@@ -390,7 +542,11 @@ fn spawn_stationd(stationd: &str, pipe_name: &str, profiles: &Path) -> tokio::pr
             "--drain-seconds",
             "15",
             "--allow-remote-shutdown",
-        ])
+        ]);
+    if allow_active_tasks {
+        command.args(["--allow-interactive-tasks", "--allow-scripted-tasks"]);
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

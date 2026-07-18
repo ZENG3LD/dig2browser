@@ -4,16 +4,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use dig2browser::agentic::{CapabilitySet, CaptureArtifact, CapturePolicy, WorkerError};
+use dig2browser::agentic::{
+    AgentReply, Capability, CapabilitySet, CaptureArtifact, CapturePolicy,
+    L1Capability, L2Capability, L3Capability, WorkerError,
+};
 use dig2browser_protocol::{
-    read_worker_request, validate_pipe_suffix, write_worker_response, FailureClass,
-    RequestKind, ResponseStatus, StationStatus, WorkerRequest, WorkerResponse,
+    read_worker_request, validate_pipe_suffix, write_worker_response,
+    CaptureCompleteness, CollectionTask, CollectionTaskResult, EvidenceCapture,
+    FailureClass, RequestKind, ResponseStatus, StationStatus, TaskCapturePolicy,
+    TaskReply, TaskStep, WorkerRequest, WorkerResponse, PROTOCOL_VERSION,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 
 use crate::{
-    BrowserLease, BrowserStation, IdentityRequest, StationError, StationFleetStatus,
+    BrowserLease, BrowserStation, BrowserTask, BrowserTaskStep, IdentityRequest,
+    StationError, StationFleetStatus,
 };
 
 const MAX_CONNECTIONS: usize = 1_024;
@@ -164,6 +170,8 @@ pub struct ServerConfig {
     max_connections: usize,
     drain_timeout: Duration,
     allow_remote_shutdown: bool,
+    allow_interactive_tasks: bool,
+    allow_scripted_tasks: bool,
 }
 
 impl ServerConfig {
@@ -187,11 +195,23 @@ impl ServerConfig {
             max_connections,
             drain_timeout,
             allow_remote_shutdown: false,
+            allow_interactive_tasks: false,
+            allow_scripted_tasks: false,
         })
     }
 
     pub fn allow_remote_shutdown(mut self, allow: bool) -> Self {
         self.allow_remote_shutdown = allow;
+        self
+    }
+
+    pub fn allow_interactive_tasks(mut self, allow: bool) -> Self {
+        self.allow_interactive_tasks = allow;
+        self
+    }
+
+    pub fn allow_scripted_tasks(mut self, allow: bool) -> Self {
+        self.allow_scripted_tasks = allow;
         self
     }
 
@@ -309,6 +329,10 @@ async fn run_windows_server(
                 let connection_shutdown = connection_shutdown.subscribe();
                 let remote_shutdown = remote_shutdown.clone();
                 let allow_remote_shutdown = config.allow_remote_shutdown;
+                let task_permissions = TaskPermissions {
+                    interaction: config.allow_interactive_tasks,
+                    script: config.allow_scripted_tasks,
+                };
                 connections.spawn(async move {
                     serve_connection(
                         server,
@@ -317,6 +341,7 @@ async fn run_windows_server(
                         connection_shutdown,
                         remote_shutdown,
                         allow_remote_shutdown,
+                        task_permissions,
                     ).await
                 });
             }
@@ -379,6 +404,7 @@ async fn serve_connection(
     mut shutdown: watch::Receiver<bool>,
     remote_shutdown: mpsc::Sender<()>,
     allow_remote_shutdown: bool,
+    task_permissions: TaskPermissions,
 ) -> Result<(), ServerError> {
     let _active = ActiveConnection {
         telemetry: telemetry.as_ref(),
@@ -408,6 +434,15 @@ async fn serve_connection(
         let should_shutdown = request.kind == RequestKind::Shutdown && allow_remote_shutdown;
         let response = match request.kind {
             RequestKind::Capture => capture(&station, telemetry.as_ref(), &request).await,
+            RequestKind::Task => {
+                run_task(
+                    &station,
+                    telemetry.as_ref(),
+                    &request,
+                    task_permissions,
+                )
+                .await
+            }
             RequestKind::Health => WorkerResponse::empty(&request, ResponseStatus::Ok),
             RequestKind::Status => {
                 let fleet = station.fleet_status().await;
@@ -427,6 +462,264 @@ async fn serve_connection(
             let _ = remote_shutdown.send(()).await;
             return Ok(());
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TaskPermissions {
+    interaction: bool,
+    script: bool,
+}
+
+async fn run_task(
+    station: &BrowserStation,
+    telemetry: &ServerTelemetry,
+    request: &WorkerRequest,
+    permissions: TaskPermissions,
+) -> WorkerResponse {
+    let started = Instant::now();
+    let observation = CaptureObservation::start(telemetry);
+    let Some(task) = request.task.as_ref() else {
+        observation.failure(FailureClass::Protocol);
+        return failure(request, ResponseStatus::Invalid, "task missing", started);
+    };
+    if task.requires_interaction() && !permissions.interaction {
+        observation.failure(FailureClass::Protocol);
+        return failure(
+            request,
+            ResponseStatus::Invalid,
+            "interactive tasks disabled",
+            started,
+        );
+    }
+    if task.requires_script() && !permissions.script {
+        observation.failure(FailureClass::Protocol);
+        return failure(
+            request,
+            ResponseStatus::Invalid,
+            "scripted tasks disabled",
+            started,
+        );
+    }
+    let station_task = match to_station_task(task) {
+        Ok(task) => task,
+        Err(_) => {
+            observation.failure(FailureClass::Protocol);
+            return failure(request, ResponseStatus::Invalid, "invalid task", started);
+        }
+    };
+    let capabilities = task_capabilities(task);
+    let lease = match acquire_lease(station, &request.profile_id, capabilities).await {
+        Ok(lease) => lease,
+        Err(error) => {
+            observation.failure(station_error_class(&error, FailureClass::Unavailable));
+            return failure(
+                request,
+                ResponseStatus::Unavailable,
+                "browser unavailable",
+                started,
+            );
+        }
+    };
+    let result = match lease.run_task(&station_task).await {
+        Ok(result) => result,
+        Err(error) => {
+            observation.failure(station_error_class(&error, FailureClass::CaptureFailed));
+            let message = match task_step_index(&error) {
+                Some(index) => format!("task failed at step {index}"),
+                None => "task failed".to_owned(),
+            };
+            return failure(
+                request,
+                ResponseStatus::CaptureFailed,
+                &message,
+                started,
+            );
+        }
+    };
+    let protocol_result = match to_protocol_result(task, result) {
+        Ok(result) => result,
+        Err(_) => {
+            observation.failure(FailureClass::Protocol);
+            return failure(
+                request,
+                ResponseStatus::Protocol,
+                "task result invalid",
+                started,
+            );
+        }
+    };
+    let mut response = match WorkerResponse::task_result(request, &protocol_result) {
+        Ok(response) => response,
+        Err(_) => {
+            observation.failure(FailureClass::TooLarge);
+            return failure(
+                request,
+                ResponseStatus::TooLarge,
+                "task result exceeds response limit",
+                started,
+            );
+        }
+    };
+    response.duration_ms = elapsed_ms(started);
+    observation.success();
+    response
+}
+
+fn to_station_task(task: &CollectionTask) -> Result<BrowserTask, crate::TaskError> {
+    BrowserTask::new(
+        task.steps()
+            .iter()
+            .map(|step| match step {
+                TaskStep::Navigate { url } => BrowserTaskStep::Navigate { url: url.clone() },
+                TaskStep::Wait { duration } => BrowserTaskStep::Wait {
+                    duration: *duration,
+                },
+                TaskStep::Wheel {
+                    x,
+                    y,
+                    delta_x,
+                    delta_y,
+                } => BrowserTaskStep::Wheel {
+                    x: *x,
+                    y: *y,
+                    delta_x: *delta_x,
+                    delta_y: *delta_y,
+                },
+                TaskStep::KeyPress { key } => BrowserTaskStep::KeyPress { key: key.clone() },
+                TaskStep::ClickSelector { selector } => BrowserTaskStep::ClickSelector {
+                    selector: selector.clone(),
+                },
+                TaskStep::TypeSelector { selector, text } => BrowserTaskStep::TypeSelector {
+                    selector: selector.clone(),
+                    text: text.clone(),
+                },
+                TaskStep::ReadSelectorText { selector } => BrowserTaskStep::ReadSelectorText {
+                    selector: selector.clone(),
+                },
+                TaskStep::Evaluate { script } => BrowserTaskStep::Evaluate {
+                    script: script.clone(),
+                },
+                TaskStep::Capture { policy } => BrowserTaskStep::Capture {
+                    policy: to_capture_policy(*policy),
+                },
+            })
+            .collect(),
+    )
+}
+
+fn to_capture_policy(policy: TaskCapturePolicy) -> CapturePolicy {
+    match policy {
+        TaskCapturePolicy::StateOnly => CapturePolicy::StateOnly,
+        TaskCapturePolicy::HtmlOnly => CapturePolicy::HtmlOnly,
+        TaskCapturePolicy::EvidenceViewport => CapturePolicy::EvidenceViewport,
+    }
+}
+
+fn task_capabilities(task: &CollectionTask) -> CapabilitySet {
+    let mut capabilities = vec![Capability::L3(L3Capability::Lifecycle)];
+    let mut add = |capability| {
+        if !capabilities.contains(&capability) {
+            capabilities.push(capability);
+        }
+    };
+    for step in task.steps() {
+        match step {
+            TaskStep::Navigate { .. } => add(Capability::L3(L3Capability::Navigate)),
+            TaskStep::Wait { .. } => {}
+            TaskStep::Wheel { .. } => add(Capability::L1(L1Capability::Scroll)),
+            TaskStep::KeyPress { .. } => add(Capability::L1(L1Capability::Keyboard)),
+            TaskStep::ClickSelector { .. } | TaskStep::TypeSelector { .. } => {
+                add(Capability::L2(L2Capability::Inspect));
+                add(Capability::L2(L2Capability::Interact));
+            }
+            TaskStep::ReadSelectorText { .. } => {
+                add(Capability::L2(L2Capability::Inspect));
+            }
+            TaskStep::Evaluate { .. } => add(Capability::L2(L2Capability::Evaluate)),
+            TaskStep::Capture { .. } => add(Capability::L3(L3Capability::Capture)),
+        }
+    }
+    CapabilitySet::new(capabilities).expect("bounded task capabilities are unique")
+}
+
+fn to_protocol_result(
+    task: &CollectionTask,
+    result: crate::BrowserTaskResult,
+) -> Result<CollectionTaskResult, dig2browser_protocol::ProtocolError> {
+    if result.replies.len() != task.steps().len()
+        || result.step_metrics.len() != task.steps().len()
+    {
+        return Err(dig2browser_protocol::ProtocolError::InvalidTaskResult);
+    }
+    let mut requested_url = String::new();
+    let mut replies = Vec::with_capacity(result.replies.len());
+    for ((step, reply), metrics) in task
+        .steps()
+        .iter()
+        .zip(result.replies)
+        .zip(result.step_metrics)
+    {
+        if let TaskStep::Navigate { url } = step {
+            requested_url.clone_from(url);
+        }
+        let reply = match reply {
+            AgentReply::Acknowledged => TaskReply::Acknowledged,
+            AgentReply::Text(text) => TaskReply::Text(text),
+            AgentReply::ScriptValue(value) => TaskReply::ScriptJson(value.to_string()),
+            AgentReply::Capture(artifact) => {
+                let TaskStep::Capture { policy } = step else {
+                    return Err(dig2browser_protocol::ProtocolError::InvalidTaskResult);
+                };
+                TaskReply::Capture(Box::new(evidence_capture(
+                    &requested_url,
+                    *policy,
+                    artifact,
+                    metrics.completed_at_unix_ms,
+                    metrics.duration_ms,
+                )))
+            }
+            AgentReply::Element(_) => {
+                return Err(dig2browser_protocol::ProtocolError::InvalidTaskResult)
+            }
+        };
+        replies.push(reply);
+    }
+    CollectionTaskResult::new(replies)
+}
+
+fn evidence_capture(
+    requested_url: &str,
+    policy: TaskCapturePolicy,
+    artifact: CaptureArtifact,
+    captured_at_unix_ms: u64,
+    duration_ms: u64,
+) -> EvidenceCapture {
+    let (state, html, png) = match artifact {
+        CaptureArtifact::StateOnly(state) => (state, Vec::new(), Vec::new()),
+        CaptureArtifact::HtmlOnly { state, html } => (state, html.into_bytes(), Vec::new()),
+        CaptureArtifact::EvidenceViewport { state, html, png } => {
+            (state, html.into_bytes(), png)
+        }
+    };
+    let html_sha256 = dig2browser::digest::sha256_bytes(&html);
+    let png_sha256 = (!png.is_empty()).then(|| dig2browser::digest::sha256_bytes(&png));
+    EvidenceCapture {
+        completeness: CaptureCompleteness::Complete,
+        policy,
+        requested_url: requested_url.to_owned(),
+        final_url: state.url,
+        captured_at_unix_ms,
+        duration_ms,
+        http_status: state.http_status,
+        title: state.title,
+        ready_state: state.ready_state,
+        html,
+        png,
+        html_sha256,
+        png_sha256,
+        collector_version: format!("dig2browser-station/{}", env!("CARGO_PKG_VERSION")),
+        protocol_version: PROTOCOL_VERSION,
     }
 }
 
@@ -532,12 +825,20 @@ async fn monitoring_lease(
     station: &BrowserStation,
     profile_id: &str,
 ) -> Result<BrowserLease, StationError> {
+    acquire_lease(station, profile_id, CapabilitySet::monitoring()).await
+}
+
+async fn acquire_lease(
+    station: &BrowserStation,
+    profile_id: &str,
+    capabilities: CapabilitySet,
+) -> Result<BrowserLease, StationError> {
     let deadline = tokio::time::Instant::now() + ACQUIRE_RETRY_WINDOW;
     loop {
         match station
             .lease(
                 IdentityRequest::public_desktop(profile_id),
-                CapabilitySet::monitoring(),
+                capabilities.clone(),
             )
             .await
         {
@@ -567,10 +868,17 @@ fn elapsed_ms(started: Instant) -> u64 {
 }
 
 fn station_error_class(error: &StationError, fallback: FailureClass) -> FailureClass {
-    if matches!(error, StationError::Worker(WorkerError::CommandTimeout(_))) {
-        FailureClass::Timeout
-    } else {
-        fallback
+    match error {
+        StationError::Worker(WorkerError::CommandTimeout(_)) => FailureClass::Timeout,
+        StationError::TaskStepFailed { source, .. } => station_error_class(source, fallback),
+        _ => fallback,
+    }
+}
+
+fn task_step_index(error: &StationError) -> Option<usize> {
+    match error {
+        StationError::TaskStepFailed { index, .. } => Some(*index),
+        _ => None,
     }
 }
 

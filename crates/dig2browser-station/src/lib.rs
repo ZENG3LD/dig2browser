@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dig2browser::agentic::{
     AgentCommand, AgentReply, BrowserSnapshot, BrowserWorker, BrowserWorkerConfig,
@@ -220,6 +220,13 @@ impl BrowserTask {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BrowserTaskResult {
     pub replies: Vec<AgentReply>,
+    pub step_metrics: Vec<BrowserTaskStepMetrics>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrowserTaskStepMetrics {
+    pub completed_at_unix_ms: u64,
+    pub duration_ms: u64,
 }
 
 struct Slot {
@@ -562,84 +569,109 @@ impl BrowserLease {
         drop(waiter);
 
         let mut replies = Vec::with_capacity(task.steps().len());
-        for step in task.steps() {
-            let reply = match step {
-                BrowserTaskStep::Navigate { url } => {
-                    self.slot
-                        .worker
-                        .execute(AgentCommand::Navigate { url: url.clone() })
-                        .await?
-                }
-                BrowserTaskStep::Wait { duration } => {
-                    tokio::time::sleep(*duration).await;
-                    AgentReply::Acknowledged
-                }
-                BrowserTaskStep::Wheel {
-                    x,
-                    y,
-                    delta_x,
-                    delta_y,
-                } => {
-                    self.slot
-                        .worker
-                        .execute(AgentCommand::Wheel {
-                            x: *x,
-                            y: *y,
-                            delta_x: *delta_x,
-                            delta_y: *delta_y,
-                        })
-                        .await?
-                }
-                BrowserTaskStep::KeyPress { key } => {
-                    self.slot
-                        .worker
-                        .execute(AgentCommand::KeyPress { key: key.clone() })
-                        .await?
-                }
-                BrowserTaskStep::ClickSelector { selector } => {
-                    let element = self.resolve_task_element(selector).await?;
-                    self.slot
-                        .worker
-                        .execute(AgentCommand::ClickElement { element })
-                        .await?
-                }
-                BrowserTaskStep::TypeSelector { selector, text } => {
-                    let element = self.resolve_task_element(selector).await?;
-                    self.slot
-                        .worker
-                        .execute(AgentCommand::TypeElement {
-                            element,
-                            text: text.clone(),
-                        })
-                        .await?
-                }
-                BrowserTaskStep::ReadSelectorText { selector } => {
-                    let element = self.resolve_task_element(selector).await?;
-                    self.slot
-                        .worker
-                        .execute(AgentCommand::ReadElementText { element })
-                        .await?
-                }
-                BrowserTaskStep::Evaluate { script } => {
-                    self.slot
-                        .worker
-                        .execute(AgentCommand::Evaluate {
-                            script: script.clone(),
-                        })
-                        .await?
-                }
-                BrowserTaskStep::Capture { policy } => {
-                    self.slot
-                        .worker
-                        .execute(AgentCommand::Capture { policy: *policy })
-                        .await?
-                }
-            };
+        let mut step_metrics = Vec::with_capacity(task.steps().len());
+        for (index, step) in task.steps().iter().enumerate() {
+            let started = Instant::now();
+            let reply = self
+                .execute_task_step(step)
+                .await
+                .map_err(|source| StationError::TaskStepFailed {
+                    index,
+                    source: Box::new(source),
+                })?;
             replies.push(reply);
+            step_metrics.push(BrowserTaskStepMetrics {
+                completed_at_unix_ms: unix_time_ms(),
+                duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            });
         }
         let now = self.station.inner.clock.fetch_add(1, Ordering::AcqRel) + 1;
         self.slot.last_used.store(now, Ordering::Release);
-        Ok(BrowserTaskResult { replies })
+        Ok(BrowserTaskResult {
+            replies,
+            step_metrics,
+        })
+    }
+
+    async fn execute_task_step(
+        &self,
+        step: &BrowserTaskStep,
+    ) -> Result<AgentReply, StationError> {
+        match step {
+            BrowserTaskStep::Navigate { url } => self
+                .slot
+                .worker
+                .execute(AgentCommand::Navigate { url: url.clone() })
+                .await
+                .map_err(StationError::from),
+            BrowserTaskStep::Wait { duration } => {
+                tokio::time::sleep(*duration).await;
+                Ok(AgentReply::Acknowledged)
+            }
+            BrowserTaskStep::Wheel {
+                x,
+                y,
+                delta_x,
+                delta_y,
+            } => self
+                .slot
+                .worker
+                .execute(AgentCommand::Wheel {
+                    x: *x,
+                    y: *y,
+                    delta_x: *delta_x,
+                    delta_y: *delta_y,
+                })
+                .await
+                .map_err(StationError::from),
+            BrowserTaskStep::KeyPress { key } => self
+                .slot
+                .worker
+                .execute(AgentCommand::KeyPress { key: key.clone() })
+                .await
+                .map_err(StationError::from),
+            BrowserTaskStep::ClickSelector { selector } => {
+                let element = self.resolve_task_element(selector).await?;
+                self.slot
+                    .worker
+                    .execute(AgentCommand::ClickElement { element })
+                    .await
+                    .map_err(StationError::from)
+            }
+            BrowserTaskStep::TypeSelector { selector, text } => {
+                let element = self.resolve_task_element(selector).await?;
+                self.slot
+                    .worker
+                    .execute(AgentCommand::TypeElement {
+                        element,
+                        text: text.clone(),
+                    })
+                    .await
+                    .map_err(StationError::from)
+            }
+            BrowserTaskStep::ReadSelectorText { selector } => {
+                let element = self.resolve_task_element(selector).await?;
+                self.slot
+                    .worker
+                    .execute(AgentCommand::ReadElementText { element })
+                    .await
+                    .map_err(StationError::from)
+            }
+            BrowserTaskStep::Evaluate { script } => self
+                .slot
+                .worker
+                .execute(AgentCommand::Evaluate {
+                    script: script.clone(),
+                })
+                .await
+                .map_err(StationError::from),
+            BrowserTaskStep::Capture { policy } => self
+                .slot
+                .worker
+                .execute(AgentCommand::Capture { policy: *policy })
+                .await
+                .map_err(StationError::from),
+        }
     }
 
     async fn resolve_task_element(&self, selector: &str) -> Result<ElementRef, StationError> {
@@ -693,6 +725,14 @@ impl BrowserLease {
         }
         Ok(())
     }
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
 }
 
 struct CommandWaiter<'a> {
@@ -807,6 +847,12 @@ pub enum StationError {
     WorkerUnavailable,
     #[error("browser worker returned an invalid reply")]
     InvalidWorkerReply,
+    #[error("browser task step {index} failed")]
+    TaskStepFailed {
+        index: usize,
+        #[source]
+        source: Box<StationError>,
+    },
     #[error("station shutdown incomplete: {stopped} stopped, {failed} failed")]
     ShutdownIncomplete { stopped: usize, failed: usize },
     #[error(transparent)]

@@ -4,6 +4,14 @@ use std::io;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+mod task;
+
+pub use task::{
+    CaptureCompleteness, CollectionTask, CollectionTaskResult, EvidenceCapture,
+    TaskCapturePolicy, TaskReply, TaskStep, MAX_TASK_RESULT_BYTES, MAX_TASK_STEPS,
+    MAX_TASK_WAIT,
+};
+
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_FINAL_URL_BYTES: usize = 16 * 1024;
@@ -29,6 +37,7 @@ pub enum RequestKind {
     Health = 2,
     Shutdown = 3,
     Status = 4,
+    Task = 5,
 }
 
 impl RequestKind {
@@ -38,17 +47,19 @@ impl RequestKind {
             2 => Ok(Self::Health),
             3 => Ok(Self::Shutdown),
             4 => Ok(Self::Status),
+            5 => Ok(Self::Task),
             _ => Err(ProtocolError::InvalidRequest),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WorkerRequest {
     pub kind: RequestKind,
     pub request_id: u64,
     pub profile_id: String,
     pub url: String,
+    pub task: Option<CollectionTask>,
 }
 
 impl WorkerRequest {
@@ -58,6 +69,21 @@ impl WorkerRequest {
             request_id,
             profile_id: profile_id.into(),
             url: url.into(),
+            task: None,
+        }
+    }
+
+    pub fn task(
+        request_id: u64,
+        profile_id: impl Into<String>,
+        task: CollectionTask,
+    ) -> Self {
+        Self {
+            kind: RequestKind::Task,
+            request_id,
+            profile_id: profile_id.into(),
+            url: String::new(),
+            task: Some(task),
         }
     }
 
@@ -79,6 +105,7 @@ impl WorkerRequest {
             request_id,
             profile_id: String::new(),
             url: String::new(),
+            task: None,
         }
     }
 
@@ -86,11 +113,19 @@ impl WorkerRequest {
         self.validate()?;
         let profile_len = u16::try_from(self.profile_id.len())
             .map_err(|_| ProtocolError::InvalidRequest)?;
-        let url_len =
-            u32::try_from(self.url.len()).map_err(|_| ProtocolError::InvalidRequest)?;
+        let task_payload = match &self.task {
+            Some(task) => task.encode_payload()?,
+            None => Vec::new(),
+        };
+        let body = if self.kind == RequestKind::Task {
+            task_payload.as_slice()
+        } else {
+            self.url.as_bytes()
+        };
+        let url_len = u32::try_from(body.len()).map_err(|_| ProtocolError::InvalidRequest)?;
         let total = REQUEST_HEADER_BYTES
             .checked_add(self.profile_id.len())
-            .and_then(|value| value.checked_add(self.url.len()))
+            .and_then(|value| value.checked_add(body.len()))
             .ok_or(ProtocolError::InvalidRequest)?;
         if total > MAX_REQUEST_BYTES {
             return Err(ProtocolError::InvalidRequest);
@@ -104,7 +139,7 @@ impl WorkerRequest {
         bytes.extend_from_slice(&profile_len.to_le_bytes());
         bytes.extend_from_slice(&url_len.to_le_bytes());
         bytes.extend_from_slice(self.profile_id.as_bytes());
-        bytes.extend_from_slice(self.url.as_bytes());
+        bytes.extend_from_slice(body);
         Ok(bytes)
     }
 
@@ -112,10 +147,25 @@ impl WorkerRequest {
         match self.kind {
             RequestKind::Capture => {
                 validate_profile_id(&self.profile_id)?;
-                validate_http_url(&self.url)
+                validate_http_url(&self.url)?;
+                if self.task.is_none() {
+                    Ok(())
+                } else {
+                    Err(ProtocolError::InvalidRequest)
+                }
+            }
+            RequestKind::Task => {
+                validate_profile_id(&self.profile_id)?;
+                if !self.url.is_empty() {
+                    return Err(ProtocolError::InvalidRequest);
+                }
+                self.task
+                    .as_ref()
+                    .ok_or(ProtocolError::InvalidRequest)?
+                    .validate()
             }
             RequestKind::Health | RequestKind::Shutdown | RequestKind::Status => {
-                if self.profile_id.is_empty() && self.url.is_empty() {
+                if self.profile_id.is_empty() && self.url.is_empty() && self.task.is_none() {
                     Ok(())
                 } else {
                     Err(ProtocolError::InvalidRequest)
@@ -328,6 +378,30 @@ impl WorkerResponse {
         response
     }
 
+    pub fn task_result(
+        request: &WorkerRequest,
+        result: &CollectionTaskResult,
+    ) -> Result<Self, ProtocolError> {
+        let mut response = Self::empty(request, ResponseStatus::Ok);
+        response.html = result.encode()?;
+        response.validate()?;
+        Ok(response)
+    }
+
+    pub fn decode_task_result(&self) -> Result<CollectionTaskResult, ProtocolError> {
+        if self.kind != RequestKind::Task
+            || self.status != ResponseStatus::Ok
+            || self.http_status.is_some()
+            || !self.final_url.is_empty()
+            || !self.title.is_empty()
+            || !self.error.is_empty()
+            || !self.png.is_empty()
+        {
+            return Err(ProtocolError::InvalidTaskResult);
+        }
+        CollectionTaskResult::decode(&self.html)
+    }
+
     pub fn decode_station_status(&self) -> Result<StationStatus, ProtocolError> {
         if self.kind != RequestKind::Status
             || self.status != ResponseStatus::Ok
@@ -372,6 +446,9 @@ impl WorkerResponse {
         }
         if self.kind == RequestKind::Status && self.status == ResponseStatus::Ok {
             self.decode_station_status()?;
+        }
+        if self.kind == RequestKind::Task && self.status == ResponseStatus::Ok {
+            self.decode_task_result()?;
         }
         Ok(())
     }
@@ -435,15 +512,29 @@ where
     let profile_id = std::str::from_utf8(&payload[..profile_len])
         .map_err(|_| FrameError::Protocol(ProtocolError::InvalidRequest))?
         .to_owned();
-    let url = std::str::from_utf8(&payload[profile_len..])
-        .map_err(|_| FrameError::Protocol(ProtocolError::InvalidRequest))?
-        .to_owned();
-    Ok(Some(WorkerRequest {
+    let body = &payload[profile_len..];
+    let (url, task) = if kind == RequestKind::Task {
+        (
+            String::new(),
+            Some(CollectionTask::decode_payload(body)?),
+        )
+    } else {
+        (
+            std::str::from_utf8(body)
+                .map_err(|_| FrameError::Protocol(ProtocolError::InvalidRequest))?
+                .to_owned(),
+            None,
+        )
+    };
+    let request = WorkerRequest {
         kind,
         request_id,
         profile_id,
         url,
-    }))
+        task,
+    };
+    request.validate()?;
+    Ok(Some(request))
 }
 
 pub async fn write_worker_response<W>(
@@ -563,7 +654,7 @@ fn validate_profile_id(value: &str) -> Result<(), ProtocolError> {
     Ok(())
 }
 
-fn validate_http_url(value: &str) -> Result<(), ProtocolError> {
+pub(crate) fn validate_http_url(value: &str) -> Result<(), ProtocolError> {
     let remainder = value
         .strip_prefix("https://")
         .or_else(|| value.strip_prefix("http://"))
@@ -608,6 +699,8 @@ pub enum ProtocolError {
     InvalidRequest,
     ResponseTooLarge,
     InvalidStatusPayload,
+    InvalidTaskPayload,
+    InvalidTaskResult,
 }
 
 impl std::fmt::Display for ProtocolError {
@@ -616,6 +709,8 @@ impl std::fmt::Display for ProtocolError {
             Self::InvalidRequest => write!(formatter, "invalid request"),
             Self::ResponseTooLarge => write!(formatter, "response exceeds protocol limits"),
             Self::InvalidStatusPayload => write!(formatter, "station status payload is invalid"),
+            Self::InvalidTaskPayload => write!(formatter, "browser task payload is invalid"),
+            Self::InvalidTaskResult => write!(formatter, "browser task result is invalid"),
         }
     }
 }
