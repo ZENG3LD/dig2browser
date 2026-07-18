@@ -9,19 +9,23 @@
 //! Prints a summary to stderr and writes HTML to stdout (unless --save-html is used).
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
+use dig2browser::DevToolsEvent;
+use dig2browser::NetworkEvent;
 use dig2browser::{
     BrowserPreference, BrowserProfile, LaunchConfig, LocaleProfile, StealthBrowser, StealthConfig,
     StealthLevel,
 };
-use dig2browser::DevToolsEvent;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "dev-fetch", about = "Fetch a URL in the stealth browser and inspect the result")]
+#[command(
+    name = "dev-fetch",
+    about = "Fetch a URL in the stealth browser and inspect the result"
+)]
 struct Cli {
     /// URL to fetch
     url: String,
@@ -45,6 +49,10 @@ struct Cli {
     /// Save screenshot PNG to this file path
     #[arg(long)]
     save_screenshot: Option<PathBuf>,
+
+    /// Save deterministic capture metadata JSON to this file path
+    #[arg(long)]
+    save_metadata: Option<PathBuf>,
 
     /// Persistent browser profile directory
     #[arg(long)]
@@ -143,6 +151,45 @@ fn extract_title(html: &str) -> Option<String> {
     Some(html[start..start + end].trim().to_string())
 }
 
+#[derive(serde::Serialize)]
+struct CaptureMetadata<'a> {
+    requested_url: &'a str,
+    final_url: &'a str,
+    http_status: Option<u16>,
+    captured_at_unix_ms: u64,
+    fetch_duration_ms: u64,
+    title: Option<&'a str>,
+    html_bytes: u64,
+    screenshot_bytes: u64,
+}
+
+fn main_document_http_status(events: &[NetworkEvent], final_url: &str) -> Option<u16> {
+    events.iter().rev().find_map(|event| {
+        let status = event.status.filter(|status| (100..=599).contains(status))?;
+        let event_url = event.url.as_deref()?;
+        if !document_urls_match(event_url, final_url) {
+            return None;
+        }
+
+        let is_main_document = match event.method.as_str() {
+            "Network.responseReceived" => event.params["type"] == "Document",
+            "network.responseCompleted" => event.params["navigation"].is_string(),
+            _ => false,
+        };
+        is_main_document.then_some(status)
+    })
+}
+
+fn document_urls_match(event_url: &str, final_url: &str) -> bool {
+    event_url.split('#').next() == final_url.split('#').next()
+}
+
+fn unix_time_ms() -> Result<u64, Box<dyn std::error::Error>> {
+    Ok(u64::try_from(
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+    )?)
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -179,14 +226,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Launch browser.
-    let t0 = Instant::now();
     let browser = StealthBrowser::launch_with(launch, stealth).await?;
 
     // Always use new_blank_page so we can subscribe to devtools before navigation.
     let page = browser.new_blank_page().await?;
 
     // Subscribe to devtools events before navigation to capture everything.
-    let need_devtools = cli.network_log || cli.console;
+    let need_devtools = cli.network_log || cli.console || cli.save_metadata.is_some();
     let mut devtools = if need_devtools {
         Some(page.devtools().await?)
     } else {
@@ -194,6 +240,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Navigate.
+    let fetch_started = Instant::now();
     if let Some(selector) = &cli.wait_selector {
         page.goto_and_wait(&cli.url, selector, Duration::from_secs(30))
             .await?;
@@ -201,16 +248,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         page.goto(&cli.url).await?;
     }
 
-    let fetch_ms = t0.elapsed().as_millis();
+    let fetch_ms = u64::try_from(fetch_started.elapsed().as_millis())?;
 
     // Capture HTML and screenshot.
     let html = page.html().await?;
     let screenshot = page.screenshot().await?;
 
     // Summary to stderr.
-    let title = extract_title(&html).unwrap_or_else(|| "(no title)".to_owned());
+    let title = extract_title(&html);
     eprintln!("URL:        {}", cli.url);
-    eprintln!("Title:      {}", title);
+    eprintln!("Title:      {}", title.as_deref().unwrap_or("(no title)"));
     eprintln!("HTML size:  {} bytes", html.len());
     eprintln!("PNG size:   {} bytes", screenshot.len());
     eprintln!("Fetch time: {} ms", fetch_ms);
@@ -277,11 +324,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // DOM query.
     if let Some(selector) = &cli.dom {
         let elements = page.find_all(selector).await?;
-        eprintln!(
-            "\n=== DOM: {} ({} matches) ===",
-            selector,
-            elements.len()
-        );
+        eprintln!("\n=== DOM: {} ({} matches) ===", selector, elements.len());
         for (i, el) in elements.iter().enumerate() {
             let el_html = el.html().await?;
             eprintln!("[{}] {}", i, el_html);
@@ -305,6 +348,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("PNG saved:  {}", ss_path.display());
     }
 
+    if let Some(metadata_path) = &cli.save_metadata {
+        let final_url = page
+            .eval("window.location.href")
+            .await?
+            .as_str()
+            .ok_or("window.location.href did not evaluate to a string")?
+            .to_owned();
+        let metadata = CaptureMetadata {
+            requested_url: &cli.url,
+            final_url: &final_url,
+            http_status: main_document_http_status(&network_events, &final_url),
+            captured_at_unix_ms: unix_time_ms()?,
+            fetch_duration_ms: fetch_ms,
+            title: title.as_deref(),
+            html_bytes: u64::try_from(html.len())?,
+            screenshot_bytes: u64::try_from(screenshot.len())?,
+        };
+        let mut json = serde_json::to_vec_pretty(&metadata)?;
+        json.push(b'\n');
+        std::fs::write(metadata_path, json)?;
+        eprintln!("Metadata saved: {}", metadata_path.display());
+    }
+
     // If neither save flag was given, print HTML to stdout.
     if cli.save_html.is_none() && cli.save_screenshot.is_none() {
         print!("{}", html);
@@ -313,4 +379,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     browser.close().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn network_event(
+        method: &str,
+        url: &str,
+        status: u16,
+        params: serde_json::Value,
+    ) -> NetworkEvent {
+        NetworkEvent {
+            method: method.to_owned(),
+            url: Some(url.to_owned()),
+            status: Some(status),
+            params,
+        }
+    }
+
+    #[test]
+    fn derives_only_matching_main_document_status() {
+        let events = vec![
+            network_event(
+                "Network.responseReceived",
+                "https://example.com/app.js",
+                404,
+                json!({"type": "Script"}),
+            ),
+            network_event(
+                "Network.responseReceived",
+                "https://example.com/missing",
+                404,
+                json!({"type": "Document"}),
+            ),
+        ];
+        assert_eq!(
+            main_document_http_status(&events, "https://example.com/missing#details"),
+            Some(404)
+        );
+    }
+
+    #[test]
+    fn bidi_status_requires_navigation_evidence() {
+        let resource = network_event(
+            "network.responseCompleted",
+            "https://example.com/gone",
+            410,
+            json!({"navigation": null}),
+        );
+        assert_eq!(
+            main_document_http_status(&[resource], "https://example.com/gone"),
+            None
+        );
+
+        let document = network_event(
+            "network.responseCompleted",
+            "https://example.com/gone",
+            410,
+            json!({"navigation": "navigation-id"}),
+        );
+        assert_eq!(
+            main_document_http_status(&[document], "https://example.com/gone"),
+            Some(410)
+        );
+    }
 }
