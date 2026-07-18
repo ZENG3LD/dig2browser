@@ -175,6 +175,7 @@ pub struct ServerConfig {
     allow_scripted_tasks: bool,
     allow_identity_status: bool,
     allow_session_state_updates: bool,
+    allow_headful_auth: bool,
 }
 
 impl ServerConfig {
@@ -202,6 +203,7 @@ impl ServerConfig {
             allow_scripted_tasks: false,
             allow_identity_status: false,
             allow_session_state_updates: false,
+            allow_headful_auth: false,
         })
     }
 
@@ -227,6 +229,11 @@ impl ServerConfig {
 
     pub fn allow_identity_status(mut self, allow: bool) -> Self {
         self.allow_identity_status = allow;
+        self
+    }
+
+    pub fn allow_headful_auth(mut self, allow: bool) -> Self {
+        self.allow_headful_auth = allow;
         self
     }
 
@@ -349,6 +356,7 @@ async fn run_windows_server(
                     script: config.allow_scripted_tasks,
                     identity_status: config.allow_identity_status,
                     session_updates: config.allow_session_state_updates,
+                    headful_auth: config.allow_headful_auth,
                 };
                 connections.spawn(async move {
                     serve_connection(
@@ -481,6 +489,22 @@ async fn serve_connection(
                 ResponseStatus::Invalid,
                 "session state updates disabled",
             ),
+            RequestKind::BeginAuthSession if task_permissions.headful_auth => {
+                begin_auth_session(&station, &request).await
+            }
+            RequestKind::BeginAuthSession => WorkerResponse::failure(
+                &request,
+                ResponseStatus::Invalid,
+                "headful authentication disabled",
+            ),
+            RequestKind::FinishAuthSession if task_permissions.headful_auth => {
+                finish_auth_session(&station, &request).await
+            }
+            RequestKind::FinishAuthSession => WorkerResponse::failure(
+                &request,
+                ResponseStatus::Invalid,
+                "headful authentication disabled",
+            ),
             RequestKind::Shutdown if allow_remote_shutdown => {
                 WorkerResponse::empty(&request, ResponseStatus::Ok)
             }
@@ -504,6 +528,81 @@ struct TaskPermissions {
     script: bool,
     identity_status: bool,
     session_updates: bool,
+    headful_auth: bool,
+}
+
+async fn begin_auth_session(
+    station: &BrowserStation,
+    request: &WorkerRequest,
+) -> WorkerResponse {
+    let Some(persona) = request.persona.clone() else {
+        return WorkerResponse::failure(
+            request,
+            ResponseStatus::Invalid,
+            "persona missing",
+        );
+    };
+    let identity = IdentityRequest::authenticated_persona(
+        &request.profile_id,
+        persona,
+    );
+    match station
+        .begin_auth_session(identity, request.url.clone())
+        .await
+    {
+        Ok(()) => WorkerResponse::empty(request, ResponseStatus::Ok),
+        Err(
+            StationError::Identity(_)
+            | StationError::PersonaMismatch
+            | StationError::PersonaBindingRequired
+            | StationError::IdentityClassMismatch
+            | StationError::IdentityClassBindingRequired
+            | StationError::InvalidPersona
+            | StationError::AuthenticatedProfileRequired,
+        ) => WorkerResponse::failure(
+            request,
+            ResponseStatus::Invalid,
+            "authentication identity rejected",
+        ),
+        Err(StationError::AuthSessionBusy | StationError::AtCapacity) => {
+            WorkerResponse::failure(
+                request,
+                ResponseStatus::Unavailable,
+                "authentication session busy",
+            )
+        }
+        Err(_) => WorkerResponse::failure(
+            request,
+            ResponseStatus::Unavailable,
+            "authentication session unavailable",
+        ),
+    }
+}
+
+async fn finish_auth_session(
+    station: &BrowserStation,
+    request: &WorkerRequest,
+) -> WorkerResponse {
+    match station.finish_auth_session(&request.profile_id).await {
+        Ok(()) => WorkerResponse::empty(request, ResponseStatus::Ok),
+        Err(StationError::Identity(_) | StationError::AuthSessionNotFound) => {
+            WorkerResponse::failure(
+                request,
+                ResponseStatus::Invalid,
+                "authentication session not found",
+            )
+        }
+        Err(StationError::AuthSessionBusy) => WorkerResponse::failure(
+            request,
+            ResponseStatus::Unavailable,
+            "authentication session busy",
+        ),
+        Err(_) => WorkerResponse::failure(
+            request,
+            ResponseStatus::Unavailable,
+            "authentication session unavailable",
+        ),
+    }
 }
 
 async fn identity_status(

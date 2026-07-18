@@ -50,6 +50,8 @@ struct Cli {
     allow_session_state_updates: bool,
     #[arg(long, default_value_t = false)]
     allow_identity_status: bool,
+    #[arg(long, default_value_t = false)]
+    allow_headful_auth: bool,
 }
 
 #[cfg(windows)]
@@ -94,7 +96,8 @@ async fn run(cli: Cli) -> Result<ServerReport, DaemonError> {
     .allow_interactive_tasks(cli.allow_interactive_tasks)
     .allow_scripted_tasks(cli.allow_scripted_tasks)
     .allow_identity_status(cli.allow_identity_status)
-    .allow_session_state_updates(cli.allow_session_state_updates);
+    .allow_session_state_updates(cli.allow_session_state_updates)
+    .allow_headful_auth(cli.allow_headful_auth);
     let station = BrowserStation::new(station_config);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {

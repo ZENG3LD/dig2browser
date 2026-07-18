@@ -521,6 +521,7 @@ struct Slot {
 
 struct State {
     slots: HashMap<IdentityRequest, Arc<Slot>>,
+    auth_sessions: HashMap<IdentityRequest, Option<BrowserWorker>>,
 }
 
 struct Inner {
@@ -548,6 +549,7 @@ impl BrowserStation {
                 config,
                 state: Mutex::new(State {
                     slots: HashMap::new(),
+                    auth_sessions: HashMap::new(),
                 }),
                 operation_gate: RwLock::new(()),
                 shutting_down: AtomicBool::new(false),
@@ -583,9 +585,17 @@ impl BrowserStation {
         if state
             .slots
             .keys()
+            .chain(state.auth_sessions.keys())
             .any(|existing| existing.id == identity.id && existing != &identity)
         {
             return Err(StationError::PersonaMismatch);
+        }
+        if state
+            .auth_sessions
+            .keys()
+            .any(|existing| existing.id == identity.id)
+        {
+            return Err(StationError::AuthSessionBusy);
         }
         if let Some(slot) = state.slots.get(&identity).cloned() {
             let ready = match slot.worker.snapshot().lifecycle {
@@ -612,7 +622,9 @@ impl BrowserStation {
         }
 
         let mut evicted = None;
-        if state.slots.len() >= self.inner.config.max_resident {
+        if state.slots.len() + state.auth_sessions.len()
+            >= self.inner.config.max_resident
+        {
             let candidate = state
                 .slots
                 .iter()
@@ -678,13 +690,18 @@ impl BrowserStation {
             .map(|slot| slot.active_leases.load(Ordering::Acquire))
             .sum();
         StationSnapshot {
-            resident: state.slots.len(),
+            resident: state.slots.len() + state.auth_sessions.len(),
             active_leases,
             shutting_down: self.inner.shutting_down.load(Ordering::Acquire),
             workers: state
                 .slots
                 .iter()
                 .map(|(identity, slot)| (identity.clone(), slot.worker.snapshot()))
+                .chain(state.auth_sessions.iter().filter_map(|(identity, worker)| {
+                    worker
+                        .as_ref()
+                        .map(|worker| (identity.clone(), worker.snapshot()))
+                }))
                 .collect(),
         }
     }
@@ -694,7 +711,7 @@ impl BrowserStation {
     pub async fn fleet_status(&self) -> StationFleetStatus {
         let state = self.inner.state.lock().await;
         let mut status = StationFleetStatus {
-            resident_identities: state.slots.len(),
+            resident_identities: state.slots.len() + state.auth_sessions.len(),
             active_leases: state
                 .slots
                 .values()
@@ -716,7 +733,203 @@ impl BrowserStation {
                 WorkerLifecycle::Stopped => status.stopped_workers += 1,
             }
         }
+        for worker in state.auth_sessions.values() {
+            let Some(worker) = worker else {
+                status.starting_workers += 1;
+                continue;
+            };
+            match worker.snapshot().lifecycle {
+                WorkerLifecycle::Starting => status.starting_workers += 1,
+                WorkerLifecycle::Ready => status.ready_workers += 1,
+                WorkerLifecycle::Degraded => status.degraded_workers += 1,
+                WorkerLifecycle::Restarting => status.restarting_workers += 1,
+                WorkerLifecycle::ShuttingDown => status.shutting_down_workers += 1,
+                WorkerLifecycle::Stopped => status.stopped_workers += 1,
+            }
+        }
         status
+    }
+
+    /// Start a visible, station-owned browser for operator authentication.
+    /// The profile remains exclusively owned by this station and no session
+    /// material is returned to the caller.
+    pub async fn begin_auth_session(
+        &self,
+        identity: IdentityRequest,
+        url: String,
+    ) -> Result<(), StationError> {
+        if identity.class != IdentityClass::Authenticated {
+            return Err(StationError::AuthenticatedProfileRequired);
+        }
+        if self.inner.shutting_down.load(Ordering::Acquire) {
+            return Err(StationError::ShuttingDown);
+        }
+        let _operation = self.inner.operation_gate.read().await;
+
+        let evicted = {
+            let mut state = self.inner.state.lock().await;
+            if self.inner.shutting_down.load(Ordering::Acquire) {
+                return Err(StationError::ShuttingDown);
+            }
+            if state
+                .slots
+                .keys()
+                .chain(state.auth_sessions.keys())
+                .any(|existing| existing.id == identity.id && existing != &identity)
+            {
+                return Err(StationError::PersonaMismatch);
+            }
+            if state
+                .auth_sessions
+                .keys()
+                .any(|existing| existing.id == identity.id)
+            {
+                return Err(StationError::AuthSessionBusy);
+            }
+
+            let mut evicted = None;
+            if let Some(slot) = state.slots.get(&identity) {
+                if slot.active_leases.load(Ordering::Acquire) != 0 {
+                    return Err(StationError::AuthSessionBusy);
+                }
+                evicted = state.slots.remove(&identity);
+            } else if state.slots.len() + state.auth_sessions.len()
+                >= self.inner.config.max_resident
+            {
+                let candidate = state
+                    .slots
+                    .iter()
+                    .filter(|(_, slot)| {
+                        slot.active_leases.load(Ordering::Acquire) == 0
+                    })
+                    .min_by_key(|(_, slot)| slot.last_used.load(Ordering::Acquire))
+                    .map(|(key, _)| key.clone());
+                let Some(candidate) = candidate else {
+                    return Err(StationError::AtCapacity);
+                };
+                evicted = state.slots.remove(&candidate);
+            }
+            state.auth_sessions.insert(identity.clone(), None);
+            evicted
+        };
+
+        if let Some(slot) = evicted {
+            if let Err(error) = slot.worker.shutdown().await {
+                self.remove_auth_reservation(&identity).await;
+                return Err(error.into());
+            }
+        }
+
+        let profile = match IdentityProfile::new(
+            &self.inner.config.profiles_root,
+            &identity.id,
+            identity.class,
+            identity.backend,
+            identity.device,
+        ) {
+            Ok(profile) => profile,
+            Err(error) => {
+                self.remove_auth_reservation(&identity).await;
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = bind_identity_contract(&profile, identity.persona()) {
+            self.remove_auth_reservation(&identity).await;
+            return Err(error);
+        }
+        let mut worker_config = self.inner.config.worker.clone();
+        worker_config.launch.headless = false;
+        if let Err(error) = apply_persona(&mut worker_config, identity.persona()) {
+            self.remove_auth_reservation(&identity).await;
+            return Err(error);
+        }
+        let worker = match BrowserWorker::spawn(
+            profile,
+            CapabilitySet::monitoring(),
+            worker_config,
+        ) {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.remove_auth_reservation(&identity).await;
+                return Err(error.into());
+            }
+        };
+        let ready = worker
+            .wait_until_settled()
+            .await
+            .is_ok_and(|snapshot| snapshot.lifecycle == WorkerLifecycle::Ready);
+        if !ready {
+            let _ = worker.shutdown().await;
+            self.remove_auth_reservation(&identity).await;
+            return Err(StationError::WorkerUnavailable);
+        }
+        if let Err(error) = worker.execute(AgentCommand::Navigate { url }).await {
+            let _ = worker.shutdown().await;
+            self.remove_auth_reservation(&identity).await;
+            return Err(error.into());
+        }
+        if let Err(error) = self
+            .update_identity_session(
+                &identity.id,
+                SessionStateUpdate {
+                    phase: SessionPhase::ReauthRequired,
+                    expires_at_unix_ms: None,
+                },
+            )
+            .await
+        {
+            let _ = worker.shutdown().await;
+            self.remove_auth_reservation(&identity).await;
+            return Err(error);
+        }
+
+        let mut state = self.inner.state.lock().await;
+        let Some(reservation) = state.auth_sessions.get_mut(&identity) else {
+            drop(state);
+            let _ = worker.shutdown().await;
+            return Err(StationError::ShuttingDown);
+        };
+        *reservation = Some(worker);
+        Ok(())
+    }
+
+    /// Close a visible authentication browser and make the durable profile
+    /// eligible for ordinary station leases again.
+    pub async fn finish_auth_session(
+        &self,
+        profile_id: &str,
+    ) -> Result<(), StationError> {
+        validate_profile_id(profile_id)?;
+        if self.inner.shutting_down.load(Ordering::Acquire) {
+            return Err(StationError::ShuttingDown);
+        }
+        let _operation = self.inner.operation_gate.read().await;
+        let (identity, worker) = {
+            let mut state = self.inner.state.lock().await;
+            let Some(identity) = state
+                .auth_sessions
+                .keys()
+                .find(|identity| identity.id == profile_id)
+                .cloned()
+            else {
+                return Err(StationError::AuthSessionNotFound);
+            };
+            let Some(worker) = state
+                .auth_sessions
+                .get_mut(&identity)
+                .and_then(Option::take)
+            else {
+                return Err(StationError::AuthSessionBusy);
+            };
+            (identity, worker)
+        };
+        let shutdown = worker.shutdown().await;
+        self.remove_auth_reservation(&identity).await;
+        shutdown.map_err(StationError::from)
+    }
+
+    async fn remove_auth_reservation(&self, identity: &IdentityRequest) {
+        self.inner.state.lock().await.auth_sessions.remove(identity);
     }
 
     /// Read one profile's non-secret session lifecycle. This never inspects or
@@ -781,11 +994,18 @@ impl BrowserStation {
         let _drained = self.inner.operation_gate.write().await;
         let workers = {
             let mut state = self.inner.state.lock().await;
-            state
+            let mut workers = state
                 .slots
                 .drain()
                 .map(|(_, slot)| slot.worker.clone())
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            workers.extend(
+                state
+                    .auth_sessions
+                    .drain()
+                    .filter_map(|(_, worker)| worker),
+            );
+            workers
         };
         let mut stopped = 0;
         let mut failed = 0;
@@ -1238,6 +1458,10 @@ pub enum StationError {
     PersonaIo(#[source] std::io::Error),
     #[error("an authenticated profile is required")]
     AuthenticatedProfileRequired,
+    #[error("browser authentication session is busy")]
+    AuthSessionBusy,
+    #[error("browser authentication session was not found")]
+    AuthSessionNotFound,
     #[error("browser session transition is invalid")]
     InvalidSessionState,
     #[error("browser session state is corrupt")]

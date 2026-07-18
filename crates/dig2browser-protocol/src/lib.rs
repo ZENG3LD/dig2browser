@@ -38,6 +38,8 @@ const STATUS_FIELDS: usize = 22;
 const STATUS_PAYLOAD_BYTES: usize = 8 + STATUS_FIELDS * 8;
 const TASK_IDENTITY_MAGIC: [u8; 4] = *b"D2TI";
 const TASK_IDENTITY_SCHEMA_VERSION: u16 = 2;
+const AUTH_IDENTITY_MAGIC: [u8; 4] = *b"D2AI";
+const AUTH_IDENTITY_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -49,6 +51,8 @@ pub enum RequestKind {
     Task = 5,
     IdentityStatus = 6,
     UpdateIdentityState = 7,
+    BeginAuthSession = 8,
+    FinishAuthSession = 9,
 }
 
 impl RequestKind {
@@ -61,6 +65,8 @@ impl RequestKind {
             5 => Ok(Self::Task),
             6 => Ok(Self::IdentityStatus),
             7 => Ok(Self::UpdateIdentityState),
+            8 => Ok(Self::BeginAuthSession),
+            9 => Ok(Self::FinishAuthSession),
             _ => Err(ProtocolError::InvalidRequest),
         }
     }
@@ -169,6 +175,37 @@ impl WorkerRequest {
         }
     }
 
+    pub fn begin_auth_session(
+        request_id: u64,
+        profile_id: impl Into<String>,
+        persona: BrowserPersona,
+        url: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: RequestKind::BeginAuthSession,
+            request_id,
+            profile_id: profile_id.into(),
+            url: url.into(),
+            task: None,
+            persona: Some(persona),
+            profile_class: Some(ProfileClass::Authenticated),
+            session_update: None,
+        }
+    }
+
+    pub fn finish_auth_session(request_id: u64, profile_id: impl Into<String>) -> Self {
+        Self {
+            kind: RequestKind::FinishAuthSession,
+            request_id,
+            profile_id: profile_id.into(),
+            url: String::new(),
+            task: None,
+            persona: None,
+            profile_class: None,
+            session_update: None,
+        }
+    }
+
     pub fn health(request_id: u64) -> Self {
         Self::control(RequestKind::Health, request_id)
     }
@@ -222,9 +259,22 @@ impl WorkerRequest {
         } else {
             None
         };
+        let auth_payload = if self.kind == RequestKind::BeginAuthSession {
+            Some(encode_auth_identity_payload(
+                self.profile_class
+                    .ok_or(ProtocolError::InvalidRequest)?,
+                self.persona
+                    .as_ref()
+                    .ok_or(ProtocolError::InvalidRequest)?,
+                &self.url,
+            )?)
+        } else {
+            None
+        };
         let body = task_payload
             .as_deref()
             .or(session_payload.as_deref())
+            .or(auth_payload.as_deref())
             .unwrap_or(self.url.as_bytes());
         let url_len = u32::try_from(body.len()).map_err(|_| ProtocolError::InvalidRequest)?;
         let total = REQUEST_HEADER_BYTES
@@ -305,6 +355,35 @@ impl WorkerRequest {
                         .as_ref()
                         .ok_or(ProtocolError::InvalidRequest)?
                         .validate()
+                } else {
+                    Err(ProtocolError::InvalidRequest)
+                }
+            }
+            RequestKind::BeginAuthSession => {
+                validate_profile_id(&self.profile_id)?;
+                validate_http_url(&self.url)?;
+                self.persona
+                    .as_ref()
+                    .ok_or(ProtocolError::InvalidRequest)?
+                    .validate()?;
+                if self.task.is_none()
+                    && self.profile_class == Some(ProfileClass::Authenticated)
+                    && self.session_update.is_none()
+                {
+                    Ok(())
+                } else {
+                    Err(ProtocolError::InvalidRequest)
+                }
+            }
+            RequestKind::FinishAuthSession => {
+                validate_profile_id(&self.profile_id)?;
+                if self.url.is_empty()
+                    && self.task.is_none()
+                    && self.persona.is_none()
+                    && self.profile_class.is_none()
+                    && self.session_update.is_none()
+                {
+                    Ok(())
                 } else {
                     Err(ProtocolError::InvalidRequest)
                 }
@@ -716,6 +795,61 @@ fn decode_task_identity_payload(
     Ok((profile_class, persona, task))
 }
 
+fn encode_auth_identity_payload(
+    profile_class: ProfileClass,
+    persona: &BrowserPersona,
+    url: &str,
+) -> Result<Vec<u8>, ProtocolError> {
+    if profile_class != ProfileClass::Authenticated {
+        return Err(ProtocolError::InvalidIdentityPayload);
+    }
+    let persona = persona.encode()?;
+    let persona_len = u16::try_from(persona.len())
+        .map_err(|_| ProtocolError::InvalidIdentityPayload)?;
+    let mut payload = Vec::with_capacity(10 + persona.len() + url.len());
+    payload.extend_from_slice(&AUTH_IDENTITY_MAGIC);
+    payload.extend_from_slice(&AUTH_IDENTITY_SCHEMA_VERSION.to_le_bytes());
+    payload.extend_from_slice(&persona_len.to_le_bytes());
+    payload.push(profile_class as u8);
+    payload.push(0);
+    payload.extend_from_slice(&persona);
+    payload.extend_from_slice(url.as_bytes());
+    Ok(payload)
+}
+
+fn decode_auth_identity_payload(
+    payload: &[u8],
+) -> Result<(ProfileClass, BrowserPersona, String), ProtocolError> {
+    if payload.len() < 10
+        || payload[..4] != AUTH_IDENTITY_MAGIC
+        || u16::from_le_bytes(payload[4..6].try_into().unwrap())
+            != AUTH_IDENTITY_SCHEMA_VERSION
+        || payload[9] != 0
+    {
+        return Err(ProtocolError::InvalidIdentityPayload);
+    }
+    let persona_len = usize::from(u16::from_le_bytes(payload[6..8].try_into().unwrap()));
+    let profile_class = ProfileClass::from_wire(payload[8])?;
+    if profile_class != ProfileClass::Authenticated {
+        return Err(ProtocolError::InvalidIdentityPayload);
+    }
+    let persona_end = 10usize
+        .checked_add(persona_len)
+        .ok_or(ProtocolError::InvalidIdentityPayload)?;
+    if persona_end >= payload.len() {
+        return Err(ProtocolError::InvalidIdentityPayload);
+    }
+    let (persona, consumed) = BrowserPersona::decode(&payload[10..persona_end])?;
+    if consumed != persona_len {
+        return Err(ProtocolError::InvalidIdentityPayload);
+    }
+    let url = std::str::from_utf8(&payload[persona_end..])
+        .map_err(|_| ProtocolError::InvalidIdentityPayload)?
+        .to_owned();
+    validate_http_url(&url)?;
+    Ok((profile_class, persona, url))
+}
+
 pub async fn read_worker_request<R>(
     stream: &mut R,
 ) -> Result<Option<WorkerRequest>, FrameError>
@@ -760,6 +894,9 @@ where
             Some(profile_class),
             None,
         )
+    } else if kind == RequestKind::BeginAuthSession {
+        let (profile_class, persona, url) = decode_auth_identity_payload(body)?;
+        (url, None, Some(persona), Some(profile_class), None)
     } else if kind == RequestKind::UpdateIdentityState {
         (
             String::new(),
@@ -1050,6 +1187,37 @@ mod tests {
                 .await
                 .expect("decode"),
             response
+        );
+    }
+
+    #[tokio::test]
+    async fn authentication_session_requests_round_trip_without_secret_fields() {
+        let begin = WorkerRequest::begin_auth_session(
+            81,
+            "operator-profile",
+            BrowserPersona::mobile_default(),
+            "https://example.test/login",
+        );
+        let bytes = begin.encode().expect("encode begin auth session");
+        assert!(!bytes.windows(6).any(|window| window == b"Cookie"));
+        let mut reader = &bytes[..];
+        assert_eq!(
+            read_worker_request(&mut reader)
+                .await
+                .expect("decode begin auth session")
+                .expect("begin auth request"),
+            begin
+        );
+
+        let finish = WorkerRequest::finish_auth_session(82, "operator-profile");
+        let bytes = finish.encode().expect("encode finish auth session");
+        let mut reader = &bytes[..];
+        assert_eq!(
+            read_worker_request(&mut reader)
+                .await
+                .expect("decode finish auth session")
+                .expect("finish auth request"),
+            finish
         );
     }
 

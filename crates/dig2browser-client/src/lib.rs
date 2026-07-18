@@ -256,6 +256,38 @@ impl StationClient {
         require_ok(&response)
     }
 
+    /// Start a station-owned visible Chromium window for operator login. The
+    /// station retains exclusive profile ownership and returns no cookie data.
+    pub async fn begin_auth_session(
+        &self,
+        profile_id: impl Into<String>,
+        persona: BrowserPersona,
+        url: impl Into<String>,
+    ) -> Result<(), ClientError> {
+        let request = WorkerRequest::begin_auth_session(
+            self.take_request_id(),
+            profile_id,
+            persona,
+            url,
+        );
+        let response = self.call(request).await?;
+        require_ok(&response)
+    }
+
+    /// Close a station-owned visible login window and release its profile back
+    /// to the headless worker pool. Session readiness remains operator-set.
+    pub async fn finish_auth_session(
+        &self,
+        profile_id: impl Into<String>,
+    ) -> Result<(), ClientError> {
+        let request = WorkerRequest::finish_auth_session(
+            self.take_request_id(),
+            profile_id,
+        );
+        let response = self.call(request).await?;
+        require_ok(&response)
+    }
+
     /// Capture while periodically yielding control to the caller for lease
     /// heartbeats or cooperative cancellation. Cancelling drops the in-flight
     /// request and disconnects the pipe so its late response cannot desync the
@@ -474,6 +506,26 @@ impl BlockingStationClient {
     ) -> Result<(), ClientError> {
         self.runtime
             .block_on(self.client.update_identity_state(profile_id, update))
+    }
+
+    pub fn begin_auth_session(
+        &self,
+        profile_id: impl Into<String>,
+        persona: BrowserPersona,
+        url: impl Into<String>,
+    ) -> Result<(), ClientError> {
+        self.runtime.block_on(
+            self.client
+                .begin_auth_session(profile_id, persona, url),
+        )
+    }
+
+    pub fn finish_auth_session(
+        &self,
+        profile_id: impl Into<String>,
+    ) -> Result<(), ClientError> {
+        self.runtime
+            .block_on(self.client.finish_auth_session(profile_id))
     }
 
     pub fn capture_with_progress<E, F>(

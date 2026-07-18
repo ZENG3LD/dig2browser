@@ -56,7 +56,7 @@ impl FixtureServer {
     }
 
     fn url(&self, path: &str) -> String {
-        format!("http://{}{}", self.address, path)
+        format!("http://localhost:{}{}", self.address.port(), path)
     }
 }
 
@@ -72,9 +72,25 @@ impl Drop for FixtureServer {
 
 fn serve_connection(mut stream: TcpStream) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    let mut request = [0_u8; 4096];
-    let count = stream.read(&mut request)?;
-    let request = String::from_utf8_lossy(&request[..count]);
+    let mut request = Vec::with_capacity(4096);
+    loop {
+        let mut chunk = [0_u8; 1024];
+        let count = stream.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        request.extend_from_slice(&chunk[..count]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+        if request.len() >= 16 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "fixture request headers exceed limit",
+            ));
+        }
+    }
+    let request = String::from_utf8_lossy(&request);
     let path = request
         .lines()
         .next()
@@ -83,15 +99,37 @@ fn serve_connection(mut stream: TcpStream) -> std::io::Result<()> {
         .split('?')
         .next()
         .unwrap_or("/");
-    let marker = path.trim_start_matches('/');
+    let requested_marker = path.trim_start_matches('/');
+    let marker = if requested_marker == "auth-check" {
+        if request.lines().any(|line| {
+            line.to_ascii_lowercase().starts_with("cookie:")
+                && line.contains("dig2browser_auth_e2e=cookie-secret")
+        }) {
+            "auth-check-ok"
+        } else {
+            "auth-check-missing"
+        }
+    } else {
+        requested_marker
+    };
     if marker == "force-close" {
         return Ok(());
     }
+    let script = if requested_marker == "auth-bootstrap" {
+        "<script>localStorage.setItem('dig2browser_auth_e2e','present');document.cookie='dig2browser_auth_e2e=cookie-secret; Path=/; Max-Age=3600'</script>"
+    } else {
+        ""
+    };
     let body = format!(
-        "<!doctype html><title>{marker}</title><main data-daemon-e2e=\"{marker}\">{marker}</main>"
+        "<!doctype html><title>{marker}</title><main data-daemon-e2e=\"{marker}\">{marker}</main>{script}"
     );
+    let cookie = if requested_marker == "auth-bootstrap" {
+        "Set-Cookie: dig2browser_auth_e2e=cookie-secret; Path=/; Max-Age=3600\r\n"
+    } else {
+        ""
+    };
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{body}",
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n{cookie}Content-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes())
@@ -391,6 +429,19 @@ async fn stationd_denies_active_task_capabilities_by_default_e2e() {
             ..
         })
     ));
+    assert!(matches!(
+        client
+            .begin_auth_session(
+                "restricted-auth-profile",
+                BrowserPersona::desktop_default(),
+                fixture.url("/restricted-auth"),
+            )
+            .await,
+        Err(ClientError::Remote {
+            status: ResponseStatus::Invalid,
+            ..
+        })
+    ));
     let status = client.status().await.expect("restricted station status");
     assert_eq!(status.resident_identities, 0);
     client.shutdown().await.expect("shutdown restricted station");
@@ -401,6 +452,173 @@ async fn stationd_denies_active_task_capabilities_by_default_e2e() {
     assert!(exit.success(), "restricted station failed: {exit}");
     let (_, stderr) = read_child_output(&mut daemon).await;
     assert!(stderr.is_empty(), "restricted station wrote stderr: {stderr}");
+    remove_tree(&profiles).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stationd_headful_auth_reuses_profile_without_exporting_secrets_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-stationd-auth-e2e-{unique}");
+    let profiles = e2e_temp_base().join(format!(
+        "dig2browser-stationd-auth-e2e-{unique}"
+    ));
+    std::fs::create_dir_all(&profiles).expect("create headful auth E2E profiles root");
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+    let auth_cli = env!("CARGO_BIN_EXE_dig2browser-auth");
+    let mut daemon = spawn_stationd_with_headful_auth(
+        stationd,
+        &pipe_name,
+        &profiles,
+    );
+    let client = StationClient::connect(
+        ClientConfig::new(
+            &pipe_name,
+            Duration::from_secs(15),
+            Duration::from_secs(90),
+        )
+        .expect("valid headful auth client config"),
+    )
+    .await
+    .expect("connect headful auth client");
+    let profile_id = "headful-auth-profile";
+    let persona = BrowserPersona::desktop_default();
+
+    let auth_url = fixture.url("/auth-bootstrap");
+    let begin = run_auth_cli(
+        auth_cli,
+        &pipe_name,
+        &["begin", "--profile-id", profile_id, "--url", &auth_url],
+    )
+    .await;
+    assert!(begin.status.success(), "auth CLI begin failed: {begin:?}");
+    assert!(String::from_utf8_lossy(&begin.stdout).contains("\"state\":\"open\""));
+    let during = client.status().await.expect("read auth session status");
+    assert_eq!(during.resident_identities, 1);
+    assert_eq!(during.ready_workers, 1);
+    let reauth = client
+        .identity_status(profile_id)
+        .await
+        .expect("read session state after auth start");
+    assert_eq!(reauth.phase, SessionPhase::ReauthRequired);
+    assert_eq!(reauth.profile_class, Some(ProfileClass::Authenticated));
+
+    let busy_task = CollectionTask::new(vec![TaskStep::Navigate {
+        url: fixture.url("/auth-busy"),
+    }])
+    .expect("valid busy task");
+    assert!(matches!(
+        client
+            .run_task_with_identity(
+                profile_id,
+                ProfileClass::Authenticated,
+                persona.clone(),
+                busy_task,
+            )
+            .await,
+        Err(ClientError::Remote {
+            status: ResponseStatus::Unavailable,
+            ..
+        })
+    ));
+    assert!(matches!(
+        client
+            .begin_auth_session(
+                profile_id,
+                persona.clone(),
+                fixture.url("/auth-duplicate"),
+            )
+            .await,
+        Err(ClientError::Remote {
+            status: ResponseStatus::Unavailable,
+            ..
+        })
+    ));
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let finish = run_auth_cli(
+        auth_cli,
+        &pipe_name,
+        &["finish", "--profile-id", profile_id],
+    )
+    .await;
+    assert!(finish.status.success(), "auth CLI finish failed: {finish:?}");
+    assert!(String::from_utf8_lossy(&finish.stdout).contains("\"state\":\"closed\""));
+    assert!(matches!(
+        client.finish_auth_session(profile_id).await,
+        Err(ClientError::Remote {
+            status: ResponseStatus::Invalid,
+            ..
+        })
+    ));
+
+    let verification = CollectionTask::new(vec![
+        TaskStep::Navigate {
+            url: fixture.url("/auth-check"),
+        },
+        TaskStep::Evaluate {
+            script: "localStorage.getItem('dig2browser_auth_e2e')".to_owned(),
+        },
+        TaskStep::Capture {
+            policy: TaskCapturePolicy::EvidenceViewport,
+        },
+    ])
+    .expect("valid post-auth verification task");
+    let result = client
+        .run_task_with_identity(
+            profile_id,
+            ProfileClass::Authenticated,
+            persona,
+            verification,
+        )
+        .await
+        .expect("reuse authenticated profile in headless worker");
+    assert_eq!(
+        result.replies()[1],
+        TaskReply::ScriptJson("\"present\"".to_owned())
+    );
+    let TaskReply::Capture(capture) = &result.replies()[2] else {
+        panic!("post-auth task did not return evidence capture");
+    };
+    assert_eq!(capture.requested_url, fixture.url("/auth-check"));
+    assert_eq!(capture.final_url, fixture.url("/auth-check"));
+    assert!(!format!("{:?}", result.replies()).contains("cookie-secret"));
+
+    let ready_command = run_auth_cli(
+        auth_cli,
+        &pipe_name,
+        &["ready", "--profile-id", profile_id, "--ttl-seconds", "60"],
+    )
+    .await;
+    assert!(
+        ready_command.status.success(),
+        "auth CLI ready failed: {ready_command:?}"
+    );
+    let ready = client
+        .identity_status(profile_id)
+        .await
+        .expect("read ready state after operator confirmation");
+    assert_eq!(ready.phase, SessionPhase::Ready);
+    assert!(ready.expires_at_unix_ms.is_some_and(|expiry| expiry > unix_time_ms()));
+    let status_command = run_auth_cli(
+        auth_cli,
+        &pipe_name,
+        &["status", "--profile-id", profile_id],
+    )
+    .await;
+    assert!(status_command.status.success(), "auth CLI status failed: {status_command:?}");
+    assert!(String::from_utf8_lossy(&status_command.stdout).contains("\"phase\":\"ready\""));
+
+    client.shutdown().await.expect("shutdown headful auth station");
+    let exit = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("headful auth daemon exit timeout")
+        .expect("wait for headful auth daemon");
+    assert!(exit.success(), "headful auth station failed: {exit}");
+    let (_, stderr) = read_child_output(&mut daemon).await;
+    assert!(stderr.is_empty(), "headful auth station wrote stderr: {stderr}");
     remove_tree(&profiles).await;
 }
 
@@ -873,8 +1091,25 @@ async fn read_child_output(child: &mut tokio::process::Child) -> (String, String
     (stdout, stderr)
 }
 
+async fn run_auth_cli(
+    auth_cli: &str,
+    pipe_name: &str,
+    args: &[&str],
+) -> std::process::Output {
+    let mut command = tokio::process::Command::new(auth_cli);
+    command.args(["--pipe-name", pipe_name]);
+    command.args(args);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .expect("run dig2browser-auth CLI")
+}
+
 fn spawn_stationd(stationd: &str, pipe_name: &str, profiles: &Path) -> tokio::process::Child {
-    spawn_stationd_with_permissions(stationd, pipe_name, profiles, true, true)
+    spawn_stationd_with_permissions(stationd, pipe_name, profiles, true, true, false)
 }
 
 fn spawn_stationd_with_task_permissions(
@@ -889,7 +1124,16 @@ fn spawn_stationd_with_task_permissions(
         profiles,
         allow_active_tasks,
         false,
+        false,
     )
+}
+
+fn spawn_stationd_with_headful_auth(
+    stationd: &str,
+    pipe_name: &str,
+    profiles: &Path,
+) -> tokio::process::Child {
+    spawn_stationd_with_permissions(stationd, pipe_name, profiles, true, true, true)
 }
 
 fn spawn_stationd_with_permissions(
@@ -898,6 +1142,7 @@ fn spawn_stationd_with_permissions(
     profiles: &Path,
     allow_active_tasks: bool,
     allow_session_state_updates: bool,
+    allow_headful_auth: bool,
 ) -> tokio::process::Child {
     let mut command = tokio::process::Command::new(stationd);
     command.args([
@@ -925,6 +1170,9 @@ fn spawn_stationd_with_permissions(
             "--allow-identity-status",
             "--allow-session-state-updates",
         ]);
+    }
+    if allow_headful_auth {
+        command.arg("--allow-headful-auth");
     }
     command
         .stdin(Stdio::null())

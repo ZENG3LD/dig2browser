@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 dig2browser = { path = "../.." }
+dig2browser-client = { path = "../dig2browser-client" }
 dig2browser-protocol = { path = "../dig2browser-protocol" }
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
