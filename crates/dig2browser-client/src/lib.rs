@@ -182,6 +182,54 @@ impl StationClient {
             .map_err(|_| ClientError::InvalidResponse)
     }
 
+    /// Run a public-profile task while periodically yielding for lease
+    /// heartbeats or cooperative cancellation. Cancellation disconnects the
+    /// pipe so a late task reply cannot desynchronize the next request.
+    pub async fn run_task_with_progress<E, F>(
+        &self,
+        profile_id: impl Into<String>,
+        task: CollectionTask,
+        progress_interval: Duration,
+        mut progress: F,
+    ) -> Result<CollectionTaskResult, CaptureProgressError<E>>
+    where
+        F: FnMut() -> Result<(), E>,
+    {
+        if let Err(error) = progress() {
+            self.disconnect().await;
+            return Err(CaptureProgressError::Aborted(error));
+        }
+
+        enum Outcome<T, E> {
+            Task(Result<T, ClientError>),
+            Aborted(E),
+        }
+
+        let progress_interval = progress_interval.max(Duration::from_millis(10));
+        let outcome = {
+            let task = self.run_task(profile_id, task);
+            tokio::pin!(task);
+            loop {
+                tokio::select! {
+                    result = &mut task => break Outcome::Task(result),
+                    () = tokio::time::sleep(progress_interval) => {
+                        if let Err(error) = progress() {
+                            break Outcome::Aborted(error);
+                        }
+                    }
+                }
+            }
+        };
+
+        match outcome {
+            Outcome::Task(result) => result.map_err(CaptureProgressError::Client),
+            Outcome::Aborted(error) => {
+                self.disconnect().await;
+                Err(CaptureProgressError::Aborted(error))
+            }
+        }
+    }
+
     pub async fn identity_status(
         &self,
         profile_id: impl Into<String>,
@@ -399,6 +447,24 @@ impl BlockingStationClient {
         profile_id: impl Into<String>,
     ) -> Result<IdentitySessionStatus, ClientError> {
         self.runtime.block_on(self.client.identity_status(profile_id))
+    }
+
+    pub fn run_task_with_progress<E, F>(
+        &self,
+        profile_id: impl Into<String>,
+        task: CollectionTask,
+        progress_interval: Duration,
+        progress: F,
+    ) -> Result<CollectionTaskResult, CaptureProgressError<E>>
+    where
+        F: FnMut() -> Result<(), E>,
+    {
+        self.runtime.block_on(self.client.run_task_with_progress(
+            profile_id,
+            task,
+            progress_interval,
+            progress,
+        ))
     }
 
     pub fn update_identity_state(
