@@ -62,6 +62,7 @@ fn open_exclusive(lock_path: &Path) -> std::io::Result<File> {
 
     OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .share_mode(0)

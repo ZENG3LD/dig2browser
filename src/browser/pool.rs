@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use crate::detect::BrowserProfile;
 use crate::detect::LaunchConfig;
-use crate::identity::ProfileOwnershipGuard;
 use crate::stealth::StealthConfig;
 use tracing::warn;
 
@@ -53,7 +52,6 @@ pub struct BrowserPool {
     semaphore: Arc<tokio::sync::Semaphore>,
     counter: Arc<AtomicUsize>,
     acquire_timeout: Duration,
-    _profile_owner: Option<ProfileOwnershipGuard>,
 }
 
 impl BrowserPool {
@@ -61,13 +59,6 @@ impl BrowserPool {
     pub async fn new(config: PoolConfig) -> Result<Self, BrowserError> {
         let size = config.size.max(1);
         validate_pool_profile(&config.launch.profile, size)?;
-        let profile_owner = match &config.launch.profile {
-            BrowserProfile::Persistent(path) => Some(
-                ProfileOwnershipGuard::acquire(path)
-                    .map_err(|error| BrowserError::Launch(error.to_string()))?,
-            ),
-            BrowserProfile::Ephemeral => None,
-        };
         let mut browsers = Vec::with_capacity(size);
 
         // Launch browsers in parallel.
@@ -100,7 +91,6 @@ impl BrowserPool {
             browsers,
             counter: Arc::new(AtomicUsize::new(0)),
             acquire_timeout: config.acquire_timeout,
-            _profile_owner: profile_owner,
         })
     }
 
