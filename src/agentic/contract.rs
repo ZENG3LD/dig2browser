@@ -16,6 +16,7 @@ pub enum L1Capability {
 pub enum L2Capability {
     Inspect,
     Interact,
+    Evaluate,
 }
 
 /// Level 3 capabilities operate on browser state and lifecycle.
@@ -73,6 +74,37 @@ impl CapabilitySet {
             Capability::L1(L1Capability::Scroll),
             Capability::L2(L2Capability::Inspect),
             Capability::L2(L2Capability::Interact),
+            Capability::L2(L2Capability::Evaluate),
+            Capability::L3(L3Capability::Navigate),
+            Capability::L3(L3Capability::Capture),
+            Capability::L3(L3Capability::Lifecycle),
+        ])
+        .expect("built-in capability set is valid")
+    }
+
+    /// Read-oriented monitoring plus bounded page-script evaluation. This is
+    /// separate from `monitoring()` so ordinary capture clients do not gain a
+    /// script execution capability implicitly.
+    pub fn scripted_monitoring() -> Self {
+        Self::new([
+            Capability::L2(L2Capability::Inspect),
+            Capability::L2(L2Capability::Evaluate),
+            Capability::L3(L3Capability::Navigate),
+            Capability::L3(L3Capability::Capture),
+            Capability::L3(L3Capability::Lifecycle),
+        ])
+        .expect("built-in capability set is valid")
+    }
+
+    /// Collection tasks that need bounded scrolling, selector interaction,
+    /// page evaluation, navigation, and evidence capture without raw pointer
+    /// or keyboard control.
+    pub fn collection() -> Self {
+        Self::new([
+            Capability::L1(L1Capability::Scroll),
+            Capability::L2(L2Capability::Inspect),
+            Capability::L2(L2Capability::Interact),
+            Capability::L2(L2Capability::Evaluate),
             Capability::L3(L3Capability::Navigate),
             Capability::L3(L3Capability::Capture),
             Capability::L3(L3Capability::Lifecycle),
@@ -173,6 +205,9 @@ pub enum AgentCommand {
     ReadElementText {
         element: ElementRef,
     },
+    Evaluate {
+        script: String,
+    },
     Navigate {
         url: String,
     },
@@ -195,6 +230,7 @@ impl AgentCommand {
             Self::ClickElement { .. } | Self::TypeElement { .. } => {
                 Capability::L2(L2Capability::Interact)
             }
+            Self::Evaluate { .. } => Capability::L2(L2Capability::Evaluate),
             Self::Navigate { .. } => Capability::L3(L3Capability::Navigate),
             Self::Capture { .. } => Capability::L3(L3Capability::Capture),
             Self::Restart | Self::Shutdown => Capability::L3(L3Capability::Lifecycle),
@@ -207,6 +243,7 @@ pub enum AgentReply {
     Acknowledged,
     Element(ElementRef),
     Text(String),
+    ScriptValue(serde_json::Value),
     Capture(CaptureArtifact),
 }
 

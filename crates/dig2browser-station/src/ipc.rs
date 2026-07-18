@@ -449,11 +449,41 @@ async fn capture(
             )
         }
     };
-    let artifact = match lease
+    let first_attempt = lease
         .navigate_and_capture(&request.url, CapturePolicy::EvidenceViewport)
-        .await
-    {
+        .await;
+    let artifact = match first_attempt {
         Ok(artifact) => artifact,
+        Err(error) if is_navigation_failure(&error) => {
+            let recovered = lease.execute(dig2browser::agentic::AgentCommand::Restart).await;
+            if recovered.is_err() {
+                observation.failure(station_error_class(&error, FailureClass::CaptureFailed));
+                return failure(
+                    request,
+                    ResponseStatus::CaptureFailed,
+                    "capture failed",
+                    started,
+                );
+            }
+            match lease
+                .navigate_and_capture(&request.url, CapturePolicy::EvidenceViewport)
+                .await
+            {
+                Ok(artifact) => artifact,
+                Err(error) => {
+                    observation.failure(station_error_class(
+                        &error,
+                        FailureClass::CaptureFailed,
+                    ));
+                    return failure(
+                        request,
+                        ResponseStatus::CaptureFailed,
+                        "capture failed",
+                        started,
+                    );
+                }
+            }
+        }
         Err(error) => {
             observation.failure(station_error_class(&error, FailureClass::CaptureFailed));
             return failure(
@@ -542,6 +572,14 @@ fn station_error_class(error: &StationError, fallback: FailureClass) -> FailureC
     } else {
         fallback
     }
+}
+
+fn is_navigation_failure(error: &StationError) -> bool {
+    matches!(
+        error,
+        StationError::Worker(WorkerError::Runtime(runtime))
+            if runtime.kind() == dig2browser::agentic::RuntimeFailureKind::Navigation
+    )
 }
 
 fn usize_u64(value: usize) -> u64 {

@@ -501,6 +501,11 @@ impl BrowserBackend for CdpBrowserBackend {
                     let _ = child.kill().await;
                 }
             }
+            if let Some(process_tree) = self._process_tree.take() {
+                process_tree
+                    .terminate_and_wait(std::time::Duration::from_secs(3))
+                    .await?;
+            }
             if self.profile_ephemeral {
                 remove_profile_dir_with_retry(&self.profile_dir).await?;
                 self.profile_ephemeral = false;

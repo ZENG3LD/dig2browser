@@ -11,7 +11,8 @@ use dig2browser::agentic::{
     CapturePolicy,
 };
 use dig2browser_station::{
-    BrowserStation, IdentityRequest, StationConfig, StationError,
+    BrowserStation, BrowserTask, BrowserTaskStep, IdentityRequest, StationConfig,
+    StationError,
 };
 
 struct FixtureServer {
@@ -135,20 +136,75 @@ async fn station_reuses_identity_enforces_ownership_and_drains_real_browser_e2e(
     }
 
     let second = station
-        .lease(identity, CapabilitySet::monitoring())
+        .lease(identity, CapabilitySet::collection())
         .await
         .expect("reuse station identity");
     let snapshot = station.snapshot().await;
     assert_eq!(snapshot.resident, 1);
     assert_eq!(snapshot.active_leases, 2);
 
+    let task = BrowserTask::new(vec![
+        BrowserTaskStep::Navigate {
+            url: fixture.url("/two"),
+        },
+        BrowserTaskStep::Wait {
+            duration: Duration::from_millis(50),
+        },
+        BrowserTaskStep::Evaluate {
+            script: "({title: document.title, marker: document.querySelector('main')?.dataset.e2e})"
+                .into(),
+        },
+        BrowserTaskStep::ReadSelectorText {
+            selector: "main".into(),
+        },
+        BrowserTaskStep::Wheel {
+            x: 640.0,
+            y: 360.0,
+            delta_x: 0.0,
+            delta_y: 250.0,
+        },
+        BrowserTaskStep::Capture {
+            policy: CapturePolicy::EvidenceViewport,
+        },
+    ])
+    .expect("valid collection task");
+    let task_result = second.run_task(&task).await.expect("run collection task");
+    assert_eq!(task_result.replies.len(), 6);
+    let AgentReply::ScriptValue(value) = &task_result.replies[2] else {
+        panic!("unexpected task script result: {:?}", task_result.replies[2]);
+    };
+    assert_eq!(value["title"].as_str(), Some("station two"));
+    assert_eq!(value["marker"].as_str(), Some("station"));
+    assert_eq!(task_result.replies[3], AgentReply::Text("station two".into()));
+    match &task_result.replies[5] {
+        AgentReply::Capture(CaptureArtifact::EvidenceViewport { state, html, png }) => {
+            assert_eq!(state.title, "station two");
+            assert!(html.contains("data-e2e=\"station\""));
+            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        }
+        reply => panic!("unexpected task capture: {reply:?}"),
+    }
+    assert_eq!(second.snapshot().restart_count, 0);
+
     second
         .execute(AgentCommand::Navigate {
-            url: fixture.url("/two"),
+            url: fixture.url("/one"),
         })
         .await
-        .expect("second navigation triggers runtime rotation");
+        .expect("next navigation rotates before loading the page");
     assert_eq!(second.snapshot().restart_count, 1);
+    let post_rotation = second
+        .execute(AgentCommand::Capture {
+            policy: CapturePolicy::HtmlOnly,
+        })
+        .await
+        .expect("capture survives pre-navigation rotation");
+    match post_rotation {
+        AgentReply::Capture(CaptureArtifact::HtmlOnly { state, .. }) => {
+            assert_eq!(state.title, "station one");
+        }
+        reply => panic!("unexpected post-rotation capture: {reply:?}"),
+    }
     assert!(matches!(
         second.execute(AgentCommand::Shutdown).await,
         Err(StationError::DirectShutdownDenied)

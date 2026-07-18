@@ -38,6 +38,10 @@ pub trait BrowserRuntime: Send + 'static {
         &'a mut self,
         selector: &'a str,
     ) -> BoxFuture<'a, RuntimeResult<String>>;
+    fn evaluate<'a>(
+        &'a mut self,
+        script: &'a str,
+    ) -> BoxFuture<'a, RuntimeResult<serde_json::Value>>;
     fn capture(&mut self, policy: CapturePolicy) -> BoxFuture<'_, RuntimeResult<CaptureArtifact>>;
 }
 
@@ -365,6 +369,18 @@ impl BrowserRuntime for RealBrowserRuntime {
                 .map_err(|_| RuntimeError::new(RuntimeFailureKind::Interaction))?;
             element
                 .text()
+                .await
+                .map_err(|_| RuntimeError::new(RuntimeFailureKind::Interaction))
+        })
+    }
+
+    fn evaluate<'a>(
+        &'a mut self,
+        script: &'a str,
+    ) -> BoxFuture<'a, RuntimeResult<serde_json::Value>> {
+        Box::pin(async move {
+            self.page()?
+                .eval(script)
                 .await
                 .map_err(|_| RuntimeError::new(RuntimeFailureKind::Interaction))
         })

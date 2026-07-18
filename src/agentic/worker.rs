@@ -16,6 +16,8 @@ use super::runtime::{BrowserRuntime, RealBrowserRuntime, RuntimeError};
 const MAX_QUEUE_CAPACITY: usize = 256;
 const MAX_KEY_BYTES: usize = 64;
 const MAX_TEXT_BYTES: usize = 64 * 1024;
+const MAX_SCRIPT_BYTES: usize = 64 * 1024;
+const MAX_SCRIPT_RESULT_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
 const MIN_COMMAND_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_COMMAND_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -268,6 +270,12 @@ async fn handle_command(
         return Err(WorkerError::Unavailable);
     }
 
+    // Rotate before the next navigation, never after it. Restarting after a
+    // successful navigation would discard the page before capture/extraction.
+    if matches!(&command, AgentCommand::Navigate { .. }) && runtime.needs_restart() {
+        restart_runtime(runtime, snapshot, snapshots).await?;
+    }
+
     let result = match command {
         AgentCommand::ClickAt { x, y } => {
             validate_finite(&[x, y])?;
@@ -330,6 +338,19 @@ async fn handle_command(
                 .await
                 .map(AgentReply::Text)
         }
+        AgentCommand::Evaluate { script } => {
+            if script.is_empty() || script.len() > MAX_SCRIPT_BYTES || script.contains('\0') {
+                return Err(WorkerError::InvalidInput);
+            }
+            runtime.evaluate(&script).await.and_then(|value| {
+                let encoded = serde_json::to_vec(&value)
+                    .map_err(|_| RuntimeError::new(RuntimeFailureKind::Protocol))?;
+                if encoded.len() > MAX_SCRIPT_RESULT_BYTES {
+                    return Err(RuntimeError::new(RuntimeFailureKind::Protocol));
+                }
+                Ok(AgentReply::ScriptValue(value))
+            })
+        }
         AgentCommand::Navigate { url } => {
             validate_navigation_url(&url)?;
             runtime.navigate(&url).await.map(|state| {
@@ -370,13 +391,9 @@ async fn handle_command(
         }
     };
 
-    if runtime.needs_restart() {
-        restart_runtime(runtime, snapshot, snapshots).await?;
-    } else {
-        snapshot.lifecycle = WorkerLifecycle::Ready;
-        snapshot.last_failure = None;
-        snapshots.send_replace(snapshot.clone());
-    }
+    snapshot.lifecycle = WorkerLifecycle::Ready;
+    snapshot.last_failure = None;
+    snapshots.send_replace(snapshot.clone());
     Ok(reply)
 }
 
@@ -651,6 +668,14 @@ mod tests {
             _selector: &'a str,
         ) -> BoxFuture<'a, RuntimeResult<String>> {
             Box::pin(async { Ok("text".into()) })
+        }
+
+        fn evaluate<'a>(
+            &'a mut self,
+            script: &'a str,
+        ) -> BoxFuture<'a, RuntimeResult<serde_json::Value>> {
+            let script = script.to_owned();
+            Box::pin(async move { Ok(serde_json::json!({ "script": script })) })
         }
 
         fn capture(

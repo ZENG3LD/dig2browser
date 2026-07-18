@@ -8,11 +8,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use dig2browser::agentic::{
     AgentCommand, AgentReply, BrowserSnapshot, BrowserWorker, BrowserWorkerConfig,
-    Capability, CapabilitySet, CaptureArtifact, CapturePolicy, L3Capability, WorkerError,
-    WorkerLifecycle,
+    Capability, CapabilitySet, CaptureArtifact, CapturePolicy, ElementRef, L1Capability,
+    L2Capability, L3Capability, WorkerError, WorkerLifecycle,
 };
 use dig2browser::identity::{
     BrowserBackend, DevicePersona, IdentityClass, IdentityError, IdentityProfile,
@@ -24,6 +25,8 @@ pub mod ipc;
 
 const MAX_RESIDENT: usize = 256;
 const MAX_IN_FLIGHT: usize = 4_096;
+const MAX_TASK_STEPS: usize = 64;
+const MAX_TASK_WAIT: Duration = Duration::from_secs(2 * 60);
 
 /// Exclusive, crash-releasing ownership of one canonical station profiles root.
 #[derive(Debug)]
@@ -156,6 +159,69 @@ impl IdentityRequest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum BrowserTaskStep {
+    Navigate { url: String },
+    Wait { duration: Duration },
+    Wheel {
+        x: f64,
+        y: f64,
+        delta_x: f64,
+        delta_y: f64,
+    },
+    KeyPress { key: String },
+    ClickSelector { selector: String },
+    TypeSelector { selector: String, text: String },
+    ReadSelectorText { selector: String },
+    Evaluate { script: String },
+    Capture { policy: CapturePolicy },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BrowserTask {
+    steps: Vec<BrowserTaskStep>,
+}
+
+impl BrowserTask {
+    pub fn new(steps: Vec<BrowserTaskStep>) -> Result<Self, TaskError> {
+        if steps.is_empty() || steps.len() > MAX_TASK_STEPS {
+            return Err(TaskError::InvalidStepCount);
+        }
+        let mut total_wait = Duration::ZERO;
+        for step in &steps {
+            match step {
+                BrowserTaskStep::Wait { duration } => {
+                    if duration.is_zero() || *duration > MAX_TASK_WAIT {
+                        return Err(TaskError::InvalidWait);
+                    }
+                    total_wait = total_wait
+                        .checked_add(*duration)
+                        .ok_or(TaskError::InvalidWait)?;
+                    if total_wait > MAX_TASK_WAIT {
+                        return Err(TaskError::InvalidWait);
+                    }
+                }
+                BrowserTaskStep::ClickSelector { selector }
+                | BrowserTaskStep::ReadSelectorText { selector }
+                | BrowserTaskStep::TypeSelector { selector, .. } => {
+                    ElementRef::new(selector, 0).map_err(|_| TaskError::InvalidSelector)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(Self { steps })
+    }
+
+    pub fn steps(&self) -> &[BrowserTaskStep] {
+        &self.steps
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserTaskResult {
+    pub replies: Vec<AgentReply>,
+}
+
 struct Slot {
     worker: BrowserWorker,
     session_gate: Mutex<()>,
@@ -276,7 +342,15 @@ impl BrowserStation {
             self.inner.config.worker.clone(),
         )?;
         let snapshot = worker.wait_until_settled().await?;
-        if snapshot.lifecycle != WorkerLifecycle::Ready {
+        let ready = match snapshot.lifecycle {
+            WorkerLifecycle::Ready => true,
+            WorkerLifecycle::Degraded => worker
+                .execute(AgentCommand::Restart)
+                .await
+                .is_ok(),
+            _ => false,
+        };
+        if !ready {
             let _ = worker.shutdown().await;
             return Err(StationError::WorkerUnavailable);
         }
@@ -466,6 +540,159 @@ impl BrowserLease {
         self.slot.last_used.store(now, Ordering::Release);
         Ok(artifact)
     }
+
+    /// Execute a bounded multi-step task under one identity session and one
+    /// global command slot. Other consumers cannot interleave page mutations
+    /// between navigation, interaction, extraction, and capture.
+    pub async fn run_task(&self, task: &BrowserTask) -> Result<BrowserTaskResult, StationError> {
+        self.validate_task_capabilities(task)?;
+        let _operation = self.station.inner.operation_gate.read().await;
+        if self.station.inner.shutting_down.load(Ordering::Acquire) {
+            return Err(StationError::ShuttingDown);
+        }
+        let _session = self.slot.session_gate.lock().await;
+        let waiter = CommandWaiter::new(&self.station.inner.command_waiters);
+        let _command = self
+            .station
+            .inner
+            .command_slots
+            .acquire()
+            .await
+            .map_err(|_| StationError::ShuttingDown)?;
+        drop(waiter);
+
+        let mut replies = Vec::with_capacity(task.steps().len());
+        for step in task.steps() {
+            let reply = match step {
+                BrowserTaskStep::Navigate { url } => {
+                    self.slot
+                        .worker
+                        .execute(AgentCommand::Navigate { url: url.clone() })
+                        .await?
+                }
+                BrowserTaskStep::Wait { duration } => {
+                    tokio::time::sleep(*duration).await;
+                    AgentReply::Acknowledged
+                }
+                BrowserTaskStep::Wheel {
+                    x,
+                    y,
+                    delta_x,
+                    delta_y,
+                } => {
+                    self.slot
+                        .worker
+                        .execute(AgentCommand::Wheel {
+                            x: *x,
+                            y: *y,
+                            delta_x: *delta_x,
+                            delta_y: *delta_y,
+                        })
+                        .await?
+                }
+                BrowserTaskStep::KeyPress { key } => {
+                    self.slot
+                        .worker
+                        .execute(AgentCommand::KeyPress { key: key.clone() })
+                        .await?
+                }
+                BrowserTaskStep::ClickSelector { selector } => {
+                    let element = self.resolve_task_element(selector).await?;
+                    self.slot
+                        .worker
+                        .execute(AgentCommand::ClickElement { element })
+                        .await?
+                }
+                BrowserTaskStep::TypeSelector { selector, text } => {
+                    let element = self.resolve_task_element(selector).await?;
+                    self.slot
+                        .worker
+                        .execute(AgentCommand::TypeElement {
+                            element,
+                            text: text.clone(),
+                        })
+                        .await?
+                }
+                BrowserTaskStep::ReadSelectorText { selector } => {
+                    let element = self.resolve_task_element(selector).await?;
+                    self.slot
+                        .worker
+                        .execute(AgentCommand::ReadElementText { element })
+                        .await?
+                }
+                BrowserTaskStep::Evaluate { script } => {
+                    self.slot
+                        .worker
+                        .execute(AgentCommand::Evaluate {
+                            script: script.clone(),
+                        })
+                        .await?
+                }
+                BrowserTaskStep::Capture { policy } => {
+                    self.slot
+                        .worker
+                        .execute(AgentCommand::Capture { policy: *policy })
+                        .await?
+                }
+            };
+            replies.push(reply);
+        }
+        let now = self.station.inner.clock.fetch_add(1, Ordering::AcqRel) + 1;
+        self.slot.last_used.store(now, Ordering::Release);
+        Ok(BrowserTaskResult { replies })
+    }
+
+    async fn resolve_task_element(&self, selector: &str) -> Result<ElementRef, StationError> {
+        let reply = self
+            .slot
+            .worker
+            .execute(AgentCommand::ResolveElement {
+                selector: selector.to_owned(),
+            })
+            .await?;
+        let AgentReply::Element(element) = reply else {
+            return Err(StationError::InvalidWorkerReply);
+        };
+        Ok(element)
+    }
+
+    fn validate_task_capabilities(&self, task: &BrowserTask) -> Result<(), StationError> {
+        for step in task.steps() {
+            let required: &[Capability] = match step {
+                BrowserTaskStep::Navigate { .. } => {
+                    &[Capability::L3(L3Capability::Navigate)]
+                }
+                BrowserTaskStep::Wait { .. } => &[],
+                BrowserTaskStep::Wheel { .. } => {
+                    &[Capability::L1(L1Capability::Scroll)]
+                }
+                BrowserTaskStep::KeyPress { .. } => {
+                    &[Capability::L1(L1Capability::Keyboard)]
+                }
+                BrowserTaskStep::ClickSelector { .. }
+                | BrowserTaskStep::TypeSelector { .. } => &[
+                    Capability::L2(L2Capability::Inspect),
+                    Capability::L2(L2Capability::Interact),
+                ],
+                BrowserTaskStep::ReadSelectorText { .. } => {
+                    &[Capability::L2(L2Capability::Inspect)]
+                }
+                BrowserTaskStep::Evaluate { .. } => {
+                    &[Capability::L2(L2Capability::Evaluate)]
+                }
+                BrowserTaskStep::Capture { .. } => {
+                    &[Capability::L3(L3Capability::Capture)]
+                }
+            };
+            if required
+                .iter()
+                .any(|capability| !self.capabilities.contains(*capability))
+            {
+                return Err(StationError::CapabilityDenied);
+            }
+        }
+        Ok(())
+    }
 }
 
 struct CommandWaiter<'a> {
@@ -542,6 +769,16 @@ pub enum ProfilesRootError {
     AlreadyOwned,
     #[error("profiles root I/O failed")]
     Io(#[source] std::io::Error),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TaskError {
+    #[error("browser task must contain 1 to 64 steps")]
+    InvalidStepCount,
+    #[error("browser task wait budget is invalid")]
+    InvalidWait,
+    #[error("browser task selector is invalid")]
+    InvalidSelector,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

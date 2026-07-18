@@ -45,7 +45,7 @@ impl OwnedProcessTree {
                 let _ = unsafe { CloseHandle(job) };
                 return Err(windows_error(error));
             }
-            return Ok(Self { job });
+            Ok(Self { job })
         }
 
         #[cfg(not(windows))]
@@ -58,9 +58,9 @@ impl OwnedProcessTree {
             use windows::Win32::Foundation::HANDLE;
             use windows::Win32::System::JobObjects::AssignProcessToJobObject;
 
-            let raw_handle = child.raw_handle().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "child process handle is unavailable")
-            })?;
+            let raw_handle = child
+                .raw_handle()
+                .ok_or_else(|| io::Error::other("child process handle is unavailable"))?;
             let process = HANDLE(raw_handle);
             // SAFETY: both handles are valid for this call. The child remains
             // owned by the caller and the Job Object remains owned by `self`.
@@ -71,11 +71,59 @@ impl OwnedProcessTree {
         let _ = child;
         Ok(())
     }
+
+    pub(crate) async fn terminate_and_wait(
+        &self,
+        timeout: std::time::Duration,
+    ) -> io::Result<()> {
+        #[cfg(windows)]
+        {
+            use windows::Win32::System::JobObjects::{
+                JobObjectBasicAccountingInformation, QueryInformationJobObject,
+                TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+            };
+
+            // SAFETY: `self.job` is a valid owned Job Object handle.
+            unsafe { TerminateJobObject(self.job, 1) }.map_err(windows_error)?;
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+                // SAFETY: the buffer matches the requested information class
+                // and remains alive for the duration of the call.
+                unsafe {
+                    QueryInformationJobObject(
+                        self.job,
+                        JobObjectBasicAccountingInformation,
+                        &mut accounting as *mut _ as *mut std::ffi::c_void,
+                        std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                        None,
+                    )
+                }
+                .map_err(windows_error)?;
+                if accounting.ActiveProcesses == 0 {
+                    return Ok(());
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "browser process tree did not terminate",
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = timeout;
+            Ok(())
+        }
+    }
 }
 
 #[cfg(windows)]
 fn windows_error(error: windows::core::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, error.to_string())
+    io::Error::other(error.to_string())
 }
 
 #[cfg(windows)]
