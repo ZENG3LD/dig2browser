@@ -1,6 +1,6 @@
 use futures::future::BoxFuture;
 
-use crate::browser::{StealthBrowser, StealthPage};
+use crate::browser::{DevToolsEvent, NetworkEvent, PageDevTools, StealthBrowser, StealthPage};
 use crate::detect::{BrowserPreference, BrowserProfile, LaunchConfig};
 use crate::identity::{BrowserBackend, DevicePersona, IdentityProfile};
 use crate::stealth::StealthConfig;
@@ -49,6 +49,8 @@ pub struct RealBrowserRuntime {
     mobile_layout: Option<MobileLayout>,
     browser: Option<StealthBrowser>,
     page: Option<StealthPage>,
+    devtools: Option<PageDevTools>,
+    document_http_status: Option<u16>,
 }
 
 impl RealBrowserRuntime {
@@ -85,6 +87,8 @@ impl RealBrowserRuntime {
             mobile_layout,
             browser: None,
             page: None,
+            devtools: None,
+            document_http_status: None,
         })
     }
 
@@ -102,6 +106,13 @@ impl RealBrowserRuntime {
             Err(_) => {
                 let _ = browser.close().await;
                 return Err(RuntimeError::new(RuntimeFailureKind::Launch));
+            }
+        };
+        let devtools = match page.devtools().await {
+            Ok(devtools) => devtools,
+            Err(_) => {
+                let _ = browser.close().await;
+                return Err(RuntimeError::new(RuntimeFailureKind::Protocol));
             }
         };
 
@@ -127,11 +138,15 @@ impl RealBrowserRuntime {
         }
 
         self.page = Some(page);
+        self.devtools = Some(devtools);
+        self.document_http_status = None;
         self.browser = Some(browser);
         Ok(())
     }
 
     async fn restart_inner(&mut self) -> RuntimeResult<()> {
+        self.devtools.take();
+        self.document_http_status = None;
         self.page.take();
         if let Some(browser) = self.browser.take() {
             browser
@@ -143,6 +158,8 @@ impl RealBrowserRuntime {
     }
 
     async fn close_inner(&mut self) -> RuntimeResult<()> {
+        self.devtools.take();
+        self.document_http_status = None;
         self.page.take();
         let close_result = if let Some(browser) = self.browser.take() {
             browser
@@ -178,8 +195,44 @@ impl RealBrowserRuntime {
             url: value["url"].as_str().unwrap_or_default().to_owned(),
             title: value["title"].as_str().unwrap_or_default().to_owned(),
             ready_state: value["readyState"].as_str().unwrap_or_default().to_owned(),
+            http_status: self.document_http_status,
         })
     }
+
+    fn clear_devtools_events(&mut self) {
+        if let Some(devtools) = &mut self.devtools {
+            while devtools.try_next().is_some() {}
+        }
+    }
+
+    fn update_document_http_status(&mut self, final_url: &str) {
+        let mut status = None;
+        if let Some(devtools) = &mut self.devtools {
+            while let Some(event) = devtools.try_next() {
+                if let DevToolsEvent::Network(event) = event {
+                    if let Some(candidate) = main_document_http_status(&event, final_url) {
+                        status = Some(candidate);
+                    }
+                }
+            }
+        }
+        self.document_http_status = status;
+    }
+}
+
+fn main_document_http_status(event: &NetworkEvent, final_url: &str) -> Option<u16> {
+    let status = event.status.filter(|status| (100..=599).contains(status))?;
+    let event_url = event.url.as_deref()?;
+    if event_url.split('#').next() != final_url.split('#').next() {
+        return None;
+    }
+
+    let is_main_document = match event.method.as_str() {
+        "Network.responseReceived" => event.params["type"] == "Document",
+        "network.responseCompleted" => event.params["navigation"].is_string(),
+        _ => false,
+    };
+    is_main_document.then_some(status)
 }
 
 impl BrowserRuntime for RealBrowserRuntime {
@@ -203,11 +256,16 @@ impl BrowserRuntime for RealBrowserRuntime {
 
     fn navigate<'a>(&'a mut self, url: &'a str) -> BoxFuture<'a, RuntimeResult<DocumentState>> {
         Box::pin(async move {
+            self.clear_devtools_events();
+            self.document_http_status = None;
             self.page()?
                 .goto(url)
                 .await
                 .map_err(|_| RuntimeError::new(RuntimeFailureKind::Navigation))?;
-            self.document_state().await
+            let mut state = self.document_state().await?;
+            self.update_document_http_status(&state.url);
+            state.http_status = self.document_http_status;
+            Ok(state)
         })
     }
 
@@ -398,5 +456,30 @@ mod tests {
         assert_eq!(runtime.stealth.viewport, (393, 852));
         assert_eq!(runtime.stealth.device_scale_factor.get(), 3.0);
         assert_eq!(runtime.stealth.user_agent, "desktop-sentinel");
+    }
+
+    #[test]
+    fn main_document_status_uses_final_document_response() {
+        let subresource = NetworkEvent {
+            method: "Network.responseReceived".into(),
+            url: Some("https://example.test/app.js".into()),
+            status: Some(200),
+            params: serde_json::json!({"type": "Script"}),
+        };
+        let document = NetworkEvent {
+            method: "Network.responseReceived".into(),
+            url: Some("https://example.test/final#fragment".into()),
+            status: Some(204),
+            params: serde_json::json!({"type": "Document"}),
+        };
+
+        assert_eq!(
+            main_document_http_status(&subresource, "https://example.test/final"),
+            None
+        );
+        assert_eq!(
+            main_document_http_status(&document, "https://example.test/final"),
+            Some(204)
+        );
     }
 }

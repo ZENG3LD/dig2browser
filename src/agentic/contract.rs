@@ -127,6 +127,7 @@ pub struct DocumentState {
     pub url: String,
     pub title: String,
     pub ready_state: String,
+    pub http_status: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

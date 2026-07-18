@@ -573,6 +573,7 @@ mod tests {
                     url,
                     title: "page".into(),
                     ready_state: "complete".into(),
+                    http_status: Some(200),
                 })
             })
         }
@@ -630,6 +631,7 @@ mod tests {
                     url: "https://example.test/private?token=secret".into(),
                     title: "page".into(),
                     ready_state: "complete".into(),
+                    http_status: Some(200),
                 }))
             })
         }

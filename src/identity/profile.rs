@@ -78,9 +78,9 @@ impl IdentityProfile {
 
 /// Validate an identity ID before using it as a profile path component.
 pub fn validate_profile_id(id: &str) -> Result<(), IdentityError> {
-    if id.is_empty() || id.len() > 64 {
+    if id.is_empty() || id.len() > 128 {
         return Err(IdentityError::InvalidProfileId(
-            "profile ID must contain 1 to 64 ASCII characters".into(),
+            "profile ID must contain 1 to 128 ASCII characters".into(),
         ));
     }
     if !id
