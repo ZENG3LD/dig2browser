@@ -5,6 +5,21 @@ use std::path::{Path, PathBuf};
 use crate::detect::binary::BrowserPreference;
 use crate::detect::DetectError;
 
+/// Renderer sandbox policy for Chromium-family browsers.
+///
+/// The control plane itself is trusted, but pages are not. Disabling the
+/// renderer sandbox is therefore an explicit compatibility choice rather than
+/// an automatic launch fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RendererSandboxMode {
+    /// Keep the browser's renderer sandbox enabled.
+    #[default]
+    Enabled,
+    /// Launch with `--no-sandbox` for environments where Chromium's sandbox
+    /// cannot start. Callers must opt into this mode explicitly.
+    CompatibilityDisabled,
+}
+
 /// Where to store the browser profile data.
 #[derive(Debug, Clone)]
 pub enum BrowserProfile {
@@ -23,6 +38,8 @@ pub struct LaunchConfig {
     pub debug_port: Option<u16>,
     pub extra_args: Vec<String>,
     pub browser_pref: BrowserPreference,
+    /// Renderer sandbox policy. Defaults to [`RendererSandboxMode::Enabled`].
+    pub renderer_sandbox: RendererSandboxMode,
     /// Restart Chrome after this many page navigations to reclaim leaked memory.
     /// Set to `0` to disable automatic restarts.
     pub restart_after_pages: u32,
@@ -40,6 +57,7 @@ impl Default for LaunchConfig {
             debug_port: None,
             extra_args: Vec::new(),
             browser_pref: BrowserPreference::Auto,
+            renderer_sandbox: RendererSandboxMode::Enabled,
             restart_after_pages: 500,
             geckodriver_url: "http://localhost:4444".into(),
         }
@@ -89,14 +107,12 @@ impl LaunchConfig {
         // Use ANGLE (hardware-accelerated via D3D11) — same as real Chrome on Windows.
         // SwiftShader is too slow for heavy WebGL SPAs like 2GIS maps.
         args.push("--use-angle=d3d11".into());
-        args.push("--no-sandbox".into());
+        if self.renderer_sandbox == RendererSandboxMode::CompatibilityDisabled {
+            args.push("--no-sandbox".into());
+        }
         args.push("--disable-dev-shm-usage".into());
         // Cap the on-disk cache to 100 MB so long-running daemons don't accumulate GBs.
         args.push("--disk-cache-size=104857600".into());
-        // Override the default User-Agent which contains "HeadlessChrome" —
-        // many sites reject it at the HTTP level before any JS runs.
-        args.push("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36".into());
-
         // Locale flags ensure HTTP Accept-Language matches navigator.languages.
         let effective_locale = locale.unwrap_or("en-US");
         let lang_base = effective_locale.split('-').next().unwrap_or("en");
@@ -110,11 +126,15 @@ impl LaunchConfig {
             "--window-size={},{}",
             self.window_size.0, self.window_size.1
         ));
+        // Caller-provided flags are useful for feature and proxy tuning, but
+        // lifecycle/profile/security ownership remains with dig2browser.
+        args.extend(sanitized_extra_args(&self.extra_args));
+
+        // Keep protected arguments last as a second line of defence against
+        // Chromium's last-flag-wins parsing.
         args.push("--remote-debugging-address=127.0.0.1".into());
         args.push(format!("--remote-debugging-port={}", port));
         args.push(format!("--user-data-dir={}", profile_dir.display()));
-
-        args.extend(self.extra_args.iter().cloned());
 
         args
     }
@@ -127,6 +147,54 @@ impl LaunchConfig {
             .map(|addr| addr.port())
             .unwrap_or(9222) // fallback
     }
+}
+
+fn is_protected_argument(argument: &str) -> bool {
+    let name = argument
+        .split_once('=')
+        .map_or(argument, |(name, _)| name)
+        .to_ascii_lowercase();
+
+    matches!(
+        name.as_str(),
+        "--remote-debugging-address"
+            | "--remote-debugging-port"
+            | "--remote-debugging-pipe"
+            | "--user-data-dir"
+            | "--no-sandbox"
+            | "--disable-setuid-sandbox"
+            | "--disable-gpu-sandbox"
+            | "--disable-seccomp-filter-sandbox"
+            | "--no-zygote"
+    )
+}
+
+fn sanitized_extra_args(extra_args: &[String]) -> Vec<String> {
+    let mut sanitized = Vec::with_capacity(extra_args.len());
+    let mut index = 0;
+    while index < extra_args.len() {
+        let argument = &extra_args[index];
+        if is_protected_argument(argument) {
+            let name = argument
+                .split_once('=')
+                .map_or(argument.as_str(), |(name, _)| name)
+                .to_ascii_lowercase();
+            if !argument.contains('=')
+                && matches!(
+                    name.as_str(),
+                    "--remote-debugging-address"
+                        | "--remote-debugging-port"
+                        | "--user-data-dir"
+                )
+            {
+                index += 1;
+            }
+        } else {
+            sanitized.push(argument.clone());
+        }
+        index += 1;
+    }
+    sanitized
 }
 
 #[cfg(test)]
@@ -144,5 +212,49 @@ mod tests {
         assert!(args
             .iter()
             .any(|argument| argument == "--remote-debugging-port=9222"));
+    }
+
+    #[test]
+    fn renderer_sandbox_is_enabled_by_default() {
+        let args = LaunchConfig::default().build_args(Path::new("profile"), 9_222, None);
+        assert!(!args.iter().any(|argument| argument == "--no-sandbox"));
+    }
+
+    #[test]
+    fn renderer_sandbox_compatibility_mode_is_explicit() {
+        let config = LaunchConfig {
+            renderer_sandbox: RendererSandboxMode::CompatibilityDisabled,
+            ..LaunchConfig::default()
+        };
+        let args = config.build_args(Path::new("profile"), 9_222, None);
+        assert!(args.iter().any(|argument| argument == "--no-sandbox"));
+    }
+
+    #[test]
+    fn extra_args_cannot_override_owned_launch_flags() {
+        let config = LaunchConfig {
+            extra_args: vec![
+                "--remote-debugging-address=0.0.0.0".into(),
+                "--remote-debugging-port=4444".into(),
+                "--user-data-dir=attacker-profile".into(),
+                "--remote-debugging-port".into(),
+                "5555".into(),
+                "--no-sandbox".into(),
+                "--proxy-server=http://127.0.0.1:8080".into(),
+            ],
+            ..LaunchConfig::default()
+        };
+        let args = config.build_args(Path::new("owned-profile"), 9_222, None);
+
+        assert!(!args.iter().any(|argument| argument.contains("0.0.0.0")));
+        assert!(!args.iter().any(|argument| argument.contains("4444")));
+        assert!(!args.iter().any(|argument| argument == "5555"));
+        assert!(!args
+            .iter()
+            .any(|argument| argument.contains("attacker-profile")));
+        assert!(!args.iter().any(|argument| argument == "--no-sandbox"));
+        assert!(args
+            .iter()
+            .any(|argument| argument == "--proxy-server=http://127.0.0.1:8080"));
     }
 }

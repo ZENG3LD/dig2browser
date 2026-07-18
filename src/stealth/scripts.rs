@@ -45,7 +45,11 @@ pub fn get_scripts(config: &StealthConfig) -> Vec<String> {
     scripts.push(override_performance_timing());
     scripts.push(override_battery_api());
     scripts.push(override_outer_size());
-    scripts.push(override_user_agent_data());
+    if let Some(profile) = config.resolved_profile_from_user_agent() {
+        if profile.full_version.is_some() {
+            scripts.push(override_user_agent_data(&profile));
+        }
+    }
 
     scripts
 }
@@ -596,37 +600,45 @@ fn override_outer_size() -> String {
 /// NOTE: On the CDP backend this is superseded by `Emulation.setUserAgentOverride`
 /// with `userAgentMetadata` which sets Client Hints natively (including HTTP headers).
 /// This JS version remains for the BiDi/Firefox backend.
-fn override_user_agent_data() -> String {
+fn override_user_agent_data(
+    profile: &crate::stealth::config::UserAgentProfile,
+) -> String {
+    let brands = profile
+        .brands()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(brand, version)| serde_json::json!({ "brand": brand, "version": version }))
+        .collect::<Vec<_>>();
+    let full_version_list = profile
+        .full_version_list()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(brand, version)| serde_json::json!({ "brand": brand, "version": version }))
+        .collect::<Vec<_>>();
+    let brands = serde_json::to_string(&brands).expect("UA brands are JSON serializable");
+    let full_version_list = serde_json::to_string(&full_version_list)
+        .expect("UA full version list is JSON serializable");
+    let full_version = serde_json::to_string(profile.full_version.as_deref().unwrap_or_default())
+        .expect("UA version is JSON serializable");
+
     r#"
     if (!navigator.userAgentData) {
         Object.defineProperty(Navigator.prototype, 'userAgentData', {
             get: () => ({
-                brands: [
-                    { brand: 'Google Chrome', version: '131' },
-                    { brand: 'Chromium', version: '131' },
-                    { brand: 'Not_A Brand', version: '24' },
-                ],
+                brands: __BRANDS__,
                 mobile: false,
                 platform: 'Windows',
                 getHighEntropyValues: function(hints) {
                     return Promise.resolve({
                         architecture: 'x86',
                         bitness: '64',
-                        brands: [
-                            { brand: 'Google Chrome', version: '131' },
-                            { brand: 'Chromium', version: '131' },
-                            { brand: 'Not_A Brand', version: '24' },
-                        ],
-                        fullVersionList: [
-                            { brand: 'Google Chrome', version: '131.0.6778.140' },
-                            { brand: 'Chromium', version: '131.0.6778.140' },
-                            { brand: 'Not_A Brand', version: '24.0.0.0' },
-                        ],
+                        brands: __BRANDS__,
+                        fullVersionList: __FULL_VERSION_LIST__,
                         mobile: false,
                         model: '',
                         platform: 'Windows',
                         platformVersion: '15.0.0',
-                        uaFullVersion: '131.0.6778.140',
+                        uaFullVersion: __FULL_VERSION__,
                     });
                 },
                 toJSON: function() {
@@ -638,7 +650,9 @@ fn override_user_agent_data() -> String {
         });
     }
     "#
-    .to_string()
+    .replace("__BRANDS__", &brands)
+    .replace("__FULL_VERSION_LIST__", &full_version_list)
+    .replace("__FULL_VERSION__", &full_version)
 }
 
 /// Override `navigator.permissions.query` to handle all permission types.

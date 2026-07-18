@@ -1,5 +1,7 @@
 //! Stealth configuration types.
 
+use crate::detect::BrowserKind;
+
 /// How aggressively to apply anti-detection overrides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StealthLevel {
@@ -42,14 +44,44 @@ impl LocaleProfile {
     }
 }
 
-/// Chrome 131 / Windows desktop User-Agent string used by default.
-///
-/// Kept as a constant so `StealthConfig::user_agent` and the JS
-/// `override_user_agent_data` script stay in sync without duplication.
-pub const DEFAULT_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
-     AppleWebKit/537.36 (KHTML, like Gecko) \
-     Chrome/131.0.0.0 Safari/537.36";
+/// An empty value selects an automatic User-Agent derived from the browser
+/// binary actually launched. A non-empty value remains an explicit override.
+pub const DEFAULT_USER_AGENT: &str = "";
+
+#[derive(Debug, Clone)]
+pub(crate) struct UserAgentProfile {
+    pub user_agent: String,
+    pub browser_brand: &'static str,
+    pub full_version: Option<String>,
+}
+
+impl UserAgentProfile {
+    pub fn major_version(&self) -> Option<&str> {
+        self.full_version
+            .as_deref()
+            .and_then(|version| version.split('.').next())
+    }
+
+    pub fn brands(&self) -> Option<Vec<(&str, &str)>> {
+        let major = self.major_version()?;
+        let mut brands = vec![(self.browser_brand, major)];
+        if self.browser_brand != "Chromium" {
+            brands.push(("Chromium", major));
+        }
+        brands.push(("Not_A Brand", "24"));
+        Some(brands)
+    }
+
+    pub fn full_version_list(&self) -> Option<Vec<(&str, &str)>> {
+        let full = self.full_version.as_deref()?;
+        let mut brands = vec![(self.browser_brand, full)];
+        if self.browser_brand != "Chromium" {
+            brands.push(("Chromium", full));
+        }
+        brands.push(("Not_A Brand", "24.0.0.0"));
+        Some(brands)
+    }
+}
 
 /// Full stealth configuration passed to script generators and injection strategies.
 #[derive(Debug, Clone)]
@@ -87,5 +119,122 @@ impl StealthConfig {
     }
     pub fn english() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn resolve_user_agent(
+        &self,
+        kind: BrowserKind,
+        detected_version: Option<&str>,
+    ) -> UserAgentProfile {
+        let browser_brand = match kind {
+            BrowserKind::Edge => "Microsoft Edge",
+            BrowserKind::Chrome => "Google Chrome",
+            BrowserKind::Chromium | BrowserKind::Firefox => "Chromium",
+        };
+
+        if !self.user_agent.trim().is_empty() {
+            let full_version = extract_browser_version(&self.user_agent).map(str::to_owned);
+            let explicit_brand = if self.user_agent.contains("Edg/") {
+                "Microsoft Edge"
+            } else if self.user_agent.contains("Chrome/") {
+                "Google Chrome"
+            } else {
+                browser_brand
+            };
+            return UserAgentProfile {
+                user_agent: self.user_agent.clone(),
+                browser_brand: explicit_brand,
+                full_version,
+            };
+        }
+
+        let full_version = detected_version.map(str::to_owned);
+        let user_agent = full_version
+            .as_deref()
+            .map(|version| automatic_user_agent(kind, version))
+            .unwrap_or_default();
+        UserAgentProfile {
+            user_agent,
+            browser_brand,
+            full_version,
+        }
+    }
+
+    pub(crate) fn resolved_profile_from_user_agent(&self) -> Option<UserAgentProfile> {
+        if self.user_agent.trim().is_empty() {
+            return None;
+        }
+        let browser_brand = if self.user_agent.contains("Edg/") {
+            "Microsoft Edge"
+        } else if self.user_agent.contains("Chrome/") {
+            "Google Chrome"
+        } else {
+            "Chromium"
+        };
+        Some(UserAgentProfile {
+            user_agent: self.user_agent.clone(),
+            browser_brand,
+            full_version: extract_browser_version(&self.user_agent).map(str::to_owned),
+        })
+    }
+}
+
+fn automatic_user_agent(kind: BrowserKind, version: &str) -> String {
+    let base = format!(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+         AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{version} Safari/537.36"
+    );
+    match kind {
+        BrowserKind::Edge => format!("{base} Edg/{version}"),
+        _ => base,
+    }
+}
+
+fn extract_browser_version(user_agent: &str) -> Option<&str> {
+    ["Edg/", "Chrome/", "Chromium/"]
+        .into_iter()
+        .find_map(|marker| {
+            let start = user_agent.find(marker)? + marker.len();
+            let version = user_agent[start..].split_whitespace().next()?;
+            version
+                .chars()
+                .all(|character| character.is_ascii_digit() || character == '.')
+                .then_some(version)
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn automatic_chrome_profile_uses_detected_version() {
+        let profile = StealthConfig::default()
+            .resolve_user_agent(BrowserKind::Chrome, Some("150.0.7871.125"));
+
+        assert!(profile.user_agent.contains("Chrome/150.0.7871.125"));
+        assert_eq!(profile.major_version(), Some("150"));
+        assert_eq!(profile.browser_brand, "Google Chrome");
+    }
+
+    #[test]
+    fn automatic_edge_profile_keeps_edge_and_chromium_tokens_coherent() {
+        let profile = StealthConfig::default()
+            .resolve_user_agent(BrowserKind::Edge, Some("150.0.7871.125"));
+
+        assert!(profile.user_agent.contains("Chrome/150.0.7871.125"));
+        assert!(profile.user_agent.contains("Edg/150.0.7871.125"));
+        assert_eq!(profile.browser_brand, "Microsoft Edge");
+    }
+
+    #[test]
+    fn explicit_user_agent_is_preserved() {
+        let config = StealthConfig {
+            user_agent: "custom-agent/7".into(),
+            ..StealthConfig::default()
+        };
+        let profile = config.resolve_user_agent(BrowserKind::Chrome, Some("150.0.7871.125"));
+
+        assert_eq!(profile.user_agent, "custom-agent/7");
     }
 }

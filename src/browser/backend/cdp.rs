@@ -15,7 +15,10 @@ use tracing::debug;
 
 use crate::cdp::{CdpClient, CdpSession};
 use crate::cookies::Cookie;
+use crate::detect::args::BrowserProfile;
+use crate::detect::version::browser_version;
 use crate::detect::{LaunchConfig, detect_browser};
+use crate::identity::ProfileOwnershipGuard;
 use crate::stealth::{StealthConfig, get_scripts};
 
 use crate::browser::devtools::DevToolsEvent;
@@ -37,6 +40,22 @@ pub(crate) struct CdpBrowserBackend {
     /// Profile dir path, deleted on drop if ephemeral.
     profile_dir: std::path::PathBuf,
     profile_ephemeral: bool,
+    /// Exclusive owner token for persistent profiles.
+    _profile_guard: Option<ProfileOwnershipGuard>,
+}
+
+struct CdpDiscovery {
+    ws_url: String,
+    browser_product: Option<String>,
+}
+
+fn product_version(product: &str) -> Option<&str> {
+    let (_, version) = product.split_once('/')?;
+    (!version.is_empty()
+        && version
+            .chars()
+            .all(|character| character.is_ascii_digit() || character == '.'))
+    .then_some(version)
 }
 
 impl Drop for CdpBrowserBackend {
@@ -62,8 +81,16 @@ impl CdpBrowserBackend {
         stealth: &StealthConfig,
     ) -> Result<Self, BrowserError> {
         let binary = detect_browser(launch.browser_pref)?;
+        let installed_version = browser_version(&binary);
         let port = launch.debug_port.unwrap_or_else(LaunchConfig::find_free_port);
         let (profile_dir, profile_ephemeral) = launch.profile.resolve()?;
+        let profile_guard = match &launch.profile {
+            BrowserProfile::Persistent(_) => Some(
+                ProfileOwnershipGuard::acquire(&profile_dir)
+                    .map_err(|error| BrowserError::Launch(error.to_string()))?,
+            ),
+            BrowserProfile::Ephemeral => None,
+        };
         let locale = Some(stealth.locale.locale.as_str());
         let args = launch.build_args(&profile_dir, port, locale);
 
@@ -86,30 +113,41 @@ impl CdpBrowserBackend {
             .spawn()
             .map_err(|e| BrowserError::Launch(e.to_string()))?;
 
-        // Read stderr looking for "DevTools listening on ws://"
+        // Keep stderr as a secondary discovery channel. The primary channel is
+        // the loopback /json/version endpoint because current Chrome versions
+        // do not guarantee that the DevTools URL remains visible on stderr.
         let stderr = child
             .stderr
             .take()
             .ok_or_else(|| BrowserError::Launch("could not capture stderr".into()))?;
 
-        let ws_url = Self::find_ws_url(stderr).await?;
-        debug!("CDP WebSocket URL: {ws_url}");
+        let discovery = Self::discover_launched_browser(stderr, &mut child, port).await?;
+        debug!("CDP WebSocket URL: {}", discovery.ws_url);
 
-        let client = CdpClient::connect(&ws_url)
+        let client = CdpClient::connect(&discovery.ws_url)
             .await
             .map_err(|e| BrowserError::Connect(e.to_string()))?;
 
         let root = client.root_session();
+        let runtime_version = discovery
+            .browser_product
+            .as_deref()
+            .and_then(product_version)
+            .or(installed_version.as_deref());
+        let user_agent = stealth.resolve_user_agent(binary.kind, runtime_version);
+        let mut resolved_stealth = stealth.clone();
+        resolved_stealth.user_agent = user_agent.user_agent;
 
         Ok(Self {
             client,
             root,
             launch: launch.clone(),
-            stealth: stealth.clone(),
+            stealth: resolved_stealth,
             page_count: AtomicU32::new(0),
             _child: Some(child),
             profile_dir,
             profile_ephemeral,
+            _profile_guard: profile_guard,
         })
     }
 
@@ -136,6 +174,7 @@ impl CdpBrowserBackend {
             _child: None, // not our child — do not kill on drop
             profile_dir: std::path::PathBuf::new(),
             profile_ephemeral: false,
+            _profile_guard: None,
         })
     }
 
@@ -189,47 +228,108 @@ impl CdpBrowserBackend {
         })
     }
 
-    /// Scan stderr lines until we see the DevTools WS URL.
-    async fn find_ws_url(
-        stderr: impl tokio::io::AsyncRead + Unpin,
-    ) -> Result<String, BrowserError> {
+    /// Poll the owned browser's loopback DevTools endpoint while retaining
+    /// stderr as a secondary discovery channel.
+    async fn discover_launched_browser(
+        stderr: tokio::process::ChildStderr,
+        child: &mut tokio::process::Child,
+        port: u16,
+    ) -> Result<CdpDiscovery, BrowserError> {
+        let mut stderr_task = tokio::spawn(Self::find_ws_url_on_stderr(stderr));
+        let mut stderr_open = true;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut last_endpoint_error: String;
+
+        loop {
+            if let Some(status) = child.try_wait().map_err(BrowserError::Io)? {
+                stderr_task.abort();
+                return Err(BrowserError::Launch(format!(
+                    "browser exited before the DevTools endpoint became ready: {status}"
+                )));
+            }
+
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                Self::query_devtools_endpoint(port),
+            )
+            .await
+            {
+                Ok(Ok(discovery)) => {
+                    stderr_task.abort();
+                    return Ok(discovery);
+                }
+                Ok(Err(error)) => last_endpoint_error = error.to_string(),
+                Err(_) => last_endpoint_error = "endpoint request timed out".into(),
+            }
+
+            if stderr_open {
+                tokio::select! {
+                    result = &mut stderr_task => {
+                        stderr_open = false;
+                        if let Ok(Ok(Some(ws_url))) = result {
+                            return Ok(CdpDiscovery {
+                                ws_url,
+                                browser_product: None,
+                            });
+                        }
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                }
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                stderr_task.abort();
+                return Err(BrowserError::Connect(format!(
+                    "timed out waiting for DevTools endpoint on 127.0.0.1:{port}: {last_endpoint_error}"
+                )));
+            }
+        }
+    }
+
+    async fn query_devtools_endpoint(port: u16) -> Result<CdpDiscovery, BrowserError> {
+        let url = format!("http://127.0.0.1:{port}/json/version");
+        let response = reqwest::get(&url)
+            .await
+            .map_err(|error| BrowserError::Connect(format!("GET {url}: {error}")))?
+            .error_for_status()
+            .map_err(|error| BrowserError::Connect(format!("GET {url}: {error}")))?;
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|error| BrowserError::Connect(format!("parse {url}: {error}")))?;
+        let ws_url = body
+            .get("webSocketDebuggerUrl")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                BrowserError::Connect("no webSocketDebuggerUrl in /json/version".into())
+            })?
+            .to_owned();
+        let browser_product = body
+            .get("Browser")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        Ok(CdpDiscovery {
+            ws_url,
+            browser_product,
+        })
+    }
+
+    /// Scan stderr until it closes or reports the DevTools WebSocket URL.
+    async fn find_ws_url_on_stderr(
+        stderr: tokio::process::ChildStderr,
+    ) -> Result<Option<String>, std::io::Error> {
         let reader = BufReader::new(stderr);
         let mut lines = reader.lines();
 
-        let timeout = std::time::Duration::from_secs(30);
-        let deadline = tokio::time::Instant::now() + timeout;
-
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(BrowserError::Connect(
-                    "timed out waiting for DevTools WebSocket URL on stderr".into(),
-                ));
-            }
-
-            let line_future = lines.next_line();
-            match tokio::time::timeout(remaining, line_future).await {
-                Ok(Ok(Some(line))) => {
-                    debug!("browser stderr: {line}");
-                    if let Some(pos) = line.find("ws://") {
-                        return Ok(line[pos..].trim().to_owned());
-                    }
-                }
-                Ok(Ok(None)) => {
-                    return Err(BrowserError::Connect(
-                        "browser stderr closed before DevTools URL appeared".into(),
-                    ));
-                }
-                Ok(Err(e)) => {
-                    return Err(BrowserError::Io(e));
-                }
-                Err(_) => {
-                    return Err(BrowserError::Connect(
-                        "timed out waiting for DevTools WebSocket URL".into(),
-                    ));
-                }
+        while let Some(line) = lines.next_line().await? {
+            debug!("browser stderr: {line}");
+            if let Some(pos) = line.find("ws://") {
+                return Ok(Some(line[pos..].trim().to_owned()));
             }
         }
+        Ok(None)
     }
 
     /// Create and attach to a new page target, inject stealth scripts, optionally navigate.
@@ -265,27 +365,27 @@ impl CdpBrowserBackend {
         // they survive property-descriptor inspection and also affect HTTP headers.
 
         // User-Agent + Client Hints: sets Sec-CH-UA* HTTP headers automatically.
-        session
-            .set_user_agent_with_metadata(
-                &self.stealth.user_agent,
-                "Windows",
-                "15.0.0",
-                "x86",
-                "",   // model — empty for desktops
-                false, // mobile
-                &[
-                    ("Google Chrome", "131"),
-                    ("Chromium", "131"),
-                    ("Not_A Brand", "24"),
-                ],
-                &[
-                    ("Google Chrome", "131.0.6778.140"),
-                    ("Chromium", "131.0.6778.140"),
-                    ("Not_A Brand", "24.0.0.0"),
-                ],
-            )
-            .await
-            .map_err(|e| BrowserError::StealthInject(e.to_string()))?;
+        if let Some(profile) = self.stealth.resolved_profile_from_user_agent() {
+            match (profile.brands(), profile.full_version_list()) {
+                (Some(brands), Some(full_version_list)) => session
+                    .set_user_agent_with_metadata(
+                        &profile.user_agent,
+                        "Windows",
+                        "15.0.0",
+                        "x86",
+                        "",   // model - empty for desktops
+                        false, // mobile
+                        &brands,
+                        &full_version_list,
+                    )
+                    .await
+                    .map_err(|e| BrowserError::StealthInject(e.to_string()))?,
+                _ => session
+                    .set_user_agent(&profile.user_agent)
+                    .await
+                    .map_err(|e| BrowserError::StealthInject(e.to_string()))?,
+            }
+        }
 
         // Timezone: fixes both Intl.DateTimeFormat AND new Date().toString().
         // The JS override_timezone script only fixes Intl, missing Date.toString().
