@@ -1,0 +1,22 @@
+[package]
+name = "dig2browser-station"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Central resource owner and consumer facade for dig2browser runtimes"
+
+[lib]
+name = "dig2browser_station"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+dig2browser = { path = "../.." }
+dig2browser-protocol = { path = "../dig2browser-protocol" }
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+dig2browser-client = { path = "../dig2browser-client" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+uuid = { version = "1", features = ["v4"] }

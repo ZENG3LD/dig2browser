@@ -1,0 +1,524 @@
+//! Lightweight D2BQ/D2BR v1 wire contract shared by station servers and clients.
+
+use std::io;
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+pub const PROTOCOL_VERSION: u16 = 1;
+pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
+pub const MAX_FINAL_URL_BYTES: usize = 16 * 1024;
+pub const MAX_TITLE_BYTES: usize = 16 * 1024;
+pub const MAX_ERROR_BYTES: usize = 1024;
+pub const MAX_HTML_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_PNG_BYTES: usize = 32 * 1024 * 1024;
+
+const REQUEST_MAGIC: [u8; 4] = *b"D2BQ";
+const RESPONSE_MAGIC: [u8; 4] = *b"D2BR";
+const REQUEST_HEADER_BYTES: usize = 22;
+const RESPONSE_HEADER_BYTES: usize = 56;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RequestKind {
+    Capture = 1,
+    Health = 2,
+    Shutdown = 3,
+}
+
+impl RequestKind {
+    fn from_wire(value: u8) -> Result<Self, ProtocolError> {
+        match value {
+            1 => Ok(Self::Capture),
+            2 => Ok(Self::Health),
+            3 => Ok(Self::Shutdown),
+            _ => Err(ProtocolError::InvalidRequest),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerRequest {
+    pub kind: RequestKind,
+    pub request_id: u64,
+    pub profile_id: String,
+    pub url: String,
+}
+
+impl WorkerRequest {
+    pub fn capture(request_id: u64, profile_id: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            kind: RequestKind::Capture,
+            request_id,
+            profile_id: profile_id.into(),
+            url: url.into(),
+        }
+    }
+
+    pub fn health(request_id: u64) -> Self {
+        Self::control(RequestKind::Health, request_id)
+    }
+
+    pub fn shutdown(request_id: u64) -> Self {
+        Self::control(RequestKind::Shutdown, request_id)
+    }
+
+    fn control(kind: RequestKind, request_id: u64) -> Self {
+        Self {
+            kind,
+            request_id,
+            profile_id: String::new(),
+            url: String::new(),
+        }
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
+        self.validate()?;
+        let profile_len = u16::try_from(self.profile_id.len())
+            .map_err(|_| ProtocolError::InvalidRequest)?;
+        let url_len =
+            u32::try_from(self.url.len()).map_err(|_| ProtocolError::InvalidRequest)?;
+        let total = REQUEST_HEADER_BYTES
+            .checked_add(self.profile_id.len())
+            .and_then(|value| value.checked_add(self.url.len()))
+            .ok_or(ProtocolError::InvalidRequest)?;
+        if total > MAX_REQUEST_BYTES {
+            return Err(ProtocolError::InvalidRequest);
+        }
+        let mut bytes = Vec::with_capacity(total);
+        bytes.extend_from_slice(&REQUEST_MAGIC);
+        bytes.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+        bytes.push(self.kind as u8);
+        bytes.push(0);
+        bytes.extend_from_slice(&self.request_id.to_le_bytes());
+        bytes.extend_from_slice(&profile_len.to_le_bytes());
+        bytes.extend_from_slice(&url_len.to_le_bytes());
+        bytes.extend_from_slice(self.profile_id.as_bytes());
+        bytes.extend_from_slice(self.url.as_bytes());
+        Ok(bytes)
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        match self.kind {
+            RequestKind::Capture => {
+                validate_profile_id(&self.profile_id)?;
+                validate_http_url(&self.url)
+            }
+            RequestKind::Health | RequestKind::Shutdown => {
+                if self.profile_id.is_empty() && self.url.is_empty() {
+                    Ok(())
+                } else {
+                    Err(ProtocolError::InvalidRequest)
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ResponseStatus {
+    Ok = 0,
+    Invalid = 1,
+    Unavailable = 2,
+    CaptureFailed = 3,
+    TooLarge = 4,
+    Protocol = 5,
+}
+
+impl ResponseStatus {
+    fn from_wire(value: u8) -> Result<Self, FrameError> {
+        match value {
+            0 => Ok(Self::Ok),
+            1 => Ok(Self::Invalid),
+            2 => Ok(Self::Unavailable),
+            3 => Ok(Self::CaptureFailed),
+            4 => Ok(Self::TooLarge),
+            5 => Ok(Self::Protocol),
+            _ => Err(FrameError::InvalidResponse),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerResponse {
+    pub status: ResponseStatus,
+    pub kind: RequestKind,
+    pub request_id: u64,
+    pub http_status: Option<u16>,
+    pub duration_ms: u64,
+    pub final_url: String,
+    pub title: String,
+    pub error: String,
+    pub html: Vec<u8>,
+    pub png: Vec<u8>,
+}
+
+impl WorkerResponse {
+    pub fn empty(request: &WorkerRequest, status: ResponseStatus) -> Self {
+        Self {
+            status,
+            kind: request.kind,
+            request_id: request.request_id,
+            http_status: None,
+            duration_ms: 0,
+            final_url: String::new(),
+            title: String::new(),
+            error: String::new(),
+            html: Vec::new(),
+            png: Vec::new(),
+        }
+    }
+
+    pub fn failure(request: &WorkerRequest, status: ResponseStatus, error: &str) -> Self {
+        let mut response = Self::empty(request, status);
+        response.error = sanitize_error(error);
+        response
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
+        self.validate()?;
+        let capacity = RESPONSE_HEADER_BYTES
+            .checked_add(self.final_url.len())
+            .and_then(|size| size.checked_add(self.title.len()))
+            .and_then(|size| size.checked_add(self.error.len()))
+            .and_then(|size| size.checked_add(self.html.len()))
+            .and_then(|size| size.checked_add(self.png.len()))
+            .ok_or(ProtocolError::ResponseTooLarge)?;
+        let mut bytes = Vec::with_capacity(capacity);
+        bytes.extend_from_slice(&response_header(self)?);
+        bytes.extend_from_slice(self.final_url.as_bytes());
+        bytes.extend_from_slice(self.title.as_bytes());
+        bytes.extend_from_slice(self.error.as_bytes());
+        bytes.extend_from_slice(&self.html);
+        bytes.extend_from_slice(&self.png);
+        Ok(bytes)
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.final_url.len() > MAX_FINAL_URL_BYTES
+            || self.title.len() > MAX_TITLE_BYTES
+            || self.error.len() > MAX_ERROR_BYTES
+            || self.html.len() > MAX_HTML_BYTES
+            || self.png.len() > MAX_PNG_BYTES
+        {
+            return Err(ProtocolError::ResponseTooLarge);
+        }
+        Ok(())
+    }
+}
+
+pub fn validate_pipe_suffix(value: &str) -> Result<(), PipeNameError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(PipeNameError);
+    }
+    Ok(())
+}
+
+pub async fn write_worker_request<W>(
+    stream: &mut W,
+    request: &WorkerRequest,
+) -> Result<(), FrameError>
+where
+    W: AsyncWrite + Unpin,
+{
+    stream.write_all(&request.encode()?).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+pub async fn read_worker_request<R>(
+    stream: &mut R,
+) -> Result<Option<WorkerRequest>, FrameError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut header = [0_u8; REQUEST_HEADER_BYTES];
+    let first = stream.read(&mut header[..4]).await?;
+    if first == 0 {
+        return Ok(None);
+    }
+    stream.read_exact(&mut header[first..]).await?;
+    if header[..4] != REQUEST_MAGIC
+        || u16::from_le_bytes(header[4..6].try_into().unwrap()) != PROTOCOL_VERSION
+        || header[7] != 0
+    {
+        return Err(FrameError::Protocol(ProtocolError::InvalidRequest));
+    }
+    let kind = RequestKind::from_wire(header[6])?;
+    let request_id = u64::from_le_bytes(header[8..16].try_into().unwrap());
+    let profile_len = u16::from_le_bytes(header[16..18].try_into().unwrap()) as usize;
+    let url_len = u32::from_le_bytes(header[18..22].try_into().unwrap()) as usize;
+    let total = REQUEST_HEADER_BYTES
+        .checked_add(profile_len)
+        .and_then(|value| value.checked_add(url_len))
+        .ok_or(ProtocolError::InvalidRequest)?;
+    if total > MAX_REQUEST_BYTES {
+        return Err(FrameError::Protocol(ProtocolError::InvalidRequest));
+    }
+    let mut payload = vec![0_u8; profile_len + url_len];
+    stream.read_exact(&mut payload).await?;
+    let profile_id = std::str::from_utf8(&payload[..profile_len])
+        .map_err(|_| FrameError::Protocol(ProtocolError::InvalidRequest))?
+        .to_owned();
+    let url = std::str::from_utf8(&payload[profile_len..])
+        .map_err(|_| FrameError::Protocol(ProtocolError::InvalidRequest))?
+        .to_owned();
+    Ok(Some(WorkerRequest {
+        kind,
+        request_id,
+        profile_id,
+        url,
+    }))
+}
+
+pub async fn write_worker_response<W>(
+    stream: &mut W,
+    response: &WorkerResponse,
+) -> Result<(), FrameError>
+where
+    W: AsyncWrite + Unpin,
+{
+    stream.write_all(&response.encode()?).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+pub async fn read_worker_response<R>(stream: &mut R) -> Result<WorkerResponse, FrameError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut header = [0_u8; RESPONSE_HEADER_BYTES];
+    stream.read_exact(&mut header).await?;
+    if header[..4] != RESPONSE_MAGIC
+        || u16::from_le_bytes(header[4..6].try_into().unwrap()) != PROTOCOL_VERSION
+        || u16::from_le_bytes(header[18..20].try_into().unwrap()) != 0
+    {
+        return Err(FrameError::InvalidResponse);
+    }
+    let status = ResponseStatus::from_wire(header[6])?;
+    let kind = RequestKind::from_wire(header[7]).map_err(|_| FrameError::InvalidResponse)?;
+    let request_id = u64::from_le_bytes(header[8..16].try_into().unwrap());
+    let raw_http_status = u16::from_le_bytes(header[16..18].try_into().unwrap());
+    let http_status = match raw_http_status {
+        0 => None,
+        100..=599 => Some(raw_http_status),
+        _ => return Err(FrameError::InvalidResponse),
+    };
+    let duration_ms = u64::from_le_bytes(header[20..28].try_into().unwrap());
+    let final_url_len = u32::from_le_bytes(header[28..32].try_into().unwrap()) as usize;
+    let title_len = u32::from_le_bytes(header[32..36].try_into().unwrap()) as usize;
+    let error_len = u32::from_le_bytes(header[36..40].try_into().unwrap()) as usize;
+    let html_len = usize::try_from(u64::from_le_bytes(header[40..48].try_into().unwrap()))
+        .map_err(|_| FrameError::InvalidResponse)?;
+    let png_len = usize::try_from(u64::from_le_bytes(header[48..56].try_into().unwrap()))
+        .map_err(|_| FrameError::InvalidResponse)?;
+    if final_url_len > MAX_FINAL_URL_BYTES
+        || title_len > MAX_TITLE_BYTES
+        || error_len > MAX_ERROR_BYTES
+        || html_len > MAX_HTML_BYTES
+        || png_len > MAX_PNG_BYTES
+    {
+        return Err(FrameError::Protocol(ProtocolError::ResponseTooLarge));
+    }
+    let response = WorkerResponse {
+        status,
+        kind,
+        request_id,
+        http_status,
+        duration_ms,
+        final_url: read_utf8(stream, final_url_len).await?,
+        title: read_utf8(stream, title_len).await?,
+        error: read_utf8(stream, error_len).await?,
+        html: read_bytes(stream, html_len).await?,
+        png: read_bytes(stream, png_len).await?,
+    };
+    response.validate()?;
+    Ok(response)
+}
+
+async fn read_utf8<R>(stream: &mut R, len: usize) -> Result<String, FrameError>
+where
+    R: AsyncRead + Unpin,
+{
+    String::from_utf8(read_bytes(stream, len).await?)
+        .map_err(|_| FrameError::InvalidResponse)
+}
+
+async fn read_bytes<R>(stream: &mut R, len: usize) -> Result<Vec<u8>, FrameError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = vec![0_u8; len];
+    stream.read_exact(&mut bytes).await?;
+    Ok(bytes)
+}
+
+fn response_header(
+    response: &WorkerResponse,
+) -> Result<[u8; RESPONSE_HEADER_BYTES], ProtocolError> {
+    response.validate()?;
+    let mut header = [0_u8; RESPONSE_HEADER_BYTES];
+    header[0..4].copy_from_slice(&RESPONSE_MAGIC);
+    header[4..6].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+    header[6] = response.status as u8;
+    header[7] = response.kind as u8;
+    header[8..16].copy_from_slice(&response.request_id.to_le_bytes());
+    header[16..18].copy_from_slice(&response.http_status.unwrap_or(0).to_le_bytes());
+    header[20..28].copy_from_slice(&response.duration_ms.to_le_bytes());
+    header[28..32].copy_from_slice(&(response.final_url.len() as u32).to_le_bytes());
+    header[32..36].copy_from_slice(&(response.title.len() as u32).to_le_bytes());
+    header[36..40].copy_from_slice(&(response.error.len() as u32).to_le_bytes());
+    header[40..48].copy_from_slice(&(response.html.len() as u64).to_le_bytes());
+    header[48..56].copy_from_slice(&(response.png.len() as u64).to_le_bytes());
+    Ok(header)
+}
+
+fn validate_profile_id(value: &str) -> Result<(), ProtocolError> {
+    if value.is_empty()
+        || value.len() > 128
+        || value == "."
+        || value == ".."
+        || value.ends_with('.')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn validate_http_url(value: &str) -> Result<(), ProtocolError> {
+    let remainder = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+        .ok_or(ProtocolError::InvalidRequest)?;
+    let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty()
+        || authority.chars().any(char::is_whitespace)
+        || value.chars().any(char::is_control)
+    {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn sanitize_error(value: &str) -> String {
+    let mut sanitized = String::with_capacity(value.len().min(MAX_ERROR_BYTES));
+    for character in value.chars() {
+        if character.is_control() {
+            continue;
+        }
+        if sanitized.len() + character.len_utf8() > MAX_ERROR_BYTES {
+            break;
+        }
+        sanitized.push(character);
+    }
+    sanitized
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PipeNameError;
+
+impl std::fmt::Display for PipeNameError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "invalid pipe name")
+    }
+}
+
+impl std::error::Error for PipeNameError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolError {
+    InvalidRequest,
+    ResponseTooLarge,
+}
+
+impl std::fmt::Display for ProtocolError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidRequest => write!(formatter, "invalid request"),
+            Self::ResponseTooLarge => write!(formatter, "response exceeds protocol limits"),
+        }
+    }
+}
+
+impl std::error::Error for ProtocolError {}
+
+#[derive(Debug)]
+pub enum FrameError {
+    Io(io::Error),
+    InvalidResponse,
+    Protocol(ProtocolError),
+}
+
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "IPC I/O failure: {error}"),
+            Self::InvalidResponse => write!(formatter, "IPC response is invalid"),
+            Self::Protocol(error) => write!(formatter, "IPC protocol failure: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for FrameError {}
+
+impl From<io::Error> for FrameError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<ProtocolError> for FrameError {
+    fn from(error: ProtocolError) -> Self {
+        Self::Protocol(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn request_and_response_round_trip_fixed_v1_layout() {
+        let request = WorkerRequest::capture(42, "review.example", "https://example.test/path");
+        let request_bytes = request.encode().expect("request");
+        assert_eq!(&request_bytes[..4], b"D2BQ");
+        let mut request_reader = &request_bytes[..];
+        assert_eq!(
+            read_worker_request(&mut request_reader)
+                .await
+                .expect("decode")
+                .expect("request"),
+            request
+        );
+
+        let response = WorkerResponse {
+            status: ResponseStatus::Ok,
+            kind: RequestKind::Capture,
+            request_id: 42,
+            http_status: Some(200),
+            duration_ms: 7,
+            final_url: "https://example.test/final".to_owned(),
+            title: "Example".to_owned(),
+            error: String::new(),
+            html: b"<html>ok</html>".to_vec(),
+            png: vec![137, 80, 78, 71],
+        };
+        let response_bytes = response.encode().expect("response");
+        assert_eq!(&response_bytes[..4], b"D2BR");
+        let mut response_reader = &response_bytes[..];
+        assert_eq!(
+            read_worker_response(&mut response_reader)
+                .await
+                .expect("decode"),
+            response
+        );
+    }
+}

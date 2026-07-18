@@ -19,6 +19,7 @@ use crate::detect::args::BrowserProfile;
 use crate::detect::version::browser_version;
 use crate::detect::{LaunchConfig, detect_browser};
 use crate::identity::ProfileOwnershipGuard;
+use crate::process_tree::OwnedProcessTree;
 use crate::stealth::{StealthConfig, get_scripts};
 
 use crate::browser::devtools::DevToolsEvent;
@@ -37,6 +38,8 @@ pub(crate) struct CdpBrowserBackend {
     /// Child process — `Some` when we launched the browser ourselves, `None`
     /// in attach mode (we must not kill a browser the user opened manually).
     _child: Option<tokio::process::Child>,
+    /// Kernel-owned containment for the complete launched Chromium tree.
+    _process_tree: Option<OwnedProcessTree>,
     /// Profile dir path, deleted on drop if ephemeral.
     profile_dir: std::path::PathBuf,
     profile_ephemeral: bool,
@@ -101,6 +104,8 @@ impl CdpBrowserBackend {
             port
         );
 
+        let process_tree = OwnedProcessTree::new()
+            .map_err(|error| BrowserError::Launch(error.to_string()))?;
         let mut child = tokio::process::Command::new(&binary.path)
             .args(&args)
             .stderr(std::process::Stdio::piped())
@@ -112,6 +117,12 @@ impl CdpBrowserBackend {
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| BrowserError::Launch(e.to_string()))?;
+        if let Err(error) = process_tree.assign(&child) {
+            let _ = child.start_kill();
+            return Err(BrowserError::Launch(format!(
+                "could not contain browser process tree: {error}"
+            )));
+        }
 
         // Keep stderr as a secondary discovery channel. The primary channel is
         // the loopback /json/version endpoint because current Chrome versions
@@ -145,6 +156,7 @@ impl CdpBrowserBackend {
             stealth: resolved_stealth,
             page_count: AtomicU32::new(0),
             _child: Some(child),
+            _process_tree: Some(process_tree),
             profile_dir,
             profile_ephemeral,
             _profile_guard: profile_guard,
@@ -172,6 +184,7 @@ impl CdpBrowserBackend {
             stealth,
             page_count: AtomicU32::new(0),
             _child: None, // not our child — do not kill on drop
+            _process_tree: None,
             profile_dir: std::path::PathBuf::new(),
             profile_ephemeral: false,
             _profile_guard: None,

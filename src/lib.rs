@@ -10,6 +10,7 @@ pub mod wasmtest;
 pub mod identity;
 pub mod agentic;
 pub mod worker_ipc;
+mod process_tree;
 
 // Re-export main types at crate root
 pub use browser::*;

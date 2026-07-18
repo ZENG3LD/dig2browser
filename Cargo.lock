@@ -522,6 +522,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "dig2browser-client"
+version = "0.1.0"
+dependencies = [
+ "dig2browser-protocol",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "dig2browser-protocol"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
+name = "dig2browser-station"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "dig2browser",
+ "dig2browser-client",
+ "dig2browser-protocol",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

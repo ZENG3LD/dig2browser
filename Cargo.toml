@@ -9,6 +9,15 @@ keywords = ["browser", "automation", "cdp", "web-bot-auth", "stealth"]
 categories = ["web-programming", "development-tools::testing"]
 readme = "README.md"
 
+[workspace]
+members = [
+    ".",
+    "crates/dig2browser-client",
+    "crates/dig2browser-protocol",
+    "crates/dig2browser-station",
+]
+resolver = "2"
+
 [[bin]]
 name = "keygen"
 path = "src/bin/keygen.rs"
@@ -63,5 +72,8 @@ zip = "2"
 windows = { version = "0.58", features = [
     "Win32_Security_Cryptography",
     "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
     "Win32_System_Memory",
+    "Win32_System_Threading",
 ] }

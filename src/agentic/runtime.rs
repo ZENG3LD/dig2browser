@@ -51,6 +51,7 @@ pub struct RealBrowserRuntime {
     page: Option<StealthPage>,
     devtools: Option<PageDevTools>,
     document_http_status: Option<u16>,
+    navigation_count: u32,
 }
 
 impl RealBrowserRuntime {
@@ -89,6 +90,7 @@ impl RealBrowserRuntime {
             page: None,
             devtools: None,
             document_http_status: None,
+            navigation_count: 0,
         })
     }
 
@@ -100,17 +102,22 @@ impl RealBrowserRuntime {
 
         let browser = StealthBrowser::launch_with(self.launch.clone(), self.stealth.clone())
             .await
-            .map_err(|_| RuntimeError::new(RuntimeFailureKind::Launch))?;
+            .map_err(|error| {
+                tracing::debug!(%error, "browser runtime launch failed");
+                RuntimeError::new(RuntimeFailureKind::Launch)
+            })?;
         let page = match browser.new_blank_page().await {
             Ok(page) => page,
-            Err(_) => {
+            Err(error) => {
+                tracing::debug!(%error, "browser runtime blank page failed");
                 let _ = browser.close().await;
                 return Err(RuntimeError::new(RuntimeFailureKind::Launch));
             }
         };
         let devtools = match page.devtools().await {
             Ok(devtools) => devtools,
-            Err(_) => {
+            Err(error) => {
+                tracing::debug!(%error, "browser runtime devtools setup failed");
                 let _ = browser.close().await;
                 return Err(RuntimeError::new(RuntimeFailureKind::Protocol));
             }
@@ -140,6 +147,7 @@ impl RealBrowserRuntime {
         self.page = Some(page);
         self.devtools = Some(devtools);
         self.document_http_status = None;
+        self.navigation_count = 0;
         self.browser = Some(browser);
         Ok(())
     }
@@ -147,6 +155,7 @@ impl RealBrowserRuntime {
     async fn restart_inner(&mut self) -> RuntimeResult<()> {
         self.devtools.take();
         self.document_http_status = None;
+        self.navigation_count = 0;
         self.page.take();
         if let Some(browser) = self.browser.take() {
             browser
@@ -249,9 +258,8 @@ impl BrowserRuntime for RealBrowserRuntime {
     }
 
     fn needs_restart(&self) -> bool {
-        self.browser
-            .as_ref()
-            .is_some_and(StealthBrowser::needs_restart)
+        let limit = self.launch.restart_after_pages;
+        limit > 0 && self.navigation_count >= limit
     }
 
     fn navigate<'a>(&'a mut self, url: &'a str) -> BoxFuture<'a, RuntimeResult<DocumentState>> {
@@ -262,6 +270,7 @@ impl BrowserRuntime for RealBrowserRuntime {
                 .goto(url)
                 .await
                 .map_err(|_| RuntimeError::new(RuntimeFailureKind::Navigation))?;
+            self.navigation_count = self.navigation_count.saturating_add(1);
             let mut state = self.document_state().await?;
             self.update_document_http_status(&state.url);
             state.http_status = self.document_http_status;

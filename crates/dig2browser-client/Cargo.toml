@@ -1,0 +1,15 @@
+[package]
+name = "dig2browser-client"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Versioned local IPC client for dig2browser-station"
+
+[lib]
+name = "dig2browser_client"
+path = "src/lib.rs"
+
+[dependencies]
+dig2browser-protocol = { path = "../dig2browser-protocol" }
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }

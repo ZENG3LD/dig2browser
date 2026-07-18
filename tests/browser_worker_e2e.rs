@@ -124,11 +124,24 @@ fn serve_connection(mut stream: TcpStream) -> std::io::Result<()> {
 }
 
 fn temporary_profiles_root() -> PathBuf {
-    std::env::temp_dir().join(format!(
+    e2e_temp_base().join(format!(
         "dig2browser-worker-e2e-{}-{}",
         std::process::id(),
         uuid::Uuid::new_v4()
     ))
+}
+
+fn e2e_temp_base() -> PathBuf {
+    #[cfg(windows)]
+    {
+        std::env::var_os("DIG2BROWSER_E2E_TMP")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\tmp"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::temp_dir()
+    }
 }
 
 fn mobile_identity(root: &PathBuf) -> IdentityProfile {

@@ -48,19 +48,42 @@ impl CdpSession {
         // Subscribe before sending the command so we don't miss a fast load.
         let mut events = self.client().subscribe();
 
-        self.call("Page.navigate", Some(json!({ "url": url }))).await?;
+        let navigation = self
+            .call("Page.navigate", Some(json!({ "url": url })))
+            .await?;
+        if let Some(error) = navigation["errorText"]
+            .as_str()
+            .filter(|error| !error.is_empty())
+        {
+            return Err(CdpError::Protocol {
+                code: -1,
+                message: format!("navigation failed: {error}"),
+            });
+        }
+        let frame_id = navigation["frameId"]
+            .as_str()
+            .ok_or_else(|| CdpError::Protocol {
+                code: -1,
+                message: "Page.navigate response has no frameId".to_owned(),
+            })?
+            .to_owned();
+        if navigation["loaderId"].as_str().is_none() {
+            return Ok(());
+        }
 
-        // Wait for Page.loadEventFired (or Page.frameStoppedLoading as fallback).
+        // loadEventFired has no frame identity and a late event from about:blank
+        // can race a fast subsequent navigation. frameStoppedLoading is scoped
+        // to the frame returned by this Page.navigate call.
         let deadline = Duration::from_secs(30);
         let result = timeout(deadline, async move {
             loop {
                 match events.recv().await {
-                    Ok(CdpEvent { method, .. })
-                        if method == "Page.loadEventFired"
-                            || method == "Page.frameStoppedLoading" =>
-                    {
-                        return Ok(());
-                    }
+                    Ok(CdpEvent { method, params, .. })
+                        if method == "Page.frameStoppedLoading"
+                            && params
+                                .as_ref()
+                                .and_then(|params| params["frameId"].as_str())
+                                == Some(frame_id.as_str()) => return Ok(()),
                     Ok(_) => continue,
                     Err(_) => return Err(CdpError::ConnectionClosed),
                 }

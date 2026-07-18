@@ -46,6 +46,7 @@ impl Default for BrowserWorkerConfig {
 pub struct BrowserWorker {
     commands: mpsc::Sender<Envelope>,
     snapshot: watch::Receiver<BrowserSnapshot>,
+    stopped: watch::Receiver<bool>,
 }
 
 impl BrowserWorker {
@@ -104,6 +105,7 @@ impl BrowserWorker {
         let initial = BrowserSnapshot::starting(identity.id().to_owned());
         let (commands, receiver) = mpsc::channel(queue_capacity);
         let (snapshot_tx, snapshot) = watch::channel(initial.clone());
+        let (stopped_tx, stopped) = watch::channel(false);
         tokio::spawn(run_actor(
             Box::new(runtime),
             capabilities,
@@ -111,8 +113,13 @@ impl BrowserWorker {
             snapshot_tx,
             initial,
             command_timeout,
+            stopped_tx,
         ));
-        Ok(Self { commands, snapshot })
+        Ok(Self {
+            commands,
+            snapshot,
+            stopped,
+        })
     }
 
     pub async fn execute(&self, command: AgentCommand) -> Result<AgentReply, WorkerError> {
@@ -151,7 +158,28 @@ impl BrowserWorker {
     }
 
     pub async fn shutdown(&self) -> Result<(), WorkerError> {
-        self.execute(AgentCommand::Shutdown).await.map(|_| ())
+        if *self.stopped.borrow() {
+            return Ok(());
+        }
+        let command_result = self.execute(AgentCommand::Shutdown).await.map(|_| ());
+        let stopped_result = self.wait_stopped().await;
+        match (command_result, stopped_result) {
+            (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    /// Wait until the actor has closed and dropped its runtime, including all
+    /// protocol transports and owned process-containment handles.
+    pub async fn wait_stopped(&self) -> Result<(), WorkerError> {
+        let mut stopped = self.stopped.clone();
+        while !*stopped.borrow() {
+            stopped
+                .changed()
+                .await
+                .map_err(|_| WorkerError::WorkerStopped)?;
+        }
+        Ok(())
     }
 }
 
@@ -167,6 +195,7 @@ async fn run_actor(
     snapshots: watch::Sender<BrowserSnapshot>,
     mut snapshot: BrowserSnapshot,
     command_timeout: Duration,
+    stopped: watch::Sender<bool>,
 ) {
     match tokio::time::timeout(command_timeout, runtime.start()).await {
         Ok(Ok(())) => {
@@ -217,6 +246,8 @@ async fn run_actor(
         snapshot.current_origin = None;
         snapshots.send_replace(snapshot);
     }
+    drop(runtime);
+    stopped.send_replace(true);
 }
 
 async fn handle_command(
