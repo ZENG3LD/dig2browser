@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::detect::LaunchConfig;
@@ -6,7 +8,7 @@ use crate::stealth::StealthConfig;
 
 use super::contract::{
     validate_selector, AgentCommand, AgentReply, BrowserSnapshot, Capability, CapabilitySet,
-    ContractError, DocumentState, ElementRef, WorkerLifecycle,
+    ContractError, DocumentState, ElementRef, RuntimeFailureKind, WorkerLifecycle,
 };
 use super::mobile::MobileLayout;
 use super::runtime::{BrowserRuntime, RealBrowserRuntime, RuntimeError};
@@ -14,10 +16,14 @@ use super::runtime::{BrowserRuntime, RealBrowserRuntime, RuntimeError};
 const MAX_QUEUE_CAPACITY: usize = 256;
 const MAX_KEY_BYTES: usize = 64;
 const MAX_TEXT_BYTES: usize = 64 * 1024;
+const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
+const MIN_COMMAND_TIMEOUT: Duration = Duration::from_millis(100);
+const MAX_COMMAND_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone)]
 pub struct BrowserWorkerConfig {
     pub queue_capacity: usize,
+    pub command_timeout: Duration,
     pub launch: LaunchConfig,
     pub stealth: StealthConfig,
     pub mobile_layout: Option<MobileLayout>,
@@ -27,6 +33,7 @@ impl Default for BrowserWorkerConfig {
     fn default() -> Self {
         Self {
             queue_capacity: 32,
+            command_timeout: DEFAULT_COMMAND_TIMEOUT,
             launch: LaunchConfig::default(),
             stealth: StealthConfig::default(),
             mobile_layout: None,
@@ -48,13 +55,20 @@ impl BrowserWorker {
         config: BrowserWorkerConfig,
     ) -> Result<Self, WorkerError> {
         validate_queue_capacity(config.queue_capacity)?;
+        validate_command_timeout(config.command_timeout)?;
         let runtime = RealBrowserRuntime::new(
             identity.clone(),
             config.launch,
             config.stealth,
             config.mobile_layout,
         )?;
-        Self::spawn_with_runtime(identity, capabilities, config.queue_capacity, runtime)
+        Self::spawn_with_runtime_and_timeout(
+            identity,
+            capabilities,
+            config.queue_capacity,
+            config.command_timeout,
+            runtime,
+        )
     }
 
     pub fn spawn_with_runtime<R>(
@@ -66,7 +80,27 @@ impl BrowserWorker {
     where
         R: BrowserRuntime,
     {
+        Self::spawn_with_runtime_and_timeout(
+            identity,
+            capabilities,
+            queue_capacity,
+            DEFAULT_COMMAND_TIMEOUT,
+            runtime,
+        )
+    }
+
+    pub fn spawn_with_runtime_and_timeout<R>(
+        identity: IdentityProfile,
+        capabilities: CapabilitySet,
+        queue_capacity: usize,
+        command_timeout: Duration,
+        runtime: R,
+    ) -> Result<Self, WorkerError>
+    where
+        R: BrowserRuntime,
+    {
         validate_queue_capacity(queue_capacity)?;
+        validate_command_timeout(command_timeout)?;
         let initial = BrowserSnapshot::starting(identity.id().to_owned());
         let (commands, receiver) = mpsc::channel(queue_capacity);
         let (snapshot_tx, snapshot) = watch::channel(initial.clone());
@@ -76,6 +110,7 @@ impl BrowserWorker {
             receiver,
             snapshot_tx,
             initial,
+            command_timeout,
         ));
         Ok(Self { commands, snapshot })
     }
@@ -131,26 +166,39 @@ async fn run_actor(
     mut commands: mpsc::Receiver<Envelope>,
     snapshots: watch::Sender<BrowserSnapshot>,
     mut snapshot: BrowserSnapshot,
+    command_timeout: Duration,
 ) {
-    match runtime.start().await {
-        Ok(()) => {
+    match tokio::time::timeout(command_timeout, runtime.start()).await {
+        Ok(Ok(())) => {
             snapshot.lifecycle = WorkerLifecycle::Ready;
             snapshot.last_failure = None;
         }
-        Err(error) => mark_degraded(&mut snapshot, error),
+        Ok(Err(error)) => mark_degraded(&mut snapshot, error),
+        Err(_) => mark_timeout_degraded(&mut snapshot),
     }
     snapshots.send_replace(snapshot.clone());
 
     while let Some(envelope) = commands.recv().await {
         let is_shutdown = matches!(envelope.command, AgentCommand::Shutdown);
-        let result = handle_command(
-            &mut *runtime,
-            &capabilities,
-            &mut snapshot,
-            &snapshots,
-            envelope.command,
+        let result = match tokio::time::timeout(
+            command_timeout,
+            handle_command(
+                &mut *runtime,
+                &capabilities,
+                &mut snapshot,
+                &snapshots,
+                envelope.command,
+            ),
         )
-        .await;
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                mark_timeout_degraded(&mut snapshot);
+                snapshots.send_replace(snapshot.clone());
+                Err(WorkerError::CommandTimeout(command_timeout))
+            }
+        };
         let _ = envelope.reply.send(result);
         if is_shutdown {
             break;
@@ -160,8 +208,10 @@ async fn run_actor(
     if snapshot.lifecycle != WorkerLifecycle::Stopped {
         snapshot.lifecycle = WorkerLifecycle::ShuttingDown;
         snapshots.send_replace(snapshot.clone());
-        if let Err(error) = runtime.close().await {
-            snapshot.last_failure = Some(error.kind());
+        match tokio::time::timeout(command_timeout, runtime.close()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => snapshot.last_failure = Some(error.kind()),
+            Err(_) => snapshot.last_failure = Some(RuntimeFailureKind::Timeout),
         }
         snapshot.lifecycle = WorkerLifecycle::Stopped;
         snapshot.current_origin = None;
@@ -330,11 +380,25 @@ fn mark_degraded(snapshot: &mut BrowserSnapshot, error: RuntimeError) {
     snapshot.last_failure = Some(error.kind());
 }
 
+fn mark_timeout_degraded(snapshot: &mut BrowserSnapshot) {
+    snapshot.lifecycle = WorkerLifecycle::Degraded;
+    snapshot.current_origin = None;
+    snapshot.last_failure = Some(RuntimeFailureKind::Timeout);
+}
+
 fn validate_queue_capacity(capacity: usize) -> Result<(), WorkerError> {
     if !(1..=MAX_QUEUE_CAPACITY).contains(&capacity) {
         return Err(WorkerError::InvalidQueueCapacity);
     }
     Ok(())
+}
+
+fn validate_command_timeout(timeout: Duration) -> Result<(), WorkerError> {
+    if (MIN_COMMAND_TIMEOUT..=MAX_COMMAND_TIMEOUT).contains(&timeout) {
+        Ok(())
+    } else {
+        Err(WorkerError::InvalidCommandTimeout)
+    }
 }
 
 fn validate_finite(values: &[f64]) -> Result<(), WorkerError> {
@@ -379,11 +443,13 @@ fn sanitized_origin(state: &DocumentState) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerError {
     InvalidQueueCapacity,
+    InvalidCommandTimeout,
     QueueClosed,
     WorkerStopped,
     CapabilityDenied(Capability),
     Unavailable,
     InvalidInput,
+    CommandTimeout(Duration),
     StaleElement {
         element_epoch: u64,
         current_epoch: u64,
@@ -396,6 +462,10 @@ impl std::fmt::Display for WorkerError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidQueueCapacity => write!(formatter, "queue capacity must be 1 to 256"),
+            Self::InvalidCommandTimeout => write!(
+                formatter,
+                "command timeout must be between 100 milliseconds and 15 minutes"
+            ),
             Self::QueueClosed => write!(formatter, "browser worker queue is closed"),
             Self::WorkerStopped => write!(formatter, "browser worker stopped"),
             Self::CapabilityDenied(capability) => {
@@ -406,6 +476,9 @@ impl std::fmt::Display for WorkerError {
             }
             Self::Unavailable => write!(formatter, "browser worker is degraded"),
             Self::InvalidInput => write!(formatter, "browser command input is invalid"),
+            Self::CommandTimeout(timeout) => {
+                write!(formatter, "browser command timed out after {timeout:?}")
+            }
             Self::StaleElement {
                 element_epoch,
                 current_epoch,
@@ -455,6 +528,7 @@ mod tests {
         navigations: Vec<String>,
         fail_navigation: bool,
         restart_needed: bool,
+        navigation_delay: Option<Duration>,
     }
 
     struct FakeRuntime {
@@ -489,8 +563,12 @@ mod tests {
                 return Box::pin(async { Err(RuntimeError::new(RuntimeFailureKind::Navigation)) });
             }
             state.navigations.push(url.to_owned());
+            let navigation_delay = state.navigation_delay;
             let url = url.to_owned();
             Box::pin(async move {
+                if let Some(delay) = navigation_delay {
+                    tokio::time::sleep(delay).await;
+                }
                 Ok(DocumentState {
                     url,
                     title: "page".into(),
@@ -718,6 +796,37 @@ mod tests {
         assert_eq!(state.navigations.len(), 1);
         assert_eq!(state.restarts, 1);
         drop(state);
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delayed_runtime_command_times_out_and_degrades_worker() {
+        let state = Arc::new(Mutex::new(FakeState {
+            navigation_delay: Some(Duration::from_millis(300)),
+            ..FakeState::default()
+        }));
+        let command_timeout = Duration::from_millis(100);
+        let worker = BrowserWorker::spawn_with_runtime_and_timeout(
+            identity(),
+            capabilities(),
+            4,
+            command_timeout,
+            FakeRuntime { state },
+        )
+        .unwrap();
+        worker.wait_until_settled().await.unwrap();
+
+        let error = worker
+            .execute(AgentCommand::Navigate {
+                url: "https://example.test".into(),
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, WorkerError::CommandTimeout(command_timeout));
+        let snapshot = worker.snapshot();
+        assert_eq!(snapshot.lifecycle, WorkerLifecycle::Degraded);
+        assert_eq!(snapshot.last_failure, Some(RuntimeFailureKind::Timeout));
         worker.shutdown().await.unwrap();
     }
 }

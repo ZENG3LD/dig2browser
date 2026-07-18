@@ -227,6 +227,7 @@ pub enum RuntimeFailureKind {
     Interaction,
     Capture,
     Protocol,
+    Timeout,
     Shutdown,
 }
 

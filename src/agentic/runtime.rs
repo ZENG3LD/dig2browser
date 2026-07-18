@@ -2,7 +2,7 @@ use futures::future::BoxFuture;
 
 use crate::browser::{StealthBrowser, StealthPage};
 use crate::detect::{BrowserPreference, BrowserProfile, LaunchConfig};
-use crate::identity::{BrowserBackend, DevicePersona, IdentityProfile, ProfileOwnershipGuard};
+use crate::identity::{BrowserBackend, DevicePersona, IdentityProfile};
 use crate::stealth::StealthConfig;
 
 use super::contract::{CaptureArtifact, CapturePolicy, DocumentState, RuntimeFailureKind};
@@ -47,7 +47,6 @@ pub struct RealBrowserRuntime {
     launch: LaunchConfig,
     stealth: StealthConfig,
     mobile_layout: Option<MobileLayout>,
-    profile_owner: Option<ProfileOwnershipGuard>,
     browser: Option<StealthBrowser>,
     page: Option<StealthPage>,
 }
@@ -76,7 +75,6 @@ impl RealBrowserRuntime {
             launch,
             stealth,
             mobile_layout,
-            profile_owner: None,
             browser: None,
             page: None,
         })
@@ -85,12 +83,6 @@ impl RealBrowserRuntime {
     async fn start_inner(&mut self) -> RuntimeResult<()> {
         if self.browser.is_some() || self.page.is_some() {
             return Ok(());
-        }
-        if self.profile_owner.is_none() {
-            self.profile_owner = Some(
-                ProfileOwnershipGuard::acquire(self.identity.profile_dir())
-                    .map_err(|_| RuntimeError::new(RuntimeFailureKind::Identity))?,
-            );
         }
         self.launch.profile = BrowserProfile::Persistent(self.identity.profile_dir().to_path_buf());
 
@@ -152,7 +144,6 @@ impl RealBrowserRuntime {
         } else {
             Ok(())
         };
-        self.profile_owner.take();
         close_result
     }
 
@@ -357,3 +348,16 @@ impl std::fmt::Display for RuntimeError {
 }
 
 impl std::error::Error for RuntimeError {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cdp_backend_is_the_only_persistent_profile_lock_owner() {
+        let source = include_str!("runtime.rs");
+        let guard_type = ["ProfileOwnership", "Guard"].concat();
+        let owner_field = ["profile", "_owner"].concat();
+
+        assert!(!source.contains(&guard_type));
+        assert!(!source.contains(&owner_field));
+    }
+}
