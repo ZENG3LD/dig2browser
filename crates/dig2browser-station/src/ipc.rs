@@ -176,6 +176,7 @@ pub struct ServerConfig {
     allow_identity_status: bool,
     allow_session_state_updates: bool,
     allow_headful_auth: bool,
+    allow_session_health: bool,
 }
 
 impl ServerConfig {
@@ -204,6 +205,7 @@ impl ServerConfig {
             allow_identity_status: false,
             allow_session_state_updates: false,
             allow_headful_auth: false,
+            allow_session_health: false,
         })
     }
 
@@ -234,6 +236,11 @@ impl ServerConfig {
 
     pub fn allow_headful_auth(mut self, allow: bool) -> Self {
         self.allow_headful_auth = allow;
+        self
+    }
+
+    pub fn allow_session_health(mut self, allow: bool) -> Self {
+        self.allow_session_health = allow;
         self
     }
 
@@ -357,6 +364,7 @@ async fn run_windows_server(
                     identity_status: config.allow_identity_status,
                     session_updates: config.allow_session_state_updates,
                     headful_auth: config.allow_headful_auth,
+                    session_health: config.allow_session_health,
                 };
                 connections.spawn(async move {
                     serve_connection(
@@ -505,6 +513,14 @@ async fn serve_connection(
                 ResponseStatus::Invalid,
                 "headful authentication disabled",
             ),
+            RequestKind::CheckAuthSession if task_permissions.session_health => {
+                check_auth_session(&station, &request).await
+            }
+            RequestKind::CheckAuthSession => WorkerResponse::failure(
+                &request,
+                ResponseStatus::Invalid,
+                "session health disabled",
+            ),
             RequestKind::Shutdown if allow_remote_shutdown => {
                 WorkerResponse::empty(&request, ResponseStatus::Ok)
             }
@@ -529,6 +545,58 @@ struct TaskPermissions {
     identity_status: bool,
     session_updates: bool,
     headful_auth: bool,
+    session_health: bool,
+}
+
+async fn check_auth_session(
+    station: &BrowserStation,
+    request: &WorkerRequest,
+) -> WorkerResponse {
+    let (Some(persona), Some(probe)) =
+        (request.persona.clone(), request.session_probe.clone())
+    else {
+        return WorkerResponse::failure(
+            request,
+            ResponseStatus::Invalid,
+            "session health probe missing",
+        );
+    };
+    let identity = IdentityRequest::authenticated_persona(
+        &request.profile_id,
+        persona,
+    );
+    match station.check_auth_session(identity, probe).await {
+        Ok(status) => WorkerResponse::identity_status(request, &status).unwrap_or_else(|_| {
+            WorkerResponse::failure(
+                request,
+                ResponseStatus::Protocol,
+                "session health status invalid",
+            )
+        }),
+        Err(
+            StationError::Identity(_)
+            | StationError::PersonaMismatch
+            | StationError::IdentityClassMismatch
+            | StationError::AuthenticatedProfileRequired
+            | StationError::InvalidSessionState,
+        ) => WorkerResponse::failure(
+            request,
+            ResponseStatus::Invalid,
+            "session health rejected",
+        ),
+        Err(StationError::AuthSessionBusy | StationError::AtCapacity) => {
+            WorkerResponse::failure(
+                request,
+                ResponseStatus::Unavailable,
+                "session health busy",
+            )
+        }
+        Err(_) => WorkerResponse::failure(
+            request,
+            ResponseStatus::Unavailable,
+            "session health unavailable",
+        ),
+    }
 }
 
 async fn begin_auth_session(

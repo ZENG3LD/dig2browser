@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(windows)]
 use dig2browser_client::{
     BrowserPersona, ClientConfig, SessionPhase, SessionStateUpdate,
-    StationClient, DEFAULT_STATION_PIPE,
+    SessionHealthProbe, StationClient, DEFAULT_STATION_PIPE,
 };
 
 #[cfg(windows)]
@@ -49,6 +49,20 @@ enum Command {
         profile_id: String,
         #[arg(long)]
         ttl_seconds: u64,
+    },
+    Check {
+        #[arg(long)]
+        profile_id: String,
+        #[arg(long)]
+        url: String,
+        #[arg(long)]
+        ready_selector: String,
+        #[arg(long)]
+        reauth_selector: String,
+        #[arg(long, default_value_t = 900)]
+        ready_ttl_seconds: u32,
+        #[arg(long, value_enum, default_value_t = PersonaPreset::Desktop)]
+        persona: PersonaPreset,
     },
 }
 
@@ -157,6 +171,36 @@ async fn run(cli: Cli) -> Result<(), &'static str> {
                 .map_err(|_| "ready_failed")?;
             println!(
                 "{{\"schema_version\":1,\"event\":\"auth_status\",\"phase\":\"ready\",\"expires_at_unix_ms\":{expires_at_unix_ms}}}"
+            );
+        }
+        Command::Check {
+            profile_id,
+            url,
+            ready_selector,
+            reauth_selector,
+            ready_ttl_seconds,
+            persona,
+        } => {
+            let status = client
+                .check_auth_session(
+                    profile_id,
+                    persona.persona(),
+                    SessionHealthProbe {
+                        url,
+                        ready_selector,
+                        reauth_selector,
+                        ready_ttl_seconds,
+                    },
+                )
+                .await
+                .map_err(|_| "check_failed")?;
+            println!(
+                "{{\"schema_version\":1,\"event\":\"auth_status\",\"phase\":\"{}\",\"updated_at_unix_ms\":{},\"expires_at_unix_ms\":{}}}",
+                phase_name(status.phase),
+                status.updated_at_unix_ms,
+                status
+                    .expires_at_unix_ms
+                    .map_or_else(|| "null".to_owned(), |value| value.to_string())
             );
         }
     }

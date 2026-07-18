@@ -13,7 +13,7 @@ use dig2browser::identity::ProfileOwnershipGuard;
 use dig2browser_client::{
     BrowserPersona, ClientConfig, ClientError, CollectionTask, FailureClass,
     IdentitySessionStatus, MobilePersonaConfig, ProfileClass, ResponseStatus,
-    SessionPhase, SessionStateUpdate, StationClient, StationStatus,
+    SessionHealthProbe, SessionPhase, SessionStateUpdate, StationClient, StationStatus,
     TaskCapturePolicy, TaskReply, TaskStep,
 };
 use tokio::io::AsyncReadExt;
@@ -121,7 +121,12 @@ fn serve_connection(mut stream: TcpStream) -> std::io::Result<()> {
         ""
     };
     let body = format!(
-        "<!doctype html><title>{marker}</title><main data-daemon-e2e=\"{marker}\">{marker}</main>{script}"
+        "<!doctype html><title>{marker}</title><main data-daemon-e2e=\"{marker}\">{marker}</main>{}{script}",
+        match requested_marker {
+            "session-ready" => "<section data-session-ready></section>",
+            "session-reauth" => "<form data-session-reauth></form>",
+            _ => "",
+        }
     );
     let cookie = if requested_marker == "auth-bootstrap" {
         "Set-Cookie: dig2browser_auth_e2e=cookie-secret; Path=/; Max-Age=3600\r\n"
@@ -442,6 +447,24 @@ async fn stationd_denies_active_task_capabilities_by_default_e2e() {
             ..
         })
     ));
+    assert!(matches!(
+        client
+            .check_auth_session(
+                "restricted-auth-profile",
+                BrowserPersona::desktop_default(),
+                SessionHealthProbe {
+                    url: fixture.url("/restricted-health"),
+                    ready_selector: "[data-session-ready]".to_owned(),
+                    reauth_selector: "[data-session-reauth]".to_owned(),
+                    ready_ttl_seconds: 60,
+                },
+            )
+            .await,
+        Err(ClientError::Remote {
+            status: ResponseStatus::Invalid,
+            ..
+        })
+    ));
     let status = client.status().await.expect("restricted station status");
     assert_eq!(status.resident_identities, 0);
     client.shutdown().await.expect("shutdown restricted station");
@@ -585,6 +608,63 @@ async fn stationd_headful_auth_reuses_profile_without_exporting_secrets_e2e() {
     assert_eq!(capture.requested_url, fixture.url("/auth-check"));
     assert_eq!(capture.final_url, fixture.url("/auth-check"));
     assert!(!format!("{:?}", result.replies()).contains("cookie-secret"));
+
+    let ready_url = fixture.url("/session-ready");
+    let health_ready = run_auth_cli(
+        auth_cli,
+        &pipe_name,
+        &[
+            "check",
+            "--profile-id",
+            profile_id,
+            "--url",
+            &ready_url,
+            "--ready-selector",
+            "[data-session-ready]",
+            "--reauth-selector",
+            "[data-session-reauth]",
+            "--ready-ttl-seconds",
+            "60",
+        ],
+    )
+    .await;
+    assert!(health_ready.status.success(), "ready probe failed: {health_ready:?}");
+    assert!(String::from_utf8_lossy(&health_ready.stdout).contains("\"phase\":\"ready\""));
+    let ready_status = client
+        .identity_status(profile_id)
+        .await
+        .expect("read health-ready state");
+    assert_eq!(ready_status.phase, SessionPhase::Ready);
+    assert!(ready_status.expires_at_unix_ms.is_some());
+
+    let reauth_url = fixture.url("/session-reauth");
+    let health_reauth = run_auth_cli(
+        auth_cli,
+        &pipe_name,
+        &[
+            "check",
+            "--profile-id",
+            profile_id,
+            "--url",
+            &reauth_url,
+            "--ready-selector",
+            "[data-session-ready]",
+            "--reauth-selector",
+            "[data-session-reauth]",
+            "--ready-ttl-seconds",
+            "60",
+        ],
+    )
+    .await;
+    assert!(health_reauth.status.success(), "reauth probe failed: {health_reauth:?}");
+    assert!(String::from_utf8_lossy(&health_reauth.stdout)
+        .contains("\"phase\":\"reauth_required\""));
+    let reauth_status = client
+        .identity_status(profile_id)
+        .await
+        .expect("read health-reauth state");
+    assert_eq!(reauth_status.phase, SessionPhase::ReauthRequired);
+    assert_eq!(reauth_status.expires_at_unix_ms, None);
 
     let ready_command = run_auth_cli(
         auth_cli,
@@ -1172,7 +1252,7 @@ fn spawn_stationd_with_permissions(
         ]);
     }
     if allow_headful_auth {
-        command.arg("--allow-headful-auth");
+        command.args(["--allow-headful-auth", "--allow-session-health"]);
     }
     command
         .stdin(Stdio::null())

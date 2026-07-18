@@ -2,7 +2,10 @@ use crate::ProtocolError;
 
 const SESSION_UPDATE_MAGIC: [u8; 4] = *b"D2SU";
 const SESSION_STATUS_MAGIC: [u8; 4] = *b"D2SS";
+const SESSION_HEALTH_MAGIC: [u8; 4] = *b"D2HP";
 const SESSION_SCHEMA_VERSION: u16 = 1;
+const MAX_PROBE_SELECTOR_BYTES: usize = 1_024;
+const MAX_PROBE_TTL_SECONDS: u32 = 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -47,6 +50,97 @@ impl SessionPhase {
 pub struct SessionStateUpdate {
     pub phase: SessionPhase,
     pub expires_at_unix_ms: Option<u64>,
+}
+
+/// Operator-defined, bounded evidence for classifying an authenticated page.
+/// The station returns only the resulting lifecycle state, never page content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionHealthProbe {
+    pub url: String,
+    pub ready_selector: String,
+    pub reauth_selector: String,
+    pub ready_ttl_seconds: u32,
+}
+
+impl SessionHealthProbe {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        crate::validate_http_url(&self.url)?;
+        if self.ready_selector == self.reauth_selector
+            || !valid_probe_selector(&self.ready_selector)
+            || !valid_probe_selector(&self.reauth_selector)
+            || !(60..=MAX_PROBE_TTL_SECONDS).contains(&self.ready_ttl_seconds)
+        {
+            return Err(ProtocolError::InvalidSessionPayload);
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
+        self.validate()?;
+        let url_len = u16::try_from(self.url.len())
+            .map_err(|_| ProtocolError::InvalidSessionPayload)?;
+        let ready_len = u16::try_from(self.ready_selector.len())
+            .map_err(|_| ProtocolError::InvalidSessionPayload)?;
+        let reauth_len = u16::try_from(self.reauth_selector.len())
+            .map_err(|_| ProtocolError::InvalidSessionPayload)?;
+        let mut output = Vec::with_capacity(
+            16 + self.url.len() + self.ready_selector.len() + self.reauth_selector.len(),
+        );
+        output.extend_from_slice(&SESSION_HEALTH_MAGIC);
+        output.extend_from_slice(&SESSION_SCHEMA_VERSION.to_le_bytes());
+        output.extend_from_slice(&self.ready_ttl_seconds.to_le_bytes());
+        output.extend_from_slice(&url_len.to_le_bytes());
+        output.extend_from_slice(&ready_len.to_le_bytes());
+        output.extend_from_slice(&reauth_len.to_le_bytes());
+        output.extend_from_slice(self.url.as_bytes());
+        output.extend_from_slice(self.ready_selector.as_bytes());
+        output.extend_from_slice(self.reauth_selector.as_bytes());
+        Ok(output)
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, ProtocolError> {
+        if payload.len() < 16
+            || payload[..4] != SESSION_HEALTH_MAGIC
+            || u16::from_le_bytes(payload[4..6].try_into().unwrap())
+                != SESSION_SCHEMA_VERSION
+        {
+            return Err(ProtocolError::InvalidSessionPayload);
+        }
+        let ready_ttl_seconds = u32::from_le_bytes(payload[6..10].try_into().unwrap());
+        let url_len = usize::from(u16::from_le_bytes(payload[10..12].try_into().unwrap()));
+        let ready_len = usize::from(u16::from_le_bytes(payload[12..14].try_into().unwrap()));
+        let reauth_len = usize::from(u16::from_le_bytes(payload[14..16].try_into().unwrap()));
+        let expected = 16usize
+            .checked_add(url_len)
+            .and_then(|value| value.checked_add(ready_len))
+            .and_then(|value| value.checked_add(reauth_len))
+            .ok_or(ProtocolError::InvalidSessionPayload)?;
+        if payload.len() != expected {
+            return Err(ProtocolError::InvalidSessionPayload);
+        }
+        let url_end = 16 + url_len;
+        let ready_end = url_end + ready_len;
+        let probe = Self {
+            url: decode_probe_string(&payload[16..url_end])?,
+            ready_selector: decode_probe_string(&payload[url_end..ready_end])?,
+            reauth_selector: decode_probe_string(&payload[ready_end..])?,
+            ready_ttl_seconds,
+        };
+        probe.validate()?;
+        Ok(probe)
+    }
+}
+
+fn valid_probe_selector(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_PROBE_SELECTOR_BYTES
+        && !value.chars().any(char::is_control)
+}
+
+fn decode_probe_string(bytes: &[u8]) -> Result<String, ProtocolError> {
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|_| ProtocolError::InvalidSessionPayload)
 }
 
 impl SessionStateUpdate {
@@ -212,5 +306,16 @@ mod tests {
         let encoded = status.encode().unwrap();
         assert_eq!(encoded.len(), IdentitySessionStatus::ENCODED_LEN);
         assert_eq!(IdentitySessionStatus::decode(&encoded).unwrap(), status);
+
+        let probe = SessionHealthProbe {
+            url: "https://example.test/account".to_owned(),
+            ready_selector: "main[data-authenticated]".to_owned(),
+            reauth_selector: "form[action*='login']".to_owned(),
+            ready_ttl_seconds: 900,
+        };
+        assert_eq!(
+            SessionHealthProbe::decode(&probe.encode().unwrap()).unwrap(),
+            probe
+        );
     }
 }

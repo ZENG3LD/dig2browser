@@ -13,8 +13,8 @@ pub use dig2browser_protocol::{
     BrowserPersona, CaptureCompleteness, CollectionTask, CollectionTaskResult,
     EvidenceCapture, FailureClass, IdentitySessionStatus, MobilePersonaConfig,
     PersonaKind, ProfileClass, ResponseStatus, SessionPhase,
-    SessionStateUpdate, StationStatus, TaskCapturePolicy, TaskReply, TaskStep,
-    DEFAULT_STATION_PIPE,
+    SessionHealthProbe, SessionStateUpdate, StationStatus, TaskCapturePolicy,
+    TaskReply, TaskStep, DEFAULT_STATION_PIPE,
 };
 
 const MIN_TIMEOUT: Duration = Duration::from_millis(100);
@@ -288,6 +288,27 @@ impl StationClient {
         require_ok(&response)
     }
 
+    /// Classify an authenticated profile from bounded operator-defined DOM
+    /// evidence. Only the resulting lifecycle state is returned.
+    pub async fn check_auth_session(
+        &self,
+        profile_id: impl Into<String>,
+        persona: BrowserPersona,
+        probe: SessionHealthProbe,
+    ) -> Result<IdentitySessionStatus, ClientError> {
+        let request = WorkerRequest::check_auth_session(
+            self.take_request_id(),
+            profile_id,
+            persona,
+            probe,
+        );
+        let response = self.call(request).await?;
+        require_ok(&response)?;
+        response
+            .decode_identity_status()
+            .map_err(|_| ClientError::InvalidResponse)
+    }
+
     /// Capture while periodically yielding control to the caller for lease
     /// heartbeats or cooperative cancellation. Cancelling drops the in-flight
     /// request and disconnects the pipe so its late response cannot desync the
@@ -526,6 +547,18 @@ impl BlockingStationClient {
     ) -> Result<(), ClientError> {
         self.runtime
             .block_on(self.client.finish_auth_session(profile_id))
+    }
+
+    pub fn check_auth_session(
+        &self,
+        profile_id: impl Into<String>,
+        persona: BrowserPersona,
+        probe: SessionHealthProbe,
+    ) -> Result<IdentitySessionStatus, ClientError> {
+        self.runtime.block_on(
+            self.client
+                .check_auth_session(profile_id, persona, probe),
+        )
     }
 
     pub fn capture_with_progress<E, F>(

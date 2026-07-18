@@ -10,7 +10,8 @@ mod task;
 
 pub use identity::{BrowserPersona, MobilePersonaConfig, PersonaKind};
 pub use session::{
-    IdentitySessionStatus, ProfileClass, SessionPhase, SessionStateUpdate,
+    IdentitySessionStatus, ProfileClass, SessionHealthProbe, SessionPhase,
+    SessionStateUpdate,
 };
 
 pub use task::{
@@ -40,6 +41,8 @@ const TASK_IDENTITY_MAGIC: [u8; 4] = *b"D2TI";
 const TASK_IDENTITY_SCHEMA_VERSION: u16 = 2;
 const AUTH_IDENTITY_MAGIC: [u8; 4] = *b"D2AI";
 const AUTH_IDENTITY_SCHEMA_VERSION: u16 = 1;
+const HEALTH_IDENTITY_MAGIC: [u8; 4] = *b"D2HI";
+const HEALTH_IDENTITY_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -53,6 +56,7 @@ pub enum RequestKind {
     UpdateIdentityState = 7,
     BeginAuthSession = 8,
     FinishAuthSession = 9,
+    CheckAuthSession = 10,
 }
 
 impl RequestKind {
@@ -67,6 +71,7 @@ impl RequestKind {
             7 => Ok(Self::UpdateIdentityState),
             8 => Ok(Self::BeginAuthSession),
             9 => Ok(Self::FinishAuthSession),
+            10 => Ok(Self::CheckAuthSession),
             _ => Err(ProtocolError::InvalidRequest),
         }
     }
@@ -82,6 +87,7 @@ pub struct WorkerRequest {
     pub persona: Option<BrowserPersona>,
     pub profile_class: Option<ProfileClass>,
     pub session_update: Option<SessionStateUpdate>,
+    pub session_probe: Option<SessionHealthProbe>,
 }
 
 impl WorkerRequest {
@@ -95,6 +101,7 @@ impl WorkerRequest {
             persona: None,
             profile_class: None,
             session_update: None,
+            session_probe: None,
         }
     }
 
@@ -142,6 +149,7 @@ impl WorkerRequest {
             persona: Some(persona),
             profile_class: Some(profile_class),
             session_update: None,
+            session_probe: None,
         }
     }
 
@@ -155,6 +163,7 @@ impl WorkerRequest {
             persona: None,
             profile_class: None,
             session_update: None,
+            session_probe: None,
         }
     }
 
@@ -172,6 +181,7 @@ impl WorkerRequest {
             persona: None,
             profile_class: None,
             session_update: Some(update),
+            session_probe: None,
         }
     }
 
@@ -190,6 +200,7 @@ impl WorkerRequest {
             persona: Some(persona),
             profile_class: Some(ProfileClass::Authenticated),
             session_update: None,
+            session_probe: None,
         }
     }
 
@@ -203,6 +214,26 @@ impl WorkerRequest {
             persona: None,
             profile_class: None,
             session_update: None,
+            session_probe: None,
+        }
+    }
+
+    pub fn check_auth_session(
+        request_id: u64,
+        profile_id: impl Into<String>,
+        persona: BrowserPersona,
+        probe: SessionHealthProbe,
+    ) -> Self {
+        Self {
+            kind: RequestKind::CheckAuthSession,
+            request_id,
+            profile_id: profile_id.into(),
+            url: String::new(),
+            task: None,
+            persona: Some(persona),
+            profile_class: Some(ProfileClass::Authenticated),
+            session_update: None,
+            session_probe: Some(probe),
         }
     }
 
@@ -228,6 +259,7 @@ impl WorkerRequest {
             persona: None,
             profile_class: None,
             session_update: None,
+            session_probe: None,
         }
     }
 
@@ -271,10 +303,25 @@ impl WorkerRequest {
         } else {
             None
         };
+        let probe_payload = if self.kind == RequestKind::CheckAuthSession {
+            Some(encode_health_identity_payload(
+                self.profile_class
+                    .ok_or(ProtocolError::InvalidRequest)?,
+                self.persona
+                    .as_ref()
+                    .ok_or(ProtocolError::InvalidRequest)?,
+                self.session_probe
+                    .as_ref()
+                    .ok_or(ProtocolError::InvalidRequest)?,
+            )?)
+        } else {
+            None
+        };
         let body = task_payload
             .as_deref()
             .or(session_payload.as_deref())
             .or(auth_payload.as_deref())
+            .or(probe_payload.as_deref())
             .unwrap_or(self.url.as_bytes());
         let url_len = u32::try_from(body.len()).map_err(|_| ProtocolError::InvalidRequest)?;
         let total = REQUEST_HEADER_BYTES
@@ -306,6 +353,7 @@ impl WorkerRequest {
                     && self.persona.is_none()
                     && self.profile_class.is_none()
                     && self.session_update.is_none()
+                    && self.session_probe.is_none()
                 {
                     Ok(())
                 } else {
@@ -325,7 +373,10 @@ impl WorkerRequest {
                     .as_ref()
                     .ok_or(ProtocolError::InvalidRequest)?
                     .validate()?;
-                if self.profile_class.is_none() || self.session_update.is_some() {
+                if self.profile_class.is_none()
+                    || self.session_update.is_some()
+                    || self.session_probe.is_some()
+                {
                     Err(ProtocolError::InvalidRequest)
                 } else {
                     Ok(())
@@ -338,6 +389,7 @@ impl WorkerRequest {
                     && self.persona.is_none()
                     && self.profile_class.is_none()
                     && self.session_update.is_none()
+                    && self.session_probe.is_none()
                 {
                     Ok(())
                 } else {
@@ -350,6 +402,7 @@ impl WorkerRequest {
                     && self.task.is_none()
                     && self.persona.is_none()
                     && self.profile_class.is_none()
+                    && self.session_probe.is_none()
                 {
                     self.session_update
                         .as_ref()
@@ -369,6 +422,7 @@ impl WorkerRequest {
                 if self.task.is_none()
                     && self.profile_class == Some(ProfileClass::Authenticated)
                     && self.session_update.is_none()
+                    && self.session_probe.is_none()
                 {
                     Ok(())
                 } else {
@@ -382,7 +436,27 @@ impl WorkerRequest {
                     && self.persona.is_none()
                     && self.profile_class.is_none()
                     && self.session_update.is_none()
+                    && self.session_probe.is_none()
                 {
+                    Ok(())
+                } else {
+                    Err(ProtocolError::InvalidRequest)
+                }
+            }
+            RequestKind::CheckAuthSession => {
+                validate_profile_id(&self.profile_id)?;
+                if !self.url.is_empty() || self.task.is_some() || self.session_update.is_some() {
+                    return Err(ProtocolError::InvalidRequest);
+                }
+                self.persona
+                    .as_ref()
+                    .ok_or(ProtocolError::InvalidRequest)?
+                    .validate()?;
+                self.session_probe
+                    .as_ref()
+                    .ok_or(ProtocolError::InvalidRequest)?
+                    .validate()?;
+                if self.profile_class == Some(ProfileClass::Authenticated) {
                     Ok(())
                 } else {
                     Err(ProtocolError::InvalidRequest)
@@ -395,6 +469,7 @@ impl WorkerRequest {
                     && self.persona.is_none()
                     && self.profile_class.is_none()
                     && self.session_update.is_none()
+                    && self.session_probe.is_none()
                 {
                     Ok(())
                 } else {
@@ -657,7 +732,10 @@ impl WorkerResponse {
     }
 
     pub fn decode_identity_status(&self) -> Result<IdentitySessionStatus, ProtocolError> {
-        if self.kind != RequestKind::IdentityStatus
+        if !matches!(
+            self.kind,
+            RequestKind::IdentityStatus | RequestKind::CheckAuthSession
+        )
             || self.status != ResponseStatus::Ok
             || self.http_status.is_some()
             || !self.final_url.is_empty()
@@ -704,7 +782,11 @@ impl WorkerResponse {
         if self.kind == RequestKind::Task && self.status == ResponseStatus::Ok {
             self.decode_task_result()?;
         }
-        if self.kind == RequestKind::IdentityStatus && self.status == ResponseStatus::Ok {
+        if matches!(
+            self.kind,
+            RequestKind::IdentityStatus | RequestKind::CheckAuthSession
+        ) && self.status == ResponseStatus::Ok
+        {
             self.decode_identity_status()?;
         }
         Ok(())
@@ -850,6 +932,59 @@ fn decode_auth_identity_payload(
     Ok((profile_class, persona, url))
 }
 
+fn encode_health_identity_payload(
+    profile_class: ProfileClass,
+    persona: &BrowserPersona,
+    probe: &SessionHealthProbe,
+) -> Result<Vec<u8>, ProtocolError> {
+    if profile_class != ProfileClass::Authenticated {
+        return Err(ProtocolError::InvalidIdentityPayload);
+    }
+    let persona = persona.encode()?;
+    let probe = probe.encode()?;
+    let persona_len = u16::try_from(persona.len())
+        .map_err(|_| ProtocolError::InvalidIdentityPayload)?;
+    let mut payload = Vec::with_capacity(10 + persona.len() + probe.len());
+    payload.extend_from_slice(&HEALTH_IDENTITY_MAGIC);
+    payload.extend_from_slice(&HEALTH_IDENTITY_SCHEMA_VERSION.to_le_bytes());
+    payload.extend_from_slice(&persona_len.to_le_bytes());
+    payload.push(profile_class as u8);
+    payload.push(0);
+    payload.extend_from_slice(&persona);
+    payload.extend_from_slice(&probe);
+    Ok(payload)
+}
+
+fn decode_health_identity_payload(
+    payload: &[u8],
+) -> Result<(ProfileClass, BrowserPersona, SessionHealthProbe), ProtocolError> {
+    if payload.len() < 10
+        || payload[..4] != HEALTH_IDENTITY_MAGIC
+        || u16::from_le_bytes(payload[4..6].try_into().unwrap())
+            != HEALTH_IDENTITY_SCHEMA_VERSION
+        || payload[9] != 0
+    {
+        return Err(ProtocolError::InvalidIdentityPayload);
+    }
+    let persona_len = usize::from(u16::from_le_bytes(payload[6..8].try_into().unwrap()));
+    let profile_class = ProfileClass::from_wire(payload[8])?;
+    if profile_class != ProfileClass::Authenticated {
+        return Err(ProtocolError::InvalidIdentityPayload);
+    }
+    let persona_end = 10usize
+        .checked_add(persona_len)
+        .ok_or(ProtocolError::InvalidIdentityPayload)?;
+    if persona_end >= payload.len() {
+        return Err(ProtocolError::InvalidIdentityPayload);
+    }
+    let (persona, consumed) = BrowserPersona::decode(&payload[10..persona_end])?;
+    if consumed != persona_len {
+        return Err(ProtocolError::InvalidIdentityPayload);
+    }
+    let probe = SessionHealthProbe::decode(&payload[persona_end..])?;
+    Ok((profile_class, persona, probe))
+}
+
 pub async fn read_worker_request<R>(
     stream: &mut R,
 ) -> Result<Option<WorkerRequest>, FrameError>
@@ -897,6 +1032,22 @@ where
     } else if kind == RequestKind::BeginAuthSession {
         let (profile_class, persona, url) = decode_auth_identity_payload(body)?;
         (url, None, Some(persona), Some(profile_class), None)
+    } else if kind == RequestKind::CheckAuthSession {
+        let (profile_class, persona, session_probe) =
+            decode_health_identity_payload(body)?;
+        let request = WorkerRequest {
+            kind,
+            request_id,
+            profile_id,
+            url: String::new(),
+            task: None,
+            persona: Some(persona),
+            profile_class: Some(profile_class),
+            session_update: None,
+            session_probe: Some(session_probe),
+        };
+        request.validate()?;
+        return Ok(Some(request));
     } else if kind == RequestKind::UpdateIdentityState {
         (
             String::new(),
@@ -925,6 +1076,7 @@ where
         persona,
         profile_class,
         session_update,
+        session_probe: None,
     };
     request.validate()?;
     Ok(Some(request))
@@ -1218,6 +1370,27 @@ mod tests {
                 .expect("decode finish auth session")
                 .expect("finish auth request"),
             finish
+        );
+
+        let check = WorkerRequest::check_auth_session(
+            83,
+            "operator-profile",
+            BrowserPersona::desktop_default(),
+            SessionHealthProbe {
+                url: "https://example.test/account".to_owned(),
+                ready_selector: "[data-authenticated]".to_owned(),
+                reauth_selector: "form[action*='login']".to_owned(),
+                ready_ttl_seconds: 900,
+            },
+        );
+        let bytes = check.encode().expect("encode auth health probe");
+        let mut reader = &bytes[..];
+        assert_eq!(
+            read_worker_request(&mut reader)
+                .await
+                .expect("decode auth health probe")
+                .expect("auth health request"),
+            check
         );
     }
 

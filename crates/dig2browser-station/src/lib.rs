@@ -24,7 +24,7 @@ use dig2browser::identity::{
 use dig2browser::stealth::{ClientHintsProfile, LocaleProfile};
 use dig2browser_protocol::{
     BrowserPersona, IdentitySessionStatus, PersonaKind, ProfileClass,
-    SessionPhase, SessionStateUpdate,
+    SessionHealthProbe, SessionPhase, SessionStateUpdate,
 };
 use tokio::sync::{Mutex, RwLock, Semaphore};
 
@@ -930,6 +930,110 @@ impl BrowserStation {
 
     async fn remove_auth_reservation(&self, identity: &IdentityRequest) {
         self.inner.state.lock().await.auth_sessions.remove(identity);
+    }
+
+    /// Check a bound authenticated profile using two bounded DOM signals and
+    /// persist only the resulting non-secret lifecycle state. Reauth evidence
+    /// wins if both selectors match; no match is recorded as unknown.
+    pub async fn check_auth_session(
+        &self,
+        identity: IdentityRequest,
+        probe: SessionHealthProbe,
+    ) -> Result<IdentitySessionStatus, StationError> {
+        if identity.class != IdentityClass::Authenticated {
+            return Err(StationError::AuthenticatedProfileRequired);
+        }
+        probe
+            .validate()
+            .map_err(|_| StationError::InvalidSessionState)?;
+        let current = self.identity_session_status(&identity.id).await?;
+        if !current.persona_bound
+            || current.profile_class != Some(ProfileClass::Authenticated)
+        {
+            return Err(StationError::AuthenticatedProfileRequired);
+        }
+
+        let ready_selector = serde_json::to_string(&probe.ready_selector)
+            .map_err(|_| StationError::InvalidSessionState)?;
+        let reauth_selector = serde_json::to_string(&probe.reauth_selector)
+            .map_err(|_| StationError::InvalidSessionState)?;
+        let script = format!(
+            "(()=>{{const ready=document.querySelector({ready_selector})!==null;const reauth=document.querySelector({reauth_selector})!==null;return {{ready,reauth}};}})()"
+        );
+        let task = BrowserTask::new(vec![
+            BrowserTaskStep::Navigate { url: probe.url },
+            BrowserTaskStep::Evaluate { script },
+        ])
+        .map_err(|_| StationError::InvalidSessionState)?;
+        let lease = self
+            .lease(identity.clone(), CapabilitySet::scripted_monitoring())
+            .await?;
+        let result = lease.run_task(&task).await?;
+        let Some(AgentReply::ScriptValue(value)) = result.replies.get(1) else {
+            return Err(StationError::InvalidWorkerReply);
+        };
+        let ready = value
+            .get("ready")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or(StationError::InvalidWorkerReply)?;
+        let reauth = value
+            .get("reauth")
+            .and_then(serde_json::Value::as_bool)
+            .ok_or(StationError::InvalidWorkerReply)?;
+        drop(lease);
+
+        if reauth {
+            self.update_identity_session(
+                &identity.id,
+                SessionStateUpdate {
+                    phase: SessionPhase::ReauthRequired,
+                    expires_at_unix_ms: None,
+                },
+            )
+            .await?;
+        } else if ready {
+            let expires_at_unix_ms = unix_time_ms()
+                .checked_add(u64::from(probe.ready_ttl_seconds) * 1_000)
+                .ok_or(StationError::InvalidSessionState)?;
+            self.update_identity_session(
+                &identity.id,
+                SessionStateUpdate {
+                    phase: SessionPhase::Ready,
+                    expires_at_unix_ms: Some(expires_at_unix_ms),
+                },
+            )
+            .await?;
+        } else {
+            self.mark_identity_session_unknown(&identity.id).await?;
+        }
+        self.identity_session_status(&identity.id).await
+    }
+
+    async fn mark_identity_session_unknown(
+        &self,
+        profile_id: &str,
+    ) -> Result<(), StationError> {
+        let _gate = self.inner.session_state_gate.lock().await;
+        let current = read_identity_session_status(
+            &self.inner.config.profiles_root,
+            profile_id,
+        )?;
+        if !current.persona_bound
+            || current.profile_class != Some(ProfileClass::Authenticated)
+        {
+            return Err(StationError::AuthenticatedProfileRequired);
+        }
+        append_session_status(
+            &self.inner.config.profiles_root.join(profile_id),
+            &IdentitySessionStatus {
+                profile_exists: true,
+                persona_bound: true,
+                profile_class: Some(ProfileClass::Authenticated),
+                phase: SessionPhase::Unknown,
+                updated_at_unix_ms: unix_time_ms(),
+                expires_at_unix_ms: None,
+            },
+        )
     }
 
     /// Read one profile's non-secret session lifecycle. This never inspects or
