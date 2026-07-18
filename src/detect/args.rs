@@ -51,8 +51,8 @@ impl BrowserProfile {
     pub fn resolve(&self) -> Result<(PathBuf, bool), DetectError> {
         match self {
             BrowserProfile::Ephemeral => {
-                let dir = std::env::temp_dir()
-                    .join(format!("dig2browser-{}", uuid::Uuid::new_v4()));
+                let dir =
+                    std::env::temp_dir().join(format!("dig2browser-{}", uuid::Uuid::new_v4()));
                 std::fs::create_dir_all(&dir).map_err(DetectError::Io)?;
                 Ok((dir, true))
             }
@@ -106,7 +106,11 @@ impl LaunchConfig {
             effective_locale, lang_base
         ));
 
-        args.push(format!("--window-size={},{}", self.window_size.0, self.window_size.1));
+        args.push(format!(
+            "--window-size={},{}",
+            self.window_size.0, self.window_size.1
+        ));
+        args.push("--remote-debugging-address=127.0.0.1".into());
         args.push(format!("--remote-debugging-port={}", port));
         args.push(format!("--user-data-dir={}", profile_dir.display()));
 
@@ -122,5 +126,23 @@ impl LaunchConfig {
             .and_then(|listener| listener.local_addr())
             .map(|addr| addr.port())
             .unwrap_or(9222) // fallback
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_launch_binds_debugging_to_loopback() {
+        let config = LaunchConfig::default();
+        let args = config.build_args(Path::new("profile"), 9_222, None);
+
+        assert!(args
+            .iter()
+            .any(|argument| argument == "--remote-debugging-address=127.0.0.1"));
+        assert!(args
+            .iter()
+            .any(|argument| argument == "--remote-debugging-port=9222"));
     }
 }
