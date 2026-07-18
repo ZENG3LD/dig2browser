@@ -16,6 +16,7 @@ use dig2browser::agentic::{
 };
 use dig2browser::identity::{
     BrowserBackend, DevicePersona, IdentityClass, IdentityError, IdentityProfile,
+    ProfileOwnershipGuard,
 };
 use tokio::sync::{Mutex, RwLock, Semaphore};
 
@@ -23,6 +24,45 @@ pub mod ipc;
 
 const MAX_RESIDENT: usize = 256;
 const MAX_IN_FLIGHT: usize = 4_096;
+
+/// Exclusive, crash-releasing ownership of one canonical station profiles root.
+#[derive(Debug)]
+pub struct ProfilesRootOwnership {
+    root: PathBuf,
+    _guard: ProfileOwnershipGuard,
+}
+
+impl ProfilesRootOwnership {
+    pub fn acquire(root: impl Into<PathBuf>) -> Result<Self, ProfilesRootError> {
+        let root = root.into();
+        if !root.is_absolute() {
+            return Err(ProfilesRootError::NotAbsolute);
+        }
+        std::fs::create_dir_all(&root).map_err(ProfilesRootError::Io)?;
+        let root = std::fs::canonicalize(root).map_err(ProfilesRootError::Io)?;
+        if !root.metadata().map_err(ProfilesRootError::Io)?.is_dir() {
+            return Err(ProfilesRootError::NotDirectory);
+        }
+        let guard = match ProfileOwnershipGuard::acquire(&root) {
+            Ok(guard) => guard,
+            Err(IdentityError::ProfileAlreadyOwned { .. }) => {
+                return Err(ProfilesRootError::AlreadyOwned)
+            }
+            Err(IdentityError::Io(error)) => return Err(ProfilesRootError::Io(error)),
+            Err(IdentityError::InvalidProfileId(_)) => {
+                return Err(ProfilesRootError::NotDirectory)
+            }
+        };
+        Ok(Self {
+            root,
+            _guard: guard,
+        })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct StationConfig {
@@ -492,6 +532,18 @@ pub struct ShutdownReport {
     pub stopped: usize,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ProfilesRootError {
+    #[error("profiles root must be absolute")]
+    NotAbsolute,
+    #[error("profiles root must be a directory")]
+    NotDirectory,
+    #[error("profiles root is already owned by another station")]
+    AlreadyOwned,
+    #[error("profiles root I/O failed")]
+    Io(#[source] std::io::Error),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
     #[error("profiles root must be absolute")]
@@ -558,5 +610,24 @@ mod tests {
             config.with_worker_capabilities(capabilities),
             Err(ConfigError::LifecycleCapabilityRequired)
         ));
+    }
+
+    #[test]
+    fn profiles_root_has_one_crash_releasing_owner() {
+        let root = std::env::temp_dir().join(format!(
+            "dig2browser-station-root-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let first = ProfilesRootOwnership::acquire(&root).expect("acquire profiles root");
+        assert!(first.root().is_absolute());
+        assert!(matches!(
+            ProfilesRootOwnership::acquire(&root),
+            Err(ProfilesRootError::AlreadyOwned)
+        ));
+        drop(first);
+        let successor =
+            ProfilesRootOwnership::acquire(&root).expect("successor acquires profiles root");
+        drop(successor);
+        std::fs::remove_dir_all(root).expect("remove profiles root fixture");
     }
 }

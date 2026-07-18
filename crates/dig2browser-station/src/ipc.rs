@@ -202,10 +202,27 @@ impl ServerConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServerReport {
+    pub stop_reason: StopReason,
     pub accepted_connections: u64,
     pub completed_connections: u64,
     pub aborted_connections: u64,
     pub stopped_workers: usize,
+    pub drain_timed_out: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    ShutdownChannel,
+    RemoteRequest,
+}
+
+impl StopReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ShutdownChannel => "shutdown_channel",
+            Self::RemoteRequest => "remote_request",
+        }
+    }
 }
 
 pub async fn run_station_server(
@@ -310,6 +327,7 @@ async fn run_windows_server(
             }
             request = remote_requests.recv() => {
                 if request.is_some() {
+                    remote_stop = true;
                     break;
                 }
             }
@@ -329,7 +347,8 @@ async fn run_windows_server(
         }
     })
     .await;
-    if drained.is_err() {
+    let drain_timed_out = drained.is_err();
+    if drain_timed_out {
         telemetry.aborted_connections.fetch_add(
             u64::try_from(connections.len()).unwrap_or(u64::MAX),
             Ordering::AcqRel,
@@ -339,10 +358,16 @@ async fn run_windows_server(
     }
     let shutdown_report = station.shutdown().await?;
     Ok(ServerReport {
+        stop_reason: if remote_stop {
+            StopReason::RemoteRequest
+        } else {
+            StopReason::ShutdownChannel
+        },
         accepted_connections: telemetry.accepted_connections.load(Ordering::Acquire),
         completed_connections: telemetry.completed_connections.load(Ordering::Acquire),
         aborted_connections: telemetry.aborted_connections.load(Ordering::Acquire),
         stopped_workers: shutdown_report.stopped,
+        drain_timed_out,
     })
 }
 

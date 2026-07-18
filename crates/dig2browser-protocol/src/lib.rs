@@ -11,6 +11,7 @@ pub const MAX_TITLE_BYTES: usize = 16 * 1024;
 pub const MAX_ERROR_BYTES: usize = 1024;
 pub const MAX_HTML_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_PNG_BYTES: usize = 32 * 1024 * 1024;
+pub const DEFAULT_STATION_PIPE: &str = "dig2browser-station-v1";
 
 const REQUEST_MAGIC: [u8; 4] = *b"D2BQ";
 const RESPONSE_MAGIC: [u8; 4] = *b"D2BR";

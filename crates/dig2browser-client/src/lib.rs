@@ -9,7 +9,9 @@ use dig2browser_protocol::{
 };
 use tokio::sync::Mutex;
 
-pub use dig2browser_protocol::{FailureClass, ResponseStatus, StationStatus};
+pub use dig2browser_protocol::{
+    FailureClass, ResponseStatus, StationStatus, DEFAULT_STATION_PIPE,
+};
 
 const MIN_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -22,6 +24,13 @@ pub struct ClientConfig {
 }
 
 impl ClientConfig {
+    pub fn local_default(
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Result<Self, ConfigError> {
+        Self::new(DEFAULT_STATION_PIPE, connect_timeout, request_timeout)
+    }
+
     pub fn new(
         pipe_name: impl Into<String>,
         connect_timeout: Duration,
@@ -382,6 +391,12 @@ mod tests {
 
     #[test]
     fn validates_pipe_and_timeouts() {
+        let default = ClientConfig::local_default(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .expect("valid default station endpoint");
+        assert_eq!(default.pipe_name(), DEFAULT_STATION_PIPE);
         assert!(matches!(
             ClientConfig::new("bad\\pipe", Duration::from_secs(1), Duration::from_secs(1)),
             Err(ConfigError::InvalidPipeName)

@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use dig2browser::identity::ProfileOwnershipGuard;
 use dig2browser_client::{ClientConfig, FailureClass, StationClient, StationStatus};
+use tokio::io::AsyncReadExt;
 
 struct FixtureServer {
     address: SocketAddr,
@@ -126,6 +128,36 @@ async fn stationd_serves_concurrent_clients_and_drains_real_chromium_e2e() {
     assert_eq!(baseline.command_limit, 4);
     assert!(baseline.command_available <= baseline.command_limit);
 
+    let endpoint_conflict_profiles =
+        e2e_temp_base().join(format!("dig2browser-stationd-conflict-e2e-{unique}"));
+    let mut endpoint_conflict = spawn_stationd(
+        stationd,
+        &pipe_name,
+        &endpoint_conflict_profiles,
+    );
+    let endpoint_status = tokio::time::timeout(Duration::from_secs(15), endpoint_conflict.wait())
+        .await
+        .expect("endpoint conflict exit timeout")
+        .expect("wait for endpoint conflict");
+    assert!(!endpoint_status.success());
+    let (_, endpoint_stderr) = read_child_output(&mut endpoint_conflict).await;
+    assert!(endpoint_stderr.contains("\"error_class\":\"station_endpoint_unavailable\""));
+    remove_tree(&endpoint_conflict_profiles).await;
+
+    let root_conflict_pipe = format!("dig2browser-stationd-root-conflict-e2e-{unique}");
+    let mut root_conflict = spawn_stationd(stationd, &root_conflict_pipe, &profiles);
+    let root_status = tokio::time::timeout(Duration::from_secs(15), root_conflict.wait())
+        .await
+        .expect("profiles root conflict exit timeout")
+        .expect("wait for profiles root conflict");
+    assert!(!root_status.success());
+    let (_, root_stderr) = read_child_output(&mut root_conflict).await;
+    assert!(root_stderr.contains("\"error_class\":\"profiles_root_owned\""));
+    observer
+        .health()
+        .await
+        .expect("primary station survives ownership conflicts");
+
     let first_url = fixture.url("/first-client");
     let second_url = fixture.url("/second-client");
     let first_task = tokio::spawn(async move {
@@ -196,6 +228,12 @@ async fn stationd_serves_concurrent_clients_and_drains_real_chromium_e2e() {
         .expect("station daemon exit timeout")
         .expect("wait for station daemon");
     assert!(status.success(), "station daemon failed: {status}");
+    let (stdout, stderr) = read_child_output(&mut daemon).await;
+    assert!(stderr.is_empty(), "clean station wrote stderr: {stderr}");
+    assert!(stdout.contains("\"event\":\"station_exit\""));
+    assert!(stdout.contains("\"outcome\":\"clean\""));
+    assert!(stdout.contains("\"stop_reason\":\"remote_request\""));
+    assert!(stdout.contains("\"drain_timed_out\":false"));
     remove_tree(&profiles).await;
 }
 
@@ -218,6 +256,28 @@ async fn stationd_hard_kill_releases_profile_and_client_reconnects_e2e() {
     let client = StationClient::connect(client_config)
         .await
         .expect("connect crash E2E client");
+    let external_profile =
+        ProfileOwnershipGuard::acquire(profiles.join("externally-locked-profile"))
+            .expect("lock profile outside station");
+    assert!(
+        client
+            .capture(
+                "externally-locked-profile",
+                fixture.url("/while-profile-locked"),
+            )
+            .await
+            .is_err(),
+        "station unexpectedly acquired an externally locked profile"
+    );
+    drop(external_profile);
+    let released_capture = client
+        .capture(
+            "externally-locked-profile",
+            fixture.url("/after-profile-release"),
+        )
+        .await
+        .expect("station acquires profile after external owner releases it");
+    assert_eq!(released_capture.title.as_deref(), Some("after-profile-release"));
     client
         .capture("crash-recovery-profile", fixture.url("/before-crash"))
         .await
@@ -261,6 +321,10 @@ async fn stationd_hard_kill_releases_profile_and_client_reconnects_e2e() {
         .expect("successor stationd exit timeout")
         .expect("wait for successor stationd");
     assert!(status.success(), "successor stationd failed: {status}");
+    let (stdout, stderr) = read_child_output(&mut successor).await;
+    assert!(stderr.is_empty(), "clean successor wrote stderr: {stderr}");
+    assert!(stdout.contains("\"outcome\":\"clean\""));
+    assert!(stdout.contains("\"stop_reason\":\"remote_request\""));
     remove_tree(&profiles).await;
 }
 
@@ -290,6 +354,24 @@ async fn e2e_serial_guard() -> tokio::sync::SemaphorePermit<'static> {
         .expect("daemon E2E semaphore remains open")
 }
 
+async fn read_child_output(child: &mut tokio::process::Child) -> (String, String) {
+    let mut stdout = String::new();
+    if let Some(mut stream) = child.stdout.take() {
+        stream
+            .read_to_string(&mut stdout)
+            .await
+            .expect("read station stdout");
+    }
+    let mut stderr = String::new();
+    if let Some(mut stream) = child.stderr.take() {
+        stream
+            .read_to_string(&mut stderr)
+            .await
+            .expect("read station stderr");
+    }
+    (stdout, stderr)
+}
+
 fn spawn_stationd(stationd: &str, pipe_name: &str, profiles: &Path) -> tokio::process::Child {
     tokio::process::Command::new(stationd)
         .args([
@@ -310,8 +392,8 @@ fn spawn_stationd(stationd: &str, pipe_name: &str, profiles: &Path) -> tokio::pr
             "--allow-remote-shutdown",
         ])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .expect("spawn station daemon")
