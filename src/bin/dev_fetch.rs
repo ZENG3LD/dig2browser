@@ -255,7 +255,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let screenshot = page.screenshot().await?;
 
     // Summary to stderr.
-    let title = extract_title(&html);
+    let title = page
+        .eval("document.title")
+        .await?
+        .as_str()
+        .map(str::to_owned)
+        .filter(|title| !title.trim().is_empty())
+        .or_else(|| extract_title(&html));
     eprintln!("URL:        {}", cli.url);
     eprintln!("Title:      {}", title.as_deref().unwrap_or("(no title)"));
     eprintln!("HTML size:  {} bytes", html.len());
