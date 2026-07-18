@@ -1,11 +1,12 @@
 //! Core cookie types.
 
+use std::fmt;
 use std::path::Path;
 
 use crate::CookieError;
 
 /// A single HTTP cookie with its metadata.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Cookie {
     pub name: String,
     pub value: String,
@@ -17,16 +18,65 @@ pub struct Cookie {
 }
 
 /// A collection of cookies.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct CookieJar(pub Vec<Cookie>);
 
+impl fmt::Debug for Cookie {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Cookie")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .field("domain", &self.domain)
+            .field("path", &self.path)
+            .field("is_secure", &self.is_secure)
+            .field("is_httponly", &self.is_httponly)
+            .field("expires_utc", &self.expires_utc)
+            .finish()
+    }
+}
+
+impl fmt::Display for Cookie {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}=<redacted>; domain={}; path={}",
+            self.name, self.domain, self.path
+        )
+    }
+}
+
+impl fmt::Debug for CookieJar {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_tuple("CookieJar").field(&self.0).finish()
+    }
+}
+
+impl fmt::Display for CookieJar {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "CookieJar(len={}, values=<redacted>)",
+            self.len()
+        )
+    }
+}
+
 impl CookieJar {
-    pub fn to_header_string(&self) -> String {
+    /// Serialize cookie values for an HTTP `Cookie` header.
+    ///
+    /// The result is secret material and must not be logged or persisted.
+    pub fn to_insecure_header_string(&self) -> String {
         self.0
             .iter()
             .map(|c| format!("{}={}", c.name, c.value))
             .collect::<Vec<_>>()
             .join("; ")
+    }
+
+    #[deprecated(note = "use to_insecure_header_string to acknowledge secret material")]
+    pub fn to_header_string(&self) -> String {
+        self.to_insecure_header_string()
     }
 
     pub fn for_domain(&self, domain: &str) -> CookieJar {
@@ -51,9 +101,28 @@ impl CookieJar {
         self.0.iter()
     }
 
-    pub fn save_to_file(&self, path: &Path) -> Result<(), CookieError> {
+    /// Export plaintext cookies. The destination must be treated as a secret.
+    ///
+    /// This refuses to overwrite an existing path. On Unix, the new file is
+    /// created with mode `0600`; on Windows it inherits the parent directory's
+    /// ACL, so authenticated exports require a restricted parent directory.
+    pub fn save_to_insecure_file(&self, path: &Path) -> Result<(), CookieError> {
+        use std::fs::OpenOptions;
         use std::io::Write;
-        let mut f = std::fs::File::create(path)?;
+
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut f = options.open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         for c in &self.0 {
             writeln!(
                 f,
@@ -69,7 +138,26 @@ impl CookieJar {
         Ok(())
     }
 
+    #[deprecated(
+        note = "plaintext cookie export is insecure; use save_to_insecure_file explicitly"
+    )]
+    pub fn save_to_file(&self, path: &Path) -> Result<(), CookieError> {
+        self.save_to_insecure_file(path)
+    }
+
+    /// Import cookies from the legacy plaintext format.
+    pub fn load_from_insecure_file(path: &Path) -> Result<Self, CookieError> {
+        Self::load_plaintext(path)
+    }
+
+    #[deprecated(
+        note = "plaintext cookie import is insecure; use load_from_insecure_file explicitly"
+    )]
     pub fn load_from_file(path: &Path) -> Result<Self, CookieError> {
+        Self::load_plaintext(path)
+    }
+
+    fn load_plaintext(path: &Path) -> Result<Self, CookieError> {
         let content = std::fs::read_to_string(path)?;
         let mut cookies = Vec::new();
         for line in content.lines() {
@@ -90,5 +178,65 @@ impl CookieJar {
             }
         }
         Ok(CookieJar(cookies))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn secret_cookie() -> Cookie {
+        Cookie {
+            name: "session".into(),
+            value: "do-not-log-this".into(),
+            domain: "example.test".into(),
+            path: "/".into(),
+            is_secure: true,
+            is_httponly: true,
+            expires_utc: None,
+        }
+    }
+
+    #[test]
+    fn debug_and_display_redact_cookie_values() {
+        let cookie = secret_cookie();
+        let jar = CookieJar(vec![cookie.clone()]);
+
+        for rendered in [
+            format!("{cookie:?}"),
+            cookie.to_string(),
+            format!("{jar:?}"),
+            jar.to_string(),
+        ] {
+            assert!(!rendered.contains(&cookie.value));
+            assert!(rendered.contains("redacted"));
+        }
+    }
+
+    #[test]
+    fn insecure_header_is_explicit_and_preserves_wire_value() {
+        let jar = CookieJar(vec![secret_cookie()]);
+        assert_eq!(jar.to_insecure_header_string(), "session=do-not-log-this");
+    }
+
+    #[test]
+    fn insecure_export_refuses_to_overwrite_existing_file() {
+        let path = std::env::temp_dir().join(format!(
+            "dig2browser-cookie-export-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let jar = CookieJar(vec![secret_cookie()]);
+
+        jar.save_to_insecure_file(&path).unwrap();
+        let imported = CookieJar::load_from_insecure_file(&path).unwrap();
+        assert_eq!(imported.0[0].value, "do-not-log-this");
+
+        let error = jar.save_to_insecure_file(&path).unwrap_err();
+        assert!(matches!(
+            error,
+            CookieError::Io(ref source) if source.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+
+        let _ = std::fs::remove_file(path);
     }
 }

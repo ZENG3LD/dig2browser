@@ -2,12 +2,13 @@
 
 use std::path::PathBuf;
 
-use crate::detect::{BrowserPreference, detect_browser};
 use crate::detect::args::LaunchConfig;
+use crate::detect::{detect_browser, BrowserPreference};
 
 use crate::cookies::decrypt::derive_aes_key;
 use crate::cookies::sqlite::read_cookies;
 use crate::cookies::types::CookieJar;
+use crate::identity::ProfileOwnershipGuard;
 use crate::CookieError;
 
 /// Configuration for the cookie interception flow.
@@ -68,6 +69,8 @@ pub async fn open_auth_session_with_locale(
     let binary = detect_browser(browser_pref).map_err(CookieError::Detect)?;
 
     std::fs::create_dir_all(profile_dir)?;
+    let _profile_owner = ProfileOwnershipGuard::acquire(profile_dir)
+        .map_err(|error| CookieError::Io(std::io::Error::other(error)))?;
 
     // Build the same args that BrowserPool/LaunchConfig would use,
     // but with headless=false so the user gets a visible window.
@@ -79,6 +82,7 @@ pub async fn open_auth_session_with_locale(
     };
     let port = LaunchConfig::find_free_port();
     let mut args = launch.build_args(profile_dir, port, locale);
+    args.push("--disable-background-mode".into());
     // Append the start URL as the last positional argument.
     args.push(start_url.to_string());
 
@@ -114,8 +118,7 @@ pub async fn open_auth_session_with_locale(
 /// 9. Return `CookieJar`.
 pub async fn intercept_cookies(config: &InterceptConfig) -> Result<CookieJar, CookieError> {
     // Step 1: find browser binary.
-    let binary = detect_browser(config.browser_pref)
-        .map_err(CookieError::Detect)?;
+    let binary = detect_browser(config.browser_pref).map_err(CookieError::Detect)?;
 
     // Step 2: resolve profile directory.
     let (profile_dir, is_ephemeral) = match &config.profile_dir {
@@ -124,11 +127,19 @@ pub async fn intercept_cookies(config: &InterceptConfig) -> Result<CookieJar, Co
             (dir.clone(), false)
         }
         None => {
-            let dir = std::env::temp_dir()
-                .join(format!("dig2browser-cookie-{}", uuid::Uuid::new_v4()));
+            let dir =
+                std::env::temp_dir().join(format!("dig2browser-cookie-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir)?;
             (dir, true)
         }
+    };
+    let _profile_owner = if is_ephemeral {
+        None
+    } else {
+        Some(
+            ProfileOwnershipGuard::acquire(&profile_dir)
+                .map_err(|error| CookieError::Io(std::io::Error::other(error)))?,
+        )
     };
 
     // Step 3: build args for visible (non-headless) browser.
@@ -142,6 +153,7 @@ pub async fn intercept_cookies(config: &InterceptConfig) -> Result<CookieJar, Co
     };
     let port = LaunchConfig::find_free_port();
     let mut args = launch.build_args(&profile_dir, port, None);
+    args.push("--disable-background-mode".into());
     args.push(config.start_url.clone());
 
     // Step 4: print instructions and launch.
@@ -158,21 +170,9 @@ pub async fn intercept_cookies(config: &InterceptConfig) -> Result<CookieJar, Co
     .await
     .map_err(|e| CookieError::Io(std::io::Error::other(e.to_string())))??;
 
-    // Step 5: kill lingering browser processes that hold the cookie DB lock.
-    // Edge/Chrome spawn background tasks that outlive the main window.
-    // We need them dead before we can copy the SQLite file.
-    let exe_name = binary.path.file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("chrome.exe")
-        .to_string();
-    tracing::debug!("[dig2browser] Killing lingering {} processes", exe_name);
-    let _ = std::process::Command::new("taskkill")
-        .args(["/IM", &exe_name, "/F"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-
-    // Wait for processes to fully exit and release file locks.
+    // Never kill processes by executable name: that can terminate unrelated
+    // operator sessions. The cookie reader copies the SQLite database and
+    // retries while this browser's remaining children flush their WAL.
     tokio::time::sleep(config.flush_wait).await;
 
     // Step 6: derive AES key.

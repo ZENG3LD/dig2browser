@@ -10,7 +10,9 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use crate::detect::BrowserProfile;
 use crate::detect::LaunchConfig;
+use crate::identity::ProfileOwnershipGuard;
 use crate::stealth::StealthConfig;
 use tracing::warn;
 
@@ -51,12 +53,21 @@ pub struct BrowserPool {
     semaphore: Arc<tokio::sync::Semaphore>,
     counter: Arc<AtomicUsize>,
     acquire_timeout: Duration,
+    _profile_owner: Option<ProfileOwnershipGuard>,
 }
 
 impl BrowserPool {
     /// Launch `config.size` browser instances and build the pool.
     pub async fn new(config: PoolConfig) -> Result<Self, BrowserError> {
         let size = config.size.max(1);
+        validate_pool_profile(&config.launch.profile, size)?;
+        let profile_owner = match &config.launch.profile {
+            BrowserProfile::Persistent(path) => Some(
+                ProfileOwnershipGuard::acquire(path)
+                    .map_err(|error| BrowserError::Launch(error.to_string()))?,
+            ),
+            BrowserProfile::Ephemeral => None,
+        };
         let mut browsers = Vec::with_capacity(size);
 
         // Launch browsers in parallel.
@@ -89,6 +100,7 @@ impl BrowserPool {
             browsers,
             counter: Arc::new(AtomicUsize::new(0)),
             acquire_timeout: config.acquire_timeout,
+            _profile_owner: profile_owner,
         })
     }
 
@@ -108,9 +120,7 @@ impl BrowserPool {
         let idx = self.counter.fetch_add(1, Ordering::Relaxed) % self.browsers.len();
         let browser = Arc::clone(&self.browsers[idx]);
 
-        let page = browser
-            .new_blank_page()
-            .await?;
+        let page = browser.new_blank_page().await?;
 
         Ok(PoolPage {
             page,
@@ -136,6 +146,15 @@ impl BrowserPool {
     }
 }
 
+fn validate_pool_profile(profile: &BrowserProfile, size: usize) -> Result<(), BrowserError> {
+    if size > 1 && matches!(profile, BrowserProfile::Persistent(_)) {
+        return Err(BrowserError::Launch(
+            "a persistent profile has a single owner; BrowserPool size must be 1".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// RAII guard that holds a semaphore permit for the duration of a pool interaction.
 ///
 /// The inner [`StealthPage`] is accessible via `Deref` or `.page()`.
@@ -156,5 +175,28 @@ impl Deref for PoolPage {
 
     fn deref(&self) -> &Self::Target {
         &self.page
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_multiple_browsers_for_one_persistent_profile() {
+        let profile = BrowserProfile::Persistent("profile".into());
+        let error = validate_pool_profile(&profile, 2).unwrap_err();
+        assert!(error.to_string().contains("single owner"));
+    }
+
+    #[test]
+    fn allows_single_browser_for_persistent_profile() {
+        let profile = BrowserProfile::Persistent("profile".into());
+        assert!(validate_pool_profile(&profile, 1).is_ok());
+    }
+
+    #[test]
+    fn allows_ephemeral_pool() {
+        assert!(validate_pool_profile(&BrowserProfile::Ephemeral, 3).is_ok());
     }
 }
