@@ -7,6 +7,8 @@ pub mod cookies;
 pub mod detect;
 pub mod browser;
 pub mod wasmtest;
+pub mod identity;
+pub mod agentic;
 
 // Re-export main types at crate root
 pub use browser::*;

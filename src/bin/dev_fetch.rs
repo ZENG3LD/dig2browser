@@ -66,6 +66,10 @@ struct Cli {
     #[arg(long)]
     cookies: bool,
 
+    /// Include secret cookie values in --cookies output
+    #[arg(long, requires = "cookies")]
+    show_cookie_values: bool,
+
     /// Show console messages (log/warn/error) captured during load
     #[arg(long)]
     console: bool,
@@ -313,9 +317,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for c in jar.iter() {
             let secure = if c.is_secure { " secure" } else { "" };
             let httponly = if c.is_httponly { " httponly" } else { "" };
+            let value = if cli.show_cookie_values {
+                c.value.as_str()
+            } else {
+                "<redacted>"
+            };
             eprintln!(
                 "  {}={} [domain={} path={}{}{}]",
-                c.name, c.value, c.domain, c.path, secure, httponly
+                c.name, value, c.domain, c.path, secure, httponly
             );
         }
     }

@@ -80,10 +80,17 @@ impl CookieJar {
     }
 
     pub fn for_domain(&self, domain: &str) -> CookieJar {
+        let requested = domain.trim_start_matches('.').to_ascii_lowercase();
         CookieJar(
             self.0
                 .iter()
-                .filter(|c| c.domain.contains(domain))
+                .filter(|cookie| {
+                    let cookie_domain = cookie.domain.trim_start_matches('.').to_ascii_lowercase();
+                    requested == cookie_domain
+                        || requested
+                            .strip_suffix(&cookie_domain)
+                            .is_some_and(|prefix| prefix.ends_with('.'))
+                })
                 .cloned()
                 .collect(),
         )
@@ -238,5 +245,18 @@ mod tests {
         ));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn domain_filter_uses_cookie_domain_boundaries() {
+        let mut parent = secret_cookie();
+        parent.domain = ".example.test".into();
+        let mut unrelated = secret_cookie();
+        unrelated.domain = "notexample.test".into();
+        let jar = CookieJar(vec![parent, unrelated]);
+
+        assert_eq!(jar.for_domain("www.example.test").len(), 1);
+        assert_eq!(jar.for_domain("example.test").len(), 1);
+        assert!(jar.for_domain("badexample.test").is_empty());
     }
 }
