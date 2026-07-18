@@ -48,6 +48,44 @@ impl LocaleProfile {
 /// binary actually launched. A non-empty value remains an explicit override.
 pub const DEFAULT_USER_AGENT: &str = "";
 
+/// Validated CSS-to-physical-pixel scale used by browser emulation.
+///
+/// The bounded range covers normal desktop scaling and Chromium's supported
+/// mobile-layout presets without allowing non-finite protocol values.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DeviceScaleFactor(f64);
+
+impl DeviceScaleFactor {
+    pub fn new(value: f64) -> Result<Self, InvalidDeviceScaleFactor> {
+        if value.is_finite() && (1.0..=4.0).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err(InvalidDeviceScaleFactor)
+        }
+    }
+
+    pub const fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl Default for DeviceScaleFactor {
+    fn default() -> Self {
+        Self(1.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidDeviceScaleFactor;
+
+impl std::fmt::Display for InvalidDeviceScaleFactor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "device scale factor must be finite and between 1 and 4")
+    }
+}
+
+impl std::error::Error for InvalidDeviceScaleFactor {}
+
 #[derive(Debug, Clone)]
 pub(crate) struct UserAgentProfile {
     pub user_agent: String,
@@ -89,6 +127,7 @@ pub struct StealthConfig {
     pub level: StealthLevel,
     pub locale: LocaleProfile,
     pub viewport: (u32, u32),
+    pub device_scale_factor: DeviceScaleFactor,
     pub hardware_concurrency: u32,
     pub device_memory_gb: u32,
     /// User-Agent string to report via both HTTP headers and JS `navigator.userAgent`.
@@ -102,6 +141,7 @@ impl Default for StealthConfig {
             level: StealthLevel::Standard,
             locale: LocaleProfile::english_us(),
             viewport: (1920, 1080),
+            device_scale_factor: DeviceScaleFactor::default(),
             hardware_concurrency: 8,
             device_memory_gb: 8,
             user_agent: DEFAULT_USER_AGENT.to_owned(),
@@ -119,6 +159,14 @@ impl StealthConfig {
     }
     pub fn english() -> Self {
         Self::default()
+    }
+
+    pub fn set_device_scale_factor(
+        &mut self,
+        value: f64,
+    ) -> Result<(), InvalidDeviceScaleFactor> {
+        self.device_scale_factor = DeviceScaleFactor::new(value)?;
+        Ok(())
     }
 
     pub(crate) fn resolve_user_agent(
@@ -236,5 +284,18 @@ mod tests {
         let profile = config.resolve_user_agent(BrowserKind::Chrome, Some("150.0.7871.125"));
 
         assert_eq!(profile.user_agent, "custom-agent/7");
+    }
+
+    #[test]
+    fn device_scale_factor_is_bounded_and_finite() {
+        let mut config = StealthConfig::default();
+
+        config.set_device_scale_factor(3.0).unwrap();
+        assert_eq!(config.device_scale_factor.get(), 3.0);
+
+        for invalid in [0.0, 4.1, f64::NAN, f64::INFINITY] {
+            assert!(config.set_device_scale_factor(invalid).is_err());
+        }
+        assert_eq!(config.device_scale_factor.get(), 3.0);
     }
 }

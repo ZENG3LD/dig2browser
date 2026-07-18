@@ -400,7 +400,7 @@ impl CdpBrowserBackend {
         // Also affects CSS media queries and visual viewport, unlike JS patching.
         let (vp_w, vp_h) = self.stealth.viewport;
         session
-            .set_device_metrics(vp_w, vp_h, 1.0)
+            .set_device_metrics(vp_w, vp_h, self.stealth.device_scale_factor.get())
             .await
             .map_err(|e| BrowserError::StealthInject(e.to_string()))?;
 
@@ -433,6 +433,21 @@ impl CdpBrowserBackend {
     }
 }
 
+async fn remove_profile_dir_with_retry(path: &std::path::Path) -> Result<(), BrowserError> {
+    const ATTEMPTS: usize = 20;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+    for attempt in 0..ATTEMPTS {
+        match tokio::fs::remove_dir_all(path).await {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) if attempt + 1 < ATTEMPTS => tokio::time::sleep(RETRY_DELAY).await,
+            Err(error) => return Err(BrowserError::Io(error)),
+        }
+    }
+    unreachable!("profile cleanup attempts are non-zero")
+}
+
 impl BrowserBackend for CdpBrowserBackend {
     fn as_any_cdp(&self) -> Option<&CdpBrowserBackend> {
         Some(self)
@@ -458,14 +473,24 @@ impl BrowserBackend for CdpBrowserBackend {
     fn close<'a>(mut self: Box<Self>) -> BoxFuture<'a, Result<(), BrowserError>> {
         Box::pin(async move {
             // Ask the browser to close gracefully via CDP.
-            let _ = self.root.call("Browser.close", None).await;
-            // Then kill the process if still running (only in launch mode).
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                self.root.call("Browser.close", None),
+            )
+            .await;
+            // Let Chromium drain its process tree before forcing the owned root
+            // process down. This avoids leaving profile files open on Windows.
             if let Some(ref mut child) = self._child {
-                let _ = child.kill().await;
+                if tokio::time::timeout(std::time::Duration::from_secs(3), child.wait())
+                    .await
+                    .is_err()
+                {
+                    let _ = child.kill().await;
+                }
             }
             if self.profile_ephemeral {
-                let _ = std::fs::remove_dir_all(&self.profile_dir);
-                self.profile_ephemeral = false; // prevent double-cleanup in Drop
+                remove_profile_dir_with_retry(&self.profile_dir).await?;
+                self.profile_ephemeral = false;
             }
             Ok(())
         })

@@ -29,7 +29,11 @@ pub fn get_scripts(config: &StealthConfig) -> Vec<String> {
 
     // Standard: adds webgl + screen_resolution
     scripts.push(override_webgl_vendor());
-    scripts.push(override_screen_resolution(config.viewport.0, config.viewport.1));
+    scripts.push(override_screen_resolution(
+        config.viewport.0,
+        config.viewport.1,
+        config.device_scale_factor.get(),
+    ));
 
     if config.level == StealthLevel::Standard {
         return scripts;
@@ -382,14 +386,14 @@ fn override_webgl_vendor() -> String {
 /// Override `screen.width/height/availWidth/availHeight` to `width × height`.
 ///
 /// `availHeight` is evaluated in Rust (not via a JS expression) to avoid any
-/// ambiguity with operator precedence in minified contexts. Also sets
-/// `devicePixelRatio` to 1.0 for consistency on 1080p non-retina displays.
+/// ambiguity with operator precedence in minified contexts. The configured
+/// `devicePixelRatio` is shared with the native CDP metrics override.
 ///
 /// NOTE: On the CDP backend this script is superseded by a native
 /// `Emulation.setDeviceMetricsOverride` call which is more reliable (survives
 /// CSS media query checks, affects visual viewport). The JS override remains
 /// here for the BiDi/Firefox backend where no CDP equivalent is available.
-fn override_screen_resolution(width: u32, height: u32) -> String {
+fn override_screen_resolution(width: u32, height: u32, device_scale_factor: f64) -> String {
     let avail_height = height.saturating_sub(40);
     format!(
         r#"
@@ -410,7 +414,7 @@ fn override_screen_resolution(width: u32, height: u32) -> String {
         configurable: true
     }});
     Object.defineProperty(window, 'devicePixelRatio', {{
-        get: () => 1,
+        get: () => {device_scale_factor},
         configurable: true
     }});
     "#
@@ -673,4 +677,23 @@ fn override_permissions_all() -> String {
     }
     "#
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screen_script_uses_configured_viewport_and_scale_factor() {
+        let mut config = StealthConfig::default();
+        config.viewport = (393, 852);
+        config.set_device_scale_factor(3.0).unwrap();
+
+        let scripts = get_scripts(&config).join("\n");
+
+        assert!(scripts.contains("get: () => 393"));
+        assert!(scripts.contains("get: () => 852"));
+        assert!(scripts.contains("get: () => 3"));
+        assert!(!scripts.contains("devicePixelRatio', {\n        get: () => 1,"));
+    }
 }

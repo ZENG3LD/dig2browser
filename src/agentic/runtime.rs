@@ -54,8 +54,8 @@ pub struct RealBrowserRuntime {
 impl RealBrowserRuntime {
     pub fn new(
         identity: IdentityProfile,
-        launch: LaunchConfig,
-        stealth: StealthConfig,
+        mut launch: LaunchConfig,
+        mut stealth: StealthConfig,
         mobile_layout: Option<MobileLayout>,
     ) -> RuntimeResult<Self> {
         if identity.backend() != BrowserBackend::Chromium
@@ -68,6 +68,14 @@ impl RealBrowserRuntime {
                 return Err(RuntimeError::new(RuntimeFailureKind::Protocol));
             }
             _ => {}
+        }
+
+        if let Some(layout) = &mobile_layout {
+            launch.window_size = (layout.width(), layout.height());
+            stealth.viewport = (layout.width(), layout.height());
+            stealth
+                .set_device_scale_factor(layout.device_scale_factor())
+                .map_err(|_| RuntimeError::new(RuntimeFailureKind::Protocol))?;
         }
 
         Ok(Self {
@@ -351,6 +359,9 @@ impl std::error::Error for RuntimeError {}
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::identity::{DevicePersona, IdentityClass};
+
     #[test]
     fn cdp_backend_is_the_only_persistent_profile_lock_owner() {
         let source = include_str!("runtime.rs");
@@ -359,5 +370,33 @@ mod tests {
 
         assert!(!source.contains(&guard_type));
         assert!(!source.contains(&owner_field));
+    }
+
+    #[test]
+    fn mobile_layout_aligns_launch_and_stealth_device_metrics() {
+        let identity = IdentityProfile::new(
+            "profiles",
+            "mobile-public",
+            IdentityClass::Public,
+            BrowserBackend::Chromium,
+            DevicePersona::MobileLayout,
+        )
+        .unwrap();
+        let layout = MobileLayout::new(393, 852, 3.0, 5).unwrap();
+        let mut stealth = StealthConfig::default();
+        stealth.user_agent = "desktop-sentinel".into();
+
+        let runtime = RealBrowserRuntime::new(
+            identity,
+            LaunchConfig::default(),
+            stealth,
+            Some(layout),
+        )
+        .unwrap();
+
+        assert_eq!(runtime.launch.window_size, (393, 852));
+        assert_eq!(runtime.stealth.viewport, (393, 852));
+        assert_eq!(runtime.stealth.device_scale_factor.get(), 3.0);
+        assert_eq!(runtime.stealth.user_agent, "desktop-sentinel");
     }
 }
