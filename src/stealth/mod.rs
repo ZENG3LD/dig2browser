@@ -7,7 +7,10 @@ pub mod config;
 pub mod inject;
 pub mod scripts;
 
-pub use config::{DEFAULT_USER_AGENT, LocaleProfile, StealthConfig, StealthLevel};
+pub use config::{
+    ClientHintsProfile, LocaleProfile, StealthConfig, StealthLevel,
+    DEFAULT_USER_AGENT,
+};
 pub use inject::InjectionStrategy;
 pub use scripts::get_scripts;
 

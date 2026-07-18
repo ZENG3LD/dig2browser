@@ -383,11 +383,11 @@ impl CdpBrowserBackend {
                 (Some(brands), Some(full_version_list)) => session
                     .set_user_agent_with_metadata(
                         &profile.user_agent,
-                        "Windows",
-                        "15.0.0",
-                        "x86",
-                        "",   // model - empty for desktops
-                        false, // mobile
+                        self.stealth.client_hints.platform(),
+                        self.stealth.client_hints.platform_version(),
+                        self.stealth.client_hints.architecture(),
+                        self.stealth.client_hints.model(),
+                        self.stealth.client_hints.mobile(),
                         &brands,
                         &full_version_list,
                     )
@@ -413,7 +413,12 @@ impl CdpBrowserBackend {
         // Also affects CSS media queries and visual viewport, unlike JS patching.
         let (vp_w, vp_h) = self.stealth.viewport;
         session
-            .set_device_metrics(vp_w, vp_h, self.stealth.device_scale_factor.get())
+            .set_device_metrics(
+                vp_w,
+                vp_h,
+                self.stealth.device_scale_factor.get(),
+                self.stealth.client_hints.mobile(),
+            )
             .await
             .map_err(|e| BrowserError::StealthInject(e.to_string()))?;
 

@@ -51,7 +51,7 @@ pub fn get_scripts(config: &StealthConfig) -> Vec<String> {
     scripts.push(override_outer_size());
     if let Some(profile) = config.resolved_profile_from_user_agent() {
         if profile.full_version.is_some() {
-            scripts.push(override_user_agent_data(&profile));
+            scripts.push(override_user_agent_data(&profile, &config.client_hints));
         }
     }
 
@@ -606,6 +606,7 @@ fn override_outer_size() -> String {
 /// This JS version remains for the BiDi/Firefox backend.
 fn override_user_agent_data(
     profile: &crate::stealth::config::UserAgentProfile,
+    client_hints: &crate::stealth::config::ClientHintsProfile,
 ) -> String {
     let brands = profile
         .brands()
@@ -624,24 +625,33 @@ fn override_user_agent_data(
         .expect("UA full version list is JSON serializable");
     let full_version = serde_json::to_string(profile.full_version.as_deref().unwrap_or_default())
         .expect("UA version is JSON serializable");
+    let platform = serde_json::to_string(client_hints.platform())
+        .expect("UA platform is JSON serializable");
+    let platform_version = serde_json::to_string(client_hints.platform_version())
+        .expect("UA platform version is JSON serializable");
+    let architecture = serde_json::to_string(client_hints.architecture())
+        .expect("UA architecture is JSON serializable");
+    let model = serde_json::to_string(client_hints.model())
+        .expect("UA model is JSON serializable");
+    let mobile = client_hints.mobile().to_string();
 
     r#"
     if (!navigator.userAgentData) {
         Object.defineProperty(Navigator.prototype, 'userAgentData', {
             get: () => ({
                 brands: __BRANDS__,
-                mobile: false,
-                platform: 'Windows',
+                mobile: __MOBILE__,
+                platform: __PLATFORM__,
                 getHighEntropyValues: function(hints) {
                     return Promise.resolve({
-                        architecture: 'x86',
+                        architecture: __ARCHITECTURE__,
                         bitness: '64',
                         brands: __BRANDS__,
                         fullVersionList: __FULL_VERSION_LIST__,
-                        mobile: false,
-                        model: '',
-                        platform: 'Windows',
-                        platformVersion: '15.0.0',
+                        mobile: __MOBILE__,
+                        model: __MODEL__,
+                        platform: __PLATFORM__,
+                        platformVersion: __PLATFORM_VERSION__,
                         uaFullVersion: __FULL_VERSION__,
                     });
                 },
@@ -657,6 +667,11 @@ fn override_user_agent_data(
     .replace("__BRANDS__", &brands)
     .replace("__FULL_VERSION_LIST__", &full_version_list)
     .replace("__FULL_VERSION__", &full_version)
+    .replace("__MOBILE__", &mobile)
+    .replace("__PLATFORM__", &platform)
+    .replace("__PLATFORM_VERSION__", &platform_version)
+    .replace("__ARCHITECTURE__", &architecture)
+    .replace("__MODEL__", &model)
 }
 
 /// Override `navigator.permissions.query` to handle all permission types.

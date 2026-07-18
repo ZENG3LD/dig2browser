@@ -10,9 +10,10 @@ use dig2browser_protocol::{
 use tokio::sync::Mutex;
 
 pub use dig2browser_protocol::{
-    CaptureCompleteness, CollectionTask, CollectionTaskResult, EvidenceCapture,
-    FailureClass, ResponseStatus, StationStatus, TaskCapturePolicy, TaskReply,
-    TaskStep, DEFAULT_STATION_PIPE,
+    BrowserPersona, CaptureCompleteness, CollectionTask, CollectionTaskResult,
+    EvidenceCapture, FailureClass, MobilePersonaConfig, PersonaKind,
+    ResponseStatus, StationStatus, TaskCapturePolicy, TaskReply, TaskStep,
+    DEFAULT_STATION_PIPE,
 };
 
 const MIN_TIMEOUT: Duration = Duration::from_millis(100);
@@ -133,6 +134,25 @@ impl StationClient {
         task: CollectionTask,
     ) -> Result<CollectionTaskResult, ClientError> {
         let request = WorkerRequest::task(self.take_request_id(), profile_id, task);
+        let response = self.call(request).await?;
+        require_ok(&response)?;
+        response
+            .decode_task_result()
+            .map_err(|_| ClientError::InvalidResponse)
+    }
+
+    pub async fn run_task_with_persona(
+        &self,
+        profile_id: impl Into<String>,
+        persona: BrowserPersona,
+        task: CollectionTask,
+    ) -> Result<CollectionTaskResult, ClientError> {
+        let request = WorkerRequest::task_with_persona(
+            self.take_request_id(),
+            profile_id,
+            persona,
+            task,
+        );
         let response = self.call(request).await?;
         require_ok(&response)?;
         response
@@ -297,6 +317,18 @@ impl BlockingStationClient {
         task: CollectionTask,
     ) -> Result<CollectionTaskResult, ClientError> {
         self.runtime.block_on(self.client.run_task(profile_id, task))
+    }
+
+    pub fn run_task_with_persona(
+        &self,
+        profile_id: impl Into<String>,
+        persona: BrowserPersona,
+        task: CollectionTask,
+    ) -> Result<CollectionTaskResult, ClientError> {
+        self.runtime.block_on(
+            self.client
+                .run_task_with_persona(profile_id, persona, task),
+        )
     }
 
     pub fn capture_with_progress<E, F>(

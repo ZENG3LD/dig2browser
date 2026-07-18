@@ -64,6 +64,7 @@ impl CdpSession {
             "Emulation.setUserAgentOverride",
             Some(json!({
                 "userAgent": user_agent,
+                "platform": platform,
                 "userAgentMetadata": {
                     "brands": brands_json,
                     "fullVersionList": full_version_list_json,
@@ -85,6 +86,7 @@ impl CdpSession {
         width: u32,
         height: u32,
         scale: f64,
+        mobile: bool,
     ) -> Result<(), CdpError> {
         self.call(
             "Emulation.setDeviceMetricsOverride",
@@ -92,7 +94,7 @@ impl CdpSession {
                 "width": width,
                 "height": height,
                 "deviceScaleFactor": scale,
-                "mobile": false,
+                "mobile": mobile,
             })),
         )
         .await?;

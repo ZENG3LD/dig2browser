@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use dig2browser::identity::ProfileOwnershipGuard;
 use dig2browser_client::{
-    ClientConfig, ClientError, CollectionTask, FailureClass, ResponseStatus,
-    StationClient, StationStatus, TaskCapturePolicy, TaskReply, TaskStep,
+    BrowserPersona, ClientConfig, ClientError, CollectionTask, FailureClass,
+    MobilePersonaConfig, ResponseStatus, StationClient, StationStatus,
+    TaskCapturePolicy, TaskReply, TaskStep,
 };
 use tokio::io::AsyncReadExt;
 
@@ -378,6 +379,153 @@ async fn stationd_denies_active_task_capabilities_by_default_e2e() {
     let (_, stderr) = read_child_output(&mut daemon).await;
     assert!(stderr.is_empty(), "restricted station wrote stderr: {stderr}");
     remove_tree(&profiles).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stationd_persists_mobile_persona_and_profile_state_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-stationd-mobile-e2e-{unique}");
+    let profiles = e2e_temp_base().join(format!("dig2browser-stationd-mobile-e2e-{unique}"));
+    std::fs::create_dir_all(&profiles).expect("create mobile E2E profiles root");
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+    let persona = BrowserPersona::mobile(MobilePersonaConfig {
+        width: 412,
+        height: 915,
+        device_scale_milli: 2625,
+        max_touch_points: 5,
+        locale: "ru-RU".to_owned(),
+        timezone: Some("Europe/Moscow".to_owned()),
+        platform_version: "14.0.0".to_owned(),
+        model: "Pixel 8".to_owned(),
+    })
+    .expect("valid mobile E2E persona");
+    let client_config = ClientConfig::new(
+        &pipe_name,
+        Duration::from_secs(15),
+        Duration::from_secs(90),
+    )
+    .expect("valid mobile client config");
+    let mut daemon = spawn_stationd(stationd, &pipe_name, &profiles);
+    let client = StationClient::connect(client_config.clone())
+        .await
+        .expect("connect mobile persona client");
+    let first_task = CollectionTask::new(vec![
+        TaskStep::Navigate {
+            url: fixture.url("/mobile-first"),
+        },
+        TaskStep::Evaluate {
+            script: "localStorage.setItem('dig2browser_e2e', 'persisted'); ({layoutWidth: innerWidth, layoutHeight: innerHeight, screenWidth: screen.width, screenHeight: screen.height, dpr: devicePixelRatio, touch: navigator.maxTouchPoints, ua: navigator.userAgent, uaMobile: navigator.userAgentData && navigator.userAgentData.mobile, uaPlatform: navigator.userAgentData && navigator.userAgentData.platform, platform: navigator.platform, language: navigator.language, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, marker: localStorage.getItem('dig2browser_e2e')})".to_owned(),
+        },
+        TaskStep::Capture {
+            policy: TaskCapturePolicy::EvidenceViewport,
+        },
+    ])
+    .expect("valid first mobile task");
+    let first_result = client
+        .run_task_with_persona("mobile-durable-profile", persona.clone(), first_task)
+        .await
+        .expect("run first mobile persona task");
+    let TaskReply::ScriptJson(first_fingerprint) = &first_result.replies()[1] else {
+        panic!("first mobile task did not return fingerprint JSON");
+    };
+    assert_mobile_fingerprint(first_fingerprint, true);
+    client.shutdown().await.expect("shutdown first mobile station");
+    let first_exit = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("first mobile daemon exit timeout")
+        .expect("wait for first mobile daemon");
+    assert!(first_exit.success(), "first mobile station failed: {first_exit}");
+    let (_, first_stderr) = read_child_output(&mut daemon).await;
+    assert!(first_stderr.is_empty(), "mobile station wrote stderr: {first_stderr}");
+
+    let mut successor = spawn_stationd(stationd, &pipe_name, &profiles);
+    let successor_client = StationClient::connect(client_config)
+        .await
+        .expect("connect mobile successor client");
+    let second_task = CollectionTask::new(vec![
+        TaskStep::Navigate {
+            url: fixture.url("/mobile-second"),
+        },
+        TaskStep::Evaluate {
+            script: "({layoutWidth: innerWidth, layoutHeight: innerHeight, screenWidth: screen.width, screenHeight: screen.height, dpr: devicePixelRatio, touch: navigator.maxTouchPoints, ua: navigator.userAgent, uaMobile: navigator.userAgentData && navigator.userAgentData.mobile, uaPlatform: navigator.userAgentData && navigator.userAgentData.platform, platform: navigator.platform, language: navigator.language, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, marker: localStorage.getItem('dig2browser_e2e')})".to_owned(),
+        },
+    ])
+    .expect("valid second mobile task");
+    let second_result = successor_client
+        .run_task_with_persona("mobile-durable-profile", persona, second_task)
+        .await
+        .expect("run successor mobile persona task");
+    let TaskReply::ScriptJson(second_fingerprint) = &second_result.replies()[1] else {
+        panic!("second mobile task did not return fingerprint JSON");
+    };
+    assert_mobile_fingerprint(second_fingerprint, true);
+
+    let mismatch_task = CollectionTask::new(vec![TaskStep::Navigate {
+        url: fixture.url("/persona-mismatch"),
+    }])
+    .expect("valid persona mismatch task");
+    assert!(matches!(
+        successor_client
+            .run_task_with_persona(
+                "mobile-durable-profile",
+                BrowserPersona::desktop_default(),
+                mismatch_task,
+            )
+            .await,
+        Err(ClientError::Remote {
+            status: ResponseStatus::Invalid,
+            ..
+        })
+    ));
+    let manifest = profiles
+        .join("mobile-durable-profile")
+        .join(".dig2browser-persona-v1");
+    let manifest_text = std::fs::read_to_string(manifest).expect("read persona manifest");
+    assert!(manifest_text.contains("kind=Mobile"));
+    assert!(!manifest_text.contains("persisted"));
+
+    successor_client
+        .shutdown()
+        .await
+        .expect("shutdown mobile successor");
+    let successor_exit = tokio::time::timeout(Duration::from_secs(30), successor.wait())
+        .await
+        .expect("mobile successor exit timeout")
+        .expect("wait for mobile successor");
+    assert!(successor_exit.success(), "mobile successor failed: {successor_exit}");
+    let (_, successor_stderr) = read_child_output(&mut successor).await;
+    assert!(
+        successor_stderr.is_empty(),
+        "mobile successor wrote stderr: {successor_stderr}"
+    );
+    remove_tree(&profiles).await;
+}
+
+fn assert_mobile_fingerprint(fingerprint: &str, marker_expected: bool) {
+    for expected in [
+        "\"screenWidth\":412",
+        "\"screenHeight\":915",
+        "\"dpr\":2.625",
+        "\"touch\":5",
+        "\"uaMobile\":true",
+        "\"uaPlatform\":\"Android\"",
+        "\"platform\":\"Android\"",
+        "\"language\":\"ru-RU\"",
+        "\"timezone\":\"Europe/Moscow\"",
+        "Android 14.0.0; Pixel 8",
+    ] {
+        assert!(
+            fingerprint.contains(expected),
+            "mobile fingerprint omitted {expected}: {fingerprint}"
+        );
+    }
+    assert_eq!(
+        fingerprint.contains("\"marker\":\"persisted\""),
+        marker_expected,
+        "unexpected durable marker state: {fingerprint}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

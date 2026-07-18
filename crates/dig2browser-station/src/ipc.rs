@@ -509,8 +509,26 @@ async fn run_task(
         }
     };
     let capabilities = task_capabilities(task);
-    let lease = match acquire_lease(station, &request.profile_id, capabilities).await {
+    let Some(persona) = request.persona.clone() else {
+        observation.failure(FailureClass::Protocol);
+        return failure(request, ResponseStatus::Invalid, "persona missing", started);
+    };
+    let identity = IdentityRequest::public_persona(&request.profile_id, persona);
+    let lease = match acquire_lease(station, identity, capabilities).await {
         Ok(lease) => lease,
+        Err(
+            error @ (StationError::PersonaMismatch
+            | StationError::PersonaBindingRequired
+            | StationError::InvalidPersona),
+        ) => {
+            observation.failure(station_error_class(&error, FailureClass::Protocol));
+            return failure(
+                request,
+                ResponseStatus::Invalid,
+                "persona contract rejected",
+                started,
+            );
+        }
         Err(error) => {
             observation.failure(station_error_class(&error, FailureClass::Unavailable));
             return failure(
@@ -825,27 +843,33 @@ async fn monitoring_lease(
     station: &BrowserStation,
     profile_id: &str,
 ) -> Result<BrowserLease, StationError> {
-    acquire_lease(station, profile_id, CapabilitySet::monitoring()).await
+    acquire_lease(
+        station,
+        IdentityRequest::public_desktop(profile_id),
+        CapabilitySet::monitoring(),
+    )
+    .await
 }
 
 async fn acquire_lease(
     station: &BrowserStation,
-    profile_id: &str,
+    identity: IdentityRequest,
     capabilities: CapabilitySet,
 ) -> Result<BrowserLease, StationError> {
     let deadline = tokio::time::Instant::now() + ACQUIRE_RETRY_WINDOW;
     loop {
         match station
-            .lease(
-                IdentityRequest::public_desktop(profile_id),
-                capabilities.clone(),
-            )
+            .lease(identity.clone(), capabilities.clone())
             .await
         {
             Ok(lease) => return Ok(lease),
             Err(error @ StationError::ShuttingDown)
             | Err(error @ StationError::CapabilityDenied)
-            | Err(error @ StationError::Identity(_)) => return Err(error),
+            | Err(error @ StationError::Identity(_))
+            | Err(error @ StationError::PersonaMismatch)
+            | Err(error @ StationError::PersonaBindingRequired)
+            | Err(error @ StationError::InvalidPersona)
+            | Err(error @ StationError::PersonaIo(_)) => return Err(error),
             Err(error) if tokio::time::Instant::now() >= deadline => return Err(error),
             Err(_) => tokio::time::sleep(ACQUIRE_RETRY_DELAY).await,
         }

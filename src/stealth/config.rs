@@ -48,6 +48,60 @@ impl LocaleProfile {
 /// binary actually launched. A non-empty value remains an explicit override.
 pub const DEFAULT_USER_AGENT: &str = "";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientHintsProfile {
+    platform: String,
+    platform_version: String,
+    architecture: String,
+    model: String,
+    mobile: bool,
+}
+
+impl ClientHintsProfile {
+    pub fn windows_desktop() -> Self {
+        Self {
+            platform: "Windows".to_owned(),
+            platform_version: "15.0.0".to_owned(),
+            architecture: "x86".to_owned(),
+            model: String::new(),
+            mobile: false,
+        }
+    }
+
+    pub fn android_mobile(
+        platform_version: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            platform: "Android".to_owned(),
+            platform_version: platform_version.into(),
+            architecture: String::new(),
+            model: model.into(),
+            mobile: true,
+        }
+    }
+
+    pub fn platform(&self) -> &str {
+        &self.platform
+    }
+
+    pub fn platform_version(&self) -> &str {
+        &self.platform_version
+    }
+
+    pub fn architecture(&self) -> &str {
+        &self.architecture
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn mobile(&self) -> bool {
+        self.mobile
+    }
+}
+
 /// Validated CSS-to-physical-pixel scale used by browser emulation.
 ///
 /// The bounded range covers normal desktop scaling and Chromium's supported
@@ -133,6 +187,7 @@ pub struct StealthConfig {
     /// User-Agent string to report via both HTTP headers and JS `navigator.userAgent`.
     /// CDP backend uses this with `Emulation.setUserAgentOverride`.
     pub user_agent: String,
+    pub client_hints: ClientHintsProfile,
 }
 
 impl Default for StealthConfig {
@@ -145,6 +200,7 @@ impl Default for StealthConfig {
             hardware_concurrency: 8,
             device_memory_gb: 8,
             user_agent: DEFAULT_USER_AGENT.to_owned(),
+            client_hints: ClientHintsProfile::windows_desktop(),
         }
     }
 }
@@ -199,7 +255,7 @@ impl StealthConfig {
         let full_version = detected_version.map(str::to_owned);
         let user_agent = full_version
             .as_deref()
-            .map(|version| automatic_user_agent(kind, version))
+            .map(|version| automatic_user_agent(kind, version, &self.client_hints))
             .unwrap_or_default();
         UserAgentProfile {
             user_agent,
@@ -227,11 +283,24 @@ impl StealthConfig {
     }
 }
 
-fn automatic_user_agent(kind: BrowserKind, version: &str) -> String {
-    let base = format!(
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
-         AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{version} Safari/537.36"
-    );
+fn automatic_user_agent(
+    kind: BrowserKind,
+    version: &str,
+    client_hints: &ClientHintsProfile,
+) -> String {
+    let base = if client_hints.mobile() {
+        format!(
+            "Mozilla/5.0 (Linux; Android {}; {}) \
+             AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{version} Mobile Safari/537.36",
+            client_hints.platform_version(),
+            client_hints.model(),
+        )
+    } else {
+        format!(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+             AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{version} Safari/537.36"
+        )
+    };
     match kind {
         BrowserKind::Edge => format!("{base} Edg/{version}"),
         _ => base,

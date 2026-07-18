@@ -13,12 +13,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use dig2browser::agentic::{
     AgentCommand, AgentReply, BrowserSnapshot, BrowserWorker, BrowserWorkerConfig,
     Capability, CapabilitySet, CaptureArtifact, CapturePolicy, ElementRef, L1Capability,
-    L2Capability, L3Capability, WorkerError, WorkerLifecycle,
+    L2Capability, L3Capability, MobileLayout, RuntimeFailureKind, WorkerError,
+    WorkerLifecycle,
 };
 use dig2browser::identity::{
     BrowserBackend, DevicePersona, IdentityClass, IdentityError, IdentityProfile,
     ProfileOwnershipGuard,
 };
+use dig2browser::stealth::{ClientHintsProfile, LocaleProfile};
+use dig2browser_protocol::{BrowserPersona, PersonaKind};
 use tokio::sync::{Mutex, RwLock, Semaphore};
 
 pub mod ipc;
@@ -128,6 +131,7 @@ pub struct IdentityRequest {
     class: IdentityClass,
     backend: BrowserBackend,
     device: DevicePersona,
+    persona: BrowserPersona,
 }
 
 impl IdentityRequest {
@@ -137,11 +141,35 @@ impl IdentityRequest {
         backend: BrowserBackend,
         device: DevicePersona,
     ) -> Self {
+        let persona = match device {
+            DevicePersona::DesktopNative => BrowserPersona::desktop_default(),
+            DevicePersona::MobileLayout => BrowserPersona::mobile_default(),
+        };
         Self {
             id: id.into(),
             class,
             backend,
             device,
+            persona,
+        }
+    }
+
+    pub fn with_persona(
+        id: impl Into<String>,
+        class: IdentityClass,
+        backend: BrowserBackend,
+        persona: BrowserPersona,
+    ) -> Self {
+        let device = match persona.kind() {
+            PersonaKind::Desktop => DevicePersona::DesktopNative,
+            PersonaKind::Mobile => DevicePersona::MobileLayout,
+        };
+        Self {
+            id: id.into(),
+            class,
+            backend,
+            device,
+            persona,
         }
     }
 
@@ -154,8 +182,16 @@ impl IdentityRequest {
         )
     }
 
+    pub fn public_persona(id: impl Into<String>, persona: BrowserPersona) -> Self {
+        Self::with_persona(id, IdentityClass::Public, BrowserBackend::Chromium, persona)
+    }
+
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    pub fn persona(&self) -> &BrowserPersona {
+        &self.persona
     }
 }
 
@@ -229,6 +265,108 @@ pub struct BrowserTaskStepMetrics {
     pub duration_ms: u64,
 }
 
+const PERSONA_MANIFEST: &str = ".dig2browser-persona-v1";
+
+fn apply_persona(
+    worker: &mut BrowserWorkerConfig,
+    persona: &BrowserPersona,
+) -> Result<(), StationError> {
+    worker.stealth.viewport = (u32::from(persona.width()), u32::from(persona.height()));
+    worker
+        .stealth
+        .set_device_scale_factor(persona.device_scale_factor())
+        .map_err(|_| StationError::InvalidPersona)?;
+    worker.stealth.locale = LocaleProfile {
+        locale: persona.locale().to_owned(),
+        timezone: persona.timezone().map(str::to_owned),
+    };
+    worker.stealth.client_hints = match persona.kind() {
+        PersonaKind::Desktop => ClientHintsProfile::windows_desktop(),
+        PersonaKind::Mobile => ClientHintsProfile::android_mobile(
+            persona.platform_version(),
+            persona.model(),
+        ),
+    };
+    worker.launch.window_size = worker.stealth.viewport;
+    worker.mobile_layout = match persona.kind() {
+        PersonaKind::Desktop => None,
+        PersonaKind::Mobile => Some(
+            MobileLayout::new(
+                u32::from(persona.width()),
+                u32::from(persona.height()),
+                persona.device_scale_factor(),
+                persona.max_touch_points(),
+            )
+            .map_err(|_| StationError::InvalidPersona)?,
+        ),
+    };
+    Ok(())
+}
+
+fn bind_persona_contract(
+    profile: &IdentityProfile,
+    persona: &BrowserPersona,
+) -> Result<(), StationError> {
+    std::fs::create_dir_all(profile.profile_dir()).map_err(StationError::PersonaIo)?;
+    let _owner = ProfileOwnershipGuard::acquire(profile.profile_dir())?;
+    let manifest = profile.profile_dir().join(PERSONA_MANIFEST);
+    let expected = persona_contract(persona);
+    match std::fs::read_to_string(&manifest) {
+        Ok(current) if current == expected => return Ok(()),
+        Ok(_) => return Err(StationError::PersonaMismatch),
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(StationError::PersonaIo(error))
+        }
+        Err(_) => {}
+    }
+    let has_existing_state = std::fs::read_dir(profile.profile_dir())
+        .map_err(StationError::PersonaIo)?
+        .filter_map(Result::ok)
+        .any(|entry| {
+            let name = entry.file_name();
+            name != PERSONA_MANIFEST && name != ".dig2browser-profile.lock"
+        });
+    if has_existing_state && persona != &BrowserPersona::desktop_default() {
+        return Err(StationError::PersonaBindingRequired);
+    }
+    let temporary = profile.profile_dir().join(format!(
+        "{PERSONA_MANIFEST}.tmp-{}",
+        std::process::id()
+    ));
+    std::fs::write(&temporary, expected.as_bytes()).map_err(StationError::PersonaIo)?;
+    match std::fs::rename(&temporary, &manifest) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            match std::fs::read_to_string(&manifest) {
+                Ok(current) if current == expected => Ok(()),
+                Ok(_) => Err(StationError::PersonaMismatch),
+                Err(_) => Err(StationError::PersonaIo(error)),
+            }
+        }
+    }
+}
+
+fn persona_contract(persona: &BrowserPersona) -> String {
+    let timezone = persona.timezone().unwrap_or_default();
+    format!(
+        "v1|kind={:?}|viewport={}x{}|dpr={}|touch={}|locale={}:{}|timezone={}:{}|platform={}:{}|model={}:{}",
+        persona.kind(),
+        persona.width(),
+        persona.height(),
+        persona.device_scale_milli(),
+        persona.max_touch_points(),
+        persona.locale().len(),
+        persona.locale(),
+        timezone.len(),
+        timezone,
+        persona.platform_version().len(),
+        persona.platform_version(),
+        persona.model().len(),
+        persona.model(),
+    )
+}
+
 struct Slot {
     worker: BrowserWorker,
     session_gate: Mutex<()>,
@@ -295,6 +433,13 @@ impl BrowserStation {
             return Err(StationError::ShuttingDown);
         }
         let now = self.inner.clock.fetch_add(1, Ordering::AcqRel) + 1;
+        if state
+            .slots
+            .keys()
+            .any(|existing| existing.id == identity.id && existing != &identity)
+        {
+            return Err(StationError::PersonaMismatch);
+        }
         if let Some(slot) = state.slots.get(&identity).cloned() {
             let ready = match slot.worker.snapshot().lifecycle {
                 WorkerLifecycle::Ready => true,
@@ -343,10 +488,13 @@ impl BrowserStation {
             identity.backend,
             identity.device,
         )?;
+        bind_persona_contract(&profile, identity.persona())?;
+        let mut worker_config = self.inner.config.worker.clone();
+        apply_persona(&mut worker_config, identity.persona())?;
         let worker = BrowserWorker::spawn(
             profile,
             self.inner.config.worker_capabilities.clone(),
-            self.inner.config.worker.clone(),
+            worker_config,
         )?;
         let snapshot = worker.wait_until_settled().await?;
         let ready = match snapshot.lifecycle {
@@ -572,13 +720,36 @@ impl BrowserLease {
         let mut step_metrics = Vec::with_capacity(task.steps().len());
         for (index, step) in task.steps().iter().enumerate() {
             let started = Instant::now();
-            let reply = self
-                .execute_task_step(step)
-                .await
-                .map_err(|source| StationError::TaskStepFailed {
-                    index,
-                    source: Box::new(source),
-                })?;
+            let first_attempt = self.execute_task_step(step).await;
+            let reply = match first_attempt {
+                Ok(reply) => reply,
+                Err(error)
+                    if index == 0
+                        && matches!(step, BrowserTaskStep::Navigate { .. })
+                        && is_navigation_error(&error) =>
+                {
+                    self.slot
+                        .worker
+                        .execute(AgentCommand::Restart)
+                        .await
+                        .map_err(|source| StationError::TaskStepFailed {
+                            index,
+                            source: Box::new(StationError::from(source)),
+                        })?;
+                    self.execute_task_step(step)
+                        .await
+                        .map_err(|source| StationError::TaskStepFailed {
+                            index,
+                            source: Box::new(source),
+                        })?
+                }
+                Err(source) => {
+                    return Err(StationError::TaskStepFailed {
+                        index,
+                        source: Box::new(source),
+                    })
+                }
+            };
             replies.push(reply);
             step_metrics.push(BrowserTaskStepMetrics {
                 completed_at_unix_ms: unix_time_ms(),
@@ -735,6 +906,14 @@ fn unix_time_ms() -> u64 {
         .unwrap_or(0)
 }
 
+fn is_navigation_error(error: &StationError) -> bool {
+    matches!(
+        error,
+        StationError::Worker(WorkerError::Runtime(runtime))
+            if runtime.kind() == RuntimeFailureKind::Navigation
+    )
+}
+
 struct CommandWaiter<'a> {
     count: &'a AtomicUsize,
 }
@@ -845,6 +1024,14 @@ pub enum StationError {
     AtCapacity,
     #[error("browser worker did not become ready")]
     WorkerUnavailable,
+    #[error("browser profile is bound to a different persona")]
+    PersonaMismatch,
+    #[error("existing profile must be bound as desktop before persona migration")]
+    PersonaBindingRequired,
+    #[error("browser persona is invalid")]
+    InvalidPersona,
+    #[error("browser persona manifest I/O failed")]
+    PersonaIo(#[source] std::io::Error),
     #[error("browser worker returned an invalid reply")]
     InvalidWorkerReply,
     #[error("browser task step {index} failed")]
