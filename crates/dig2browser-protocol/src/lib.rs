@@ -5,9 +5,13 @@ use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 mod identity;
+mod session;
 mod task;
 
 pub use identity::{BrowserPersona, MobilePersonaConfig, PersonaKind};
+pub use session::{
+    IdentitySessionStatus, ProfileClass, SessionPhase, SessionStateUpdate,
+};
 
 pub use task::{
     CaptureCompleteness, CollectionTask, CollectionTaskResult, EvidenceCapture,
@@ -33,7 +37,7 @@ const STATUS_SCHEMA_VERSION: u16 = 1;
 const STATUS_FIELDS: usize = 22;
 const STATUS_PAYLOAD_BYTES: usize = 8 + STATUS_FIELDS * 8;
 const TASK_IDENTITY_MAGIC: [u8; 4] = *b"D2TI";
-const TASK_IDENTITY_SCHEMA_VERSION: u16 = 1;
+const TASK_IDENTITY_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -43,6 +47,8 @@ pub enum RequestKind {
     Shutdown = 3,
     Status = 4,
     Task = 5,
+    IdentityStatus = 6,
+    UpdateIdentityState = 7,
 }
 
 impl RequestKind {
@@ -53,6 +59,8 @@ impl RequestKind {
             3 => Ok(Self::Shutdown),
             4 => Ok(Self::Status),
             5 => Ok(Self::Task),
+            6 => Ok(Self::IdentityStatus),
+            7 => Ok(Self::UpdateIdentityState),
             _ => Err(ProtocolError::InvalidRequest),
         }
     }
@@ -66,6 +74,8 @@ pub struct WorkerRequest {
     pub url: String,
     pub task: Option<CollectionTask>,
     pub persona: Option<BrowserPersona>,
+    pub profile_class: Option<ProfileClass>,
+    pub session_update: Option<SessionStateUpdate>,
 }
 
 impl WorkerRequest {
@@ -77,6 +87,8 @@ impl WorkerRequest {
             url: url.into(),
             task: None,
             persona: None,
+            profile_class: None,
+            session_update: None,
         }
     }
 
@@ -99,6 +111,22 @@ impl WorkerRequest {
         persona: BrowserPersona,
         task: CollectionTask,
     ) -> Self {
+        Self::task_with_identity(
+            request_id,
+            profile_id,
+            ProfileClass::Public,
+            persona,
+            task,
+        )
+    }
+
+    pub fn task_with_identity(
+        request_id: u64,
+        profile_id: impl Into<String>,
+        profile_class: ProfileClass,
+        persona: BrowserPersona,
+        task: CollectionTask,
+    ) -> Self {
         Self {
             kind: RequestKind::Task,
             request_id,
@@ -106,6 +134,38 @@ impl WorkerRequest {
             url: String::new(),
             task: Some(task),
             persona: Some(persona),
+            profile_class: Some(profile_class),
+            session_update: None,
+        }
+    }
+
+    pub fn identity_status(request_id: u64, profile_id: impl Into<String>) -> Self {
+        Self {
+            kind: RequestKind::IdentityStatus,
+            request_id,
+            profile_id: profile_id.into(),
+            url: String::new(),
+            task: None,
+            persona: None,
+            profile_class: None,
+            session_update: None,
+        }
+    }
+
+    pub fn update_identity_state(
+        request_id: u64,
+        profile_id: impl Into<String>,
+        update: SessionStateUpdate,
+    ) -> Self {
+        Self {
+            kind: RequestKind::UpdateIdentityState,
+            request_id,
+            profile_id: profile_id.into(),
+            url: String::new(),
+            task: None,
+            persona: None,
+            profile_class: None,
+            session_update: Some(update),
         }
     }
 
@@ -129,6 +189,8 @@ impl WorkerRequest {
             url: String::new(),
             task: None,
             persona: None,
+            profile_class: None,
+            session_update: None,
         }
     }
 
@@ -138,6 +200,8 @@ impl WorkerRequest {
             .map_err(|_| ProtocolError::InvalidRequest)?;
         let task_payload = if self.kind == RequestKind::Task {
             Some(encode_task_identity_payload(
+                self.profile_class
+                    .ok_or(ProtocolError::InvalidRequest)?,
                 self.persona
                     .as_ref()
                     .ok_or(ProtocolError::InvalidRequest)?,
@@ -148,7 +212,20 @@ impl WorkerRequest {
         } else {
             None
         };
-        let body = task_payload.as_deref().unwrap_or(self.url.as_bytes());
+        let session_payload = if self.kind == RequestKind::UpdateIdentityState {
+            Some(
+                self.session_update
+                    .as_ref()
+                    .ok_or(ProtocolError::InvalidRequest)?
+                    .encode()?,
+            )
+        } else {
+            None
+        };
+        let body = task_payload
+            .as_deref()
+            .or(session_payload.as_deref())
+            .unwrap_or(self.url.as_bytes());
         let url_len = u32::try_from(body.len()).map_err(|_| ProtocolError::InvalidRequest)?;
         let total = REQUEST_HEADER_BYTES
             .checked_add(self.profile_id.len())
@@ -175,7 +252,11 @@ impl WorkerRequest {
             RequestKind::Capture => {
                 validate_profile_id(&self.profile_id)?;
                 validate_http_url(&self.url)?;
-                if self.task.is_none() && self.persona.is_none() {
+                if self.task.is_none()
+                    && self.persona.is_none()
+                    && self.profile_class.is_none()
+                    && self.session_update.is_none()
+                {
                     Ok(())
                 } else {
                     Err(ProtocolError::InvalidRequest)
@@ -193,13 +274,48 @@ impl WorkerRequest {
                 self.persona
                     .as_ref()
                     .ok_or(ProtocolError::InvalidRequest)?
-                    .validate()
+                    .validate()?;
+                if self.profile_class.is_none() || self.session_update.is_some() {
+                    Err(ProtocolError::InvalidRequest)
+                } else {
+                    Ok(())
+                }
+            }
+            RequestKind::IdentityStatus => {
+                validate_profile_id(&self.profile_id)?;
+                if self.url.is_empty()
+                    && self.task.is_none()
+                    && self.persona.is_none()
+                    && self.profile_class.is_none()
+                    && self.session_update.is_none()
+                {
+                    Ok(())
+                } else {
+                    Err(ProtocolError::InvalidRequest)
+                }
+            }
+            RequestKind::UpdateIdentityState => {
+                validate_profile_id(&self.profile_id)?;
+                if self.url.is_empty()
+                    && self.task.is_none()
+                    && self.persona.is_none()
+                    && self.profile_class.is_none()
+                {
+                    self.session_update
+                        .as_ref()
+                        .ok_or(ProtocolError::InvalidRequest)?
+                        .validate()
+                } else {
+                    Err(ProtocolError::InvalidRequest)
+                }
             }
             RequestKind::Health | RequestKind::Shutdown | RequestKind::Status => {
                 if self.profile_id.is_empty()
                     && self.url.is_empty()
                     && self.task.is_none()
                     && self.persona.is_none()
+                    && self.profile_class.is_none()
+                    && self.session_update.is_none()
                 {
                     Ok(())
                 } else {
@@ -413,6 +529,16 @@ impl WorkerResponse {
         response
     }
 
+    pub fn identity_status(
+        request: &WorkerRequest,
+        status: &IdentitySessionStatus,
+    ) -> Result<Self, ProtocolError> {
+        let mut response = Self::empty(request, ResponseStatus::Ok);
+        response.html = status.encode()?;
+        response.validate()?;
+        Ok(response)
+    }
+
     pub fn task_result(
         request: &WorkerRequest,
         result: &CollectionTaskResult,
@@ -451,6 +577,20 @@ impl WorkerResponse {
         StationStatus::decode(&self.html)
     }
 
+    pub fn decode_identity_status(&self) -> Result<IdentitySessionStatus, ProtocolError> {
+        if self.kind != RequestKind::IdentityStatus
+            || self.status != ResponseStatus::Ok
+            || self.http_status.is_some()
+            || !self.final_url.is_empty()
+            || !self.title.is_empty()
+            || !self.error.is_empty()
+            || !self.png.is_empty()
+        {
+            return Err(ProtocolError::InvalidSessionPayload);
+        }
+        IdentitySessionStatus::decode(&self.html)
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
         self.validate()?;
         let capacity = RESPONSE_HEADER_BYTES
@@ -485,6 +625,9 @@ impl WorkerResponse {
         if self.kind == RequestKind::Task && self.status == ResponseStatus::Ok {
             self.decode_task_result()?;
         }
+        if self.kind == RequestKind::IdentityStatus && self.status == ResponseStatus::Ok {
+            self.decode_identity_status()?;
+        }
         Ok(())
     }
 }
@@ -514,6 +657,7 @@ where
 }
 
 fn encode_task_identity_payload(
+    profile_class: ProfileClass,
     persona: &BrowserPersona,
     task: &CollectionTask,
 ) -> Result<Vec<u8>, ProtocolError> {
@@ -521,10 +665,12 @@ fn encode_task_identity_payload(
     let task = task.encode_payload()?;
     let persona_len = u16::try_from(persona.len())
         .map_err(|_| ProtocolError::InvalidIdentityPayload)?;
-    let mut payload = Vec::with_capacity(8 + persona.len() + task.len());
+    let mut payload = Vec::with_capacity(10 + persona.len() + task.len());
     payload.extend_from_slice(&TASK_IDENTITY_MAGIC);
     payload.extend_from_slice(&TASK_IDENTITY_SCHEMA_VERSION.to_le_bytes());
     payload.extend_from_slice(&persona_len.to_le_bytes());
+    payload.push(profile_class as u8);
+    payload.push(0);
     payload.extend_from_slice(&persona);
     payload.extend_from_slice(&task);
     Ok(payload)
@@ -532,33 +678,42 @@ fn encode_task_identity_payload(
 
 fn decode_task_identity_payload(
     payload: &[u8],
-) -> Result<(BrowserPersona, CollectionTask), ProtocolError> {
+) -> Result<(ProfileClass, BrowserPersona, CollectionTask), ProtocolError> {
     if payload.starts_with(b"D2TK") {
         return Ok((
+            ProfileClass::Public,
             BrowserPersona::desktop_default(),
             CollectionTask::decode_payload(payload)?,
         ));
     }
-    if payload.len() < 8
-        || payload[..4] != TASK_IDENTITY_MAGIC
-        || u16::from_le_bytes(payload[4..6].try_into().unwrap())
-            != TASK_IDENTITY_SCHEMA_VERSION
-    {
+    if payload.len() < 8 || payload[..4] != TASK_IDENTITY_MAGIC {
+        return Err(ProtocolError::InvalidIdentityPayload);
+    }
+    let schema = u16::from_le_bytes(payload[4..6].try_into().unwrap());
+    if !matches!(schema, 1 | TASK_IDENTITY_SCHEMA_VERSION) {
         return Err(ProtocolError::InvalidIdentityPayload);
     }
     let persona_len = usize::from(u16::from_le_bytes(payload[6..8].try_into().unwrap()));
-    let persona_end = 8usize
+    let (profile_class, persona_offset) = if schema == 1 {
+        (ProfileClass::Public, 8usize)
+    } else {
+        if payload.len() < 10 || payload[9] != 0 {
+            return Err(ProtocolError::InvalidIdentityPayload);
+        }
+        (ProfileClass::from_wire(payload[8])?, 10usize)
+    };
+    let persona_end = persona_offset
         .checked_add(persona_len)
         .ok_or(ProtocolError::InvalidIdentityPayload)?;
     if persona_end >= payload.len() {
         return Err(ProtocolError::InvalidIdentityPayload);
     }
-    let (persona, consumed) = BrowserPersona::decode(&payload[8..persona_end])?;
+    let (persona, consumed) = BrowserPersona::decode(&payload[persona_offset..persona_end])?;
     if consumed != persona_len {
         return Err(ProtocolError::InvalidIdentityPayload);
     }
     let task = CollectionTask::decode_payload(&payload[persona_end..])?;
-    Ok((persona, task))
+    Ok((profile_class, persona, task))
 }
 
 pub async fn read_worker_request<R>(
@@ -596,14 +751,30 @@ where
         .map_err(|_| FrameError::Protocol(ProtocolError::InvalidRequest))?
         .to_owned();
     let body = &payload[profile_len..];
-    let (url, task, persona) = if kind == RequestKind::Task {
-        let (persona, task) = decode_task_identity_payload(body)?;
-        (String::new(), Some(task), Some(persona))
+    let (url, task, persona, profile_class, session_update) = if kind == RequestKind::Task {
+        let (profile_class, persona, task) = decode_task_identity_payload(body)?;
+        (
+            String::new(),
+            Some(task),
+            Some(persona),
+            Some(profile_class),
+            None,
+        )
+    } else if kind == RequestKind::UpdateIdentityState {
+        (
+            String::new(),
+            None,
+            None,
+            None,
+            Some(SessionStateUpdate::decode(body)?),
+        )
     } else {
         (
             std::str::from_utf8(body)
                 .map_err(|_| FrameError::Protocol(ProtocolError::InvalidRequest))?
                 .to_owned(),
+            None,
+            None,
             None,
             None,
         )
@@ -615,6 +786,8 @@ where
         url,
         task,
         persona,
+        profile_class,
+        session_update,
     };
     request.validate()?;
     Ok(Some(request))
@@ -785,6 +958,7 @@ pub enum ProtocolError {
     InvalidTaskPayload,
     InvalidTaskResult,
     InvalidIdentityPayload,
+    InvalidSessionPayload,
 }
 
 impl std::fmt::Display for ProtocolError {
@@ -797,6 +971,9 @@ impl std::fmt::Display for ProtocolError {
             Self::InvalidTaskResult => write!(formatter, "browser task result is invalid"),
             Self::InvalidIdentityPayload => {
                 write!(formatter, "browser identity payload is invalid")
+            }
+            Self::InvalidSessionPayload => {
+                write!(formatter, "browser session payload is invalid")
             }
         }
     }
@@ -911,5 +1088,47 @@ mod tests {
         assert!(response.title.is_empty());
         assert!(response.error.is_empty());
         assert!(response.png.is_empty());
+    }
+
+    #[tokio::test]
+    async fn authenticated_task_and_session_requests_round_trip() {
+        let task = CollectionTask::new(vec![TaskStep::Navigate {
+            url: "https://example.test/".to_owned(),
+        }])
+        .unwrap();
+        let request = WorkerRequest::task_with_identity(
+            81,
+            "authenticated-profile",
+            ProfileClass::Authenticated,
+            BrowserPersona::mobile_default(),
+            task,
+        );
+        let encoded = request.encode().unwrap();
+        let mut reader = encoded.as_slice();
+        assert_eq!(read_worker_request(&mut reader).await.unwrap().unwrap(), request);
+
+        let update = WorkerRequest::update_identity_state(
+            82,
+            "authenticated-profile",
+            SessionStateUpdate {
+                phase: SessionPhase::Ready,
+                expires_at_unix_ms: Some(1_800_000_000_000),
+            },
+        );
+        let encoded = update.encode().unwrap();
+        let mut reader = encoded.as_slice();
+        assert_eq!(read_worker_request(&mut reader).await.unwrap().unwrap(), update);
+
+        let status_request = WorkerRequest::identity_status(83, "authenticated-profile");
+        let status = IdentitySessionStatus {
+            profile_exists: true,
+            persona_bound: true,
+            profile_class: Some(ProfileClass::Authenticated),
+            phase: SessionPhase::ReauthRequired,
+            updated_at_unix_ms: 1_700_000_000_000,
+            expires_at_unix_ms: None,
+        };
+        let response = WorkerResponse::identity_status(&status_request, &status).unwrap();
+        assert_eq!(response.decode_identity_status().unwrap(), status);
     }
 }

@@ -11,8 +11,9 @@ use dig2browser::agentic::{
 use dig2browser_protocol::{
     read_worker_request, validate_pipe_suffix, write_worker_response,
     CaptureCompleteness, CollectionTask, CollectionTaskResult, EvidenceCapture,
-    FailureClass, RequestKind, ResponseStatus, StationStatus, TaskCapturePolicy,
-    TaskReply, TaskStep, WorkerRequest, WorkerResponse, PROTOCOL_VERSION,
+    FailureClass, ProfileClass, RequestKind, ResponseStatus, StationStatus,
+    TaskCapturePolicy, TaskReply, TaskStep, WorkerRequest, WorkerResponse,
+    PROTOCOL_VERSION,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
@@ -172,6 +173,8 @@ pub struct ServerConfig {
     allow_remote_shutdown: bool,
     allow_interactive_tasks: bool,
     allow_scripted_tasks: bool,
+    allow_identity_status: bool,
+    allow_session_state_updates: bool,
 }
 
 impl ServerConfig {
@@ -197,6 +200,8 @@ impl ServerConfig {
             allow_remote_shutdown: false,
             allow_interactive_tasks: false,
             allow_scripted_tasks: false,
+            allow_identity_status: false,
+            allow_session_state_updates: false,
         })
     }
 
@@ -212,6 +217,16 @@ impl ServerConfig {
 
     pub fn allow_scripted_tasks(mut self, allow: bool) -> Self {
         self.allow_scripted_tasks = allow;
+        self
+    }
+
+    pub fn allow_session_state_updates(mut self, allow: bool) -> Self {
+        self.allow_session_state_updates = allow;
+        self
+    }
+
+    pub fn allow_identity_status(mut self, allow: bool) -> Self {
+        self.allow_identity_status = allow;
         self
     }
 
@@ -332,6 +347,8 @@ async fn run_windows_server(
                 let task_permissions = TaskPermissions {
                     interaction: config.allow_interactive_tasks,
                     script: config.allow_scripted_tasks,
+                    identity_status: config.allow_identity_status,
+                    session_updates: config.allow_session_state_updates,
                 };
                 connections.spawn(async move {
                     serve_connection(
@@ -448,6 +465,22 @@ async fn serve_connection(
                 let fleet = station.fleet_status().await;
                 WorkerResponse::station_status(&request, &telemetry.status(fleet))
             }
+            RequestKind::IdentityStatus if task_permissions.identity_status => {
+                identity_status(&station, &request).await
+            }
+            RequestKind::IdentityStatus => WorkerResponse::failure(
+                &request,
+                ResponseStatus::Invalid,
+                "identity status disabled",
+            ),
+            RequestKind::UpdateIdentityState if task_permissions.session_updates => {
+                update_identity_state(&station, &request).await
+            }
+            RequestKind::UpdateIdentityState => WorkerResponse::failure(
+                &request,
+                ResponseStatus::Invalid,
+                "session state updates disabled",
+            ),
             RequestKind::Shutdown if allow_remote_shutdown => {
                 WorkerResponse::empty(&request, ResponseStatus::Ok)
             }
@@ -469,6 +502,66 @@ async fn serve_connection(
 struct TaskPermissions {
     interaction: bool,
     script: bool,
+    identity_status: bool,
+    session_updates: bool,
+}
+
+async fn identity_status(
+    station: &BrowserStation,
+    request: &WorkerRequest,
+) -> WorkerResponse {
+    match station.identity_session_status(&request.profile_id).await {
+        Ok(status) => WorkerResponse::identity_status(request, &status).unwrap_or_else(|_| {
+            WorkerResponse::failure(
+                request,
+                ResponseStatus::Protocol,
+                "identity status invalid",
+            )
+        }),
+        Err(StationError::Identity(_)) => WorkerResponse::failure(
+            request,
+            ResponseStatus::Invalid,
+            "invalid profile",
+        ),
+        Err(_) => WorkerResponse::failure(
+            request,
+            ResponseStatus::Unavailable,
+            "identity status unavailable",
+        ),
+    }
+}
+
+async fn update_identity_state(
+    station: &BrowserStation,
+    request: &WorkerRequest,
+) -> WorkerResponse {
+    let Some(update) = request.session_update else {
+        return WorkerResponse::failure(
+            request,
+            ResponseStatus::Invalid,
+            "session state missing",
+        );
+    };
+    match station
+        .update_identity_session(&request.profile_id, update)
+        .await
+    {
+        Ok(()) => WorkerResponse::empty(request, ResponseStatus::Ok),
+        Err(
+            StationError::Identity(_)
+            | StationError::AuthenticatedProfileRequired
+            | StationError::InvalidSessionState,
+        ) => WorkerResponse::failure(
+            request,
+            ResponseStatus::Invalid,
+            "session state rejected",
+        ),
+        Err(_) => WorkerResponse::failure(
+            request,
+            ResponseStatus::Unavailable,
+            "session state unavailable",
+        ),
+    }
 }
 
 async fn run_task(
@@ -513,12 +606,30 @@ async fn run_task(
         observation.failure(FailureClass::Protocol);
         return failure(request, ResponseStatus::Invalid, "persona missing", started);
     };
-    let identity = IdentityRequest::public_persona(&request.profile_id, persona);
+    let identity = match request.profile_class {
+        Some(ProfileClass::Public) => {
+            IdentityRequest::public_persona(&request.profile_id, persona)
+        }
+        Some(ProfileClass::Authenticated) => {
+            IdentityRequest::authenticated_persona(&request.profile_id, persona)
+        }
+        None => {
+            observation.failure(FailureClass::Protocol);
+            return failure(
+                request,
+                ResponseStatus::Invalid,
+                "profile class missing",
+                started,
+            );
+        }
+    };
     let lease = match acquire_lease(station, identity, capabilities).await {
         Ok(lease) => lease,
         Err(
             error @ (StationError::PersonaMismatch
             | StationError::PersonaBindingRequired
+            | StationError::IdentityClassMismatch
+            | StationError::IdentityClassBindingRequired
             | StationError::InvalidPersona),
         ) => {
             observation.failure(station_error_class(&error, FailureClass::Protocol));
@@ -868,6 +979,8 @@ async fn acquire_lease(
             | Err(error @ StationError::Identity(_))
             | Err(error @ StationError::PersonaMismatch)
             | Err(error @ StationError::PersonaBindingRequired)
+            | Err(error @ StationError::IdentityClassMismatch)
+            | Err(error @ StationError::IdentityClassBindingRequired)
             | Err(error @ StationError::InvalidPersona)
             | Err(error @ StationError::PersonaIo(_)) => return Err(error),
             Err(error) if tokio::time::Instant::now() >= deadline => return Err(error),

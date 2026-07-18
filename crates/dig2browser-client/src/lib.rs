@@ -11,8 +11,9 @@ use tokio::sync::Mutex;
 
 pub use dig2browser_protocol::{
     BrowserPersona, CaptureCompleteness, CollectionTask, CollectionTaskResult,
-    EvidenceCapture, FailureClass, MobilePersonaConfig, PersonaKind,
-    ResponseStatus, StationStatus, TaskCapturePolicy, TaskReply, TaskStep,
+    EvidenceCapture, FailureClass, IdentitySessionStatus, MobilePersonaConfig,
+    PersonaKind, ProfileClass, ResponseStatus, SessionPhase,
+    SessionStateUpdate, StationStatus, TaskCapturePolicy, TaskReply, TaskStep,
     DEFAULT_STATION_PIPE,
 };
 
@@ -158,6 +159,53 @@ impl StationClient {
         response
             .decode_task_result()
             .map_err(|_| ClientError::InvalidResponse)
+    }
+
+    pub async fn run_task_with_identity(
+        &self,
+        profile_id: impl Into<String>,
+        profile_class: ProfileClass,
+        persona: BrowserPersona,
+        task: CollectionTask,
+    ) -> Result<CollectionTaskResult, ClientError> {
+        let request = WorkerRequest::task_with_identity(
+            self.take_request_id(),
+            profile_id,
+            profile_class,
+            persona,
+            task,
+        );
+        let response = self.call(request).await?;
+        require_ok(&response)?;
+        response
+            .decode_task_result()
+            .map_err(|_| ClientError::InvalidResponse)
+    }
+
+    pub async fn identity_status(
+        &self,
+        profile_id: impl Into<String>,
+    ) -> Result<IdentitySessionStatus, ClientError> {
+        let request = WorkerRequest::identity_status(self.take_request_id(), profile_id);
+        let response = self.call(request).await?;
+        require_ok(&response)?;
+        response
+            .decode_identity_status()
+            .map_err(|_| ClientError::InvalidResponse)
+    }
+
+    pub async fn update_identity_state(
+        &self,
+        profile_id: impl Into<String>,
+        update: SessionStateUpdate,
+    ) -> Result<(), ClientError> {
+        let request = WorkerRequest::update_identity_state(
+            self.take_request_id(),
+            profile_id,
+            update,
+        );
+        let response = self.call(request).await?;
+        require_ok(&response)
     }
 
     /// Capture while periodically yielding control to the caller for lease
@@ -331,6 +379,37 @@ impl BlockingStationClient {
         )
     }
 
+    pub fn run_task_with_identity(
+        &self,
+        profile_id: impl Into<String>,
+        profile_class: ProfileClass,
+        persona: BrowserPersona,
+        task: CollectionTask,
+    ) -> Result<CollectionTaskResult, ClientError> {
+        self.runtime.block_on(self.client.run_task_with_identity(
+            profile_id,
+            profile_class,
+            persona,
+            task,
+        ))
+    }
+
+    pub fn identity_status(
+        &self,
+        profile_id: impl Into<String>,
+    ) -> Result<IdentitySessionStatus, ClientError> {
+        self.runtime.block_on(self.client.identity_status(profile_id))
+    }
+
+    pub fn update_identity_state(
+        &self,
+        profile_id: impl Into<String>,
+        update: SessionStateUpdate,
+    ) -> Result<(), ClientError> {
+        self.runtime
+            .block_on(self.client.update_identity_state(profile_id, update))
+    }
+
     pub fn capture_with_progress<E, F>(
         &self,
         profile_id: impl Into<String>,
@@ -469,5 +548,7 @@ mod tests {
         assert_eq!(RequestKind::Shutdown as u8, 3);
         assert_eq!(RequestKind::Status as u8, 4);
         assert_eq!(RequestKind::Task as u8, 5);
+        assert_eq!(RequestKind::IdentityStatus as u8, 6);
+        assert_eq!(RequestKind::UpdateIdentityState as u8, 7);
     }
 }

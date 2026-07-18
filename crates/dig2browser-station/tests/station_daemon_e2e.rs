@@ -7,12 +7,13 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dig2browser::identity::ProfileOwnershipGuard;
 use dig2browser_client::{
     BrowserPersona, ClientConfig, ClientError, CollectionTask, FailureClass,
-    MobilePersonaConfig, ResponseStatus, StationClient, StationStatus,
+    IdentitySessionStatus, MobilePersonaConfig, ProfileClass, ResponseStatus,
+    SessionPhase, SessionStateUpdate, StationClient, StationStatus,
     TaskCapturePolicy, TaskReply, TaskStep,
 };
 use tokio::io::AsyncReadExt;
@@ -368,6 +369,28 @@ async fn stationd_denies_active_task_capabilities_by_default_e2e() {
             ..
         })
     ));
+    assert!(matches!(
+        client
+            .update_identity_state(
+                "restricted-profile",
+                SessionStateUpdate {
+                    phase: SessionPhase::ReauthRequired,
+                    expires_at_unix_ms: None,
+                },
+            )
+            .await,
+        Err(ClientError::Remote {
+            status: ResponseStatus::Invalid,
+            ..
+        })
+    ));
+    assert!(matches!(
+        client.identity_status("restricted-profile").await,
+        Err(ClientError::Remote {
+            status: ResponseStatus::Invalid,
+            ..
+        })
+    ));
     let status = client.status().await.expect("restricted station status");
     assert_eq!(status.resident_identities, 0);
     client.shutdown().await.expect("shutdown restricted station");
@@ -378,6 +401,193 @@ async fn stationd_denies_active_task_capabilities_by_default_e2e() {
     assert!(exit.success(), "restricted station failed: {exit}");
     let (_, stderr) = read_child_output(&mut daemon).await;
     assert!(stderr.is_empty(), "restricted station wrote stderr: {stderr}");
+    remove_tree(&profiles).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stationd_persists_authenticated_session_lifecycle_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-stationd-session-e2e-{unique}");
+    let profiles = e2e_temp_base().join(format!(
+        "dig2browser-stationd-session-e2e-{unique}"
+    ));
+    std::fs::create_dir_all(&profiles).expect("create session E2E profiles root");
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+    let client_config = ClientConfig::new(
+        &pipe_name,
+        Duration::from_secs(15),
+        Duration::from_secs(90),
+    )
+    .expect("valid session client config");
+    let mut daemon = spawn_stationd(stationd, &pipe_name, &profiles);
+    let client = StationClient::connect(client_config.clone())
+        .await
+        .expect("connect authenticated session client");
+    let task = CollectionTask::new(vec![
+        TaskStep::Navigate {
+            url: fixture.url("/authenticated-profile"),
+        },
+        TaskStep::Capture {
+            policy: TaskCapturePolicy::EvidenceViewport,
+        },
+    ])
+    .expect("valid authenticated identity task");
+    let result = client
+        .run_task_with_identity(
+            "authenticated-durable-profile",
+            ProfileClass::Authenticated,
+            BrowserPersona::desktop_default(),
+            task,
+        )
+        .await
+        .expect("create authenticated browser identity");
+    assert!(matches!(result.replies()[1], TaskReply::Capture(_)));
+
+    let unknown = client
+        .identity_status("authenticated-durable-profile")
+        .await
+        .expect("read initial authenticated state");
+    assert_eq!(unknown.profile_class, Some(ProfileClass::Authenticated));
+    assert_eq!(unknown.phase, SessionPhase::Unknown);
+    assert!(unknown.profile_exists);
+    assert!(unknown.persona_bound);
+    let expiry = unix_time_ms().saturating_add(1_500);
+    client
+        .update_identity_state(
+            "authenticated-durable-profile",
+            SessionStateUpdate {
+                phase: SessionPhase::Ready,
+                expires_at_unix_ms: Some(expiry),
+            },
+        )
+        .await
+        .expect("mark authenticated session ready");
+    let ready = client
+        .identity_status("authenticated-durable-profile")
+        .await
+        .expect("read ready authenticated state");
+    assert_eq!(ready.phase, SessionPhase::Ready);
+    assert_eq!(ready.expires_at_unix_ms, Some(expiry));
+    assert!(ready.updated_at_unix_ms > 0);
+
+    client.shutdown().await.expect("shutdown first session station");
+    let first_exit = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("first session daemon exit timeout")
+        .expect("wait for first session daemon");
+    assert!(first_exit.success(), "first session station failed: {first_exit}");
+    let (_, first_stderr) = read_child_output(&mut daemon).await;
+    assert!(first_stderr.is_empty(), "session station wrote stderr: {first_stderr}");
+
+    let mut successor = spawn_stationd(stationd, &pipe_name, &profiles);
+    let successor_client = StationClient::connect(client_config)
+        .await
+        .expect("connect session successor client");
+    let now = unix_time_ms();
+    if expiry >= now {
+        tokio::time::sleep(Duration::from_millis(
+            expiry.saturating_sub(now).saturating_add(25),
+        ))
+        .await;
+    }
+    let expired = successor_client
+        .identity_status("authenticated-durable-profile")
+        .await
+        .expect("read expired state after restart");
+    assert_eq!(expired.phase, SessionPhase::Expired);
+    assert_eq!(expired.expires_at_unix_ms, Some(expiry));
+
+    successor_client
+        .update_identity_state(
+            "authenticated-durable-profile",
+            SessionStateUpdate {
+                phase: SessionPhase::ReauthRequired,
+                expires_at_unix_ms: None,
+            },
+        )
+        .await
+        .expect("mark authenticated session for reauthentication");
+    let reauth = successor_client
+        .identity_status("authenticated-durable-profile")
+        .await
+        .expect("read reauthentication state");
+    assert_eq!(reauth.phase, SessionPhase::ReauthRequired);
+    assert_eq!(reauth.expires_at_unix_ms, None);
+
+    let renewed_expiry = unix_time_ms().saturating_add(60_000);
+    successor_client
+        .update_identity_state(
+            "authenticated-durable-profile",
+            SessionStateUpdate {
+                phase: SessionPhase::Ready,
+                expires_at_unix_ms: Some(renewed_expiry),
+            },
+        )
+        .await
+        .expect("mark reauthenticated session ready");
+    let renewed = successor_client
+        .identity_status("authenticated-durable-profile")
+        .await
+        .expect("read renewed session state");
+    assert_eq!(renewed.phase, SessionPhase::Ready);
+    assert_eq!(renewed.expires_at_unix_ms, Some(renewed_expiry));
+
+    let public_task = CollectionTask::new(vec![TaskStep::Navigate {
+        url: fixture.url("/public-profile"),
+    }])
+    .expect("valid public identity task");
+    successor_client
+        .run_task("public-session-profile", public_task)
+        .await
+        .expect("create public browser identity");
+    assert!(matches!(
+        successor_client
+            .update_identity_state(
+                "public-session-profile",
+                SessionStateUpdate {
+                    phase: SessionPhase::Ready,
+                    expires_at_unix_ms: Some(renewed_expiry),
+                },
+            )
+            .await,
+        Err(ClientError::Remote {
+            status: ResponseStatus::Invalid,
+            ..
+        })
+    ));
+
+    let journal = std::fs::read(
+        profiles
+            .join("authenticated-durable-profile")
+            .join(".dig2browser-session-state-v1"),
+    )
+    .expect("read non-secret session journal");
+    assert_eq!(journal.len() % IdentitySessionStatus::ENCODED_LEN, 0);
+    assert_eq!(journal.len(), IdentitySessionStatus::ENCODED_LEN * 3);
+    let class = std::fs::read_to_string(
+        profiles
+            .join("authenticated-durable-profile")
+            .join(".dig2browser-profile-class-v1"),
+    )
+    .expect("read identity class binding");
+    assert_eq!(class, "Authenticated");
+
+    successor_client
+        .shutdown()
+        .await
+        .expect("shutdown session successor");
+    let successor_exit = tokio::time::timeout(Duration::from_secs(30), successor.wait())
+        .await
+        .expect("session successor exit timeout")
+        .expect("wait for session successor");
+    assert!(successor_exit.success(), "session successor failed: {successor_exit}");
+    let (_, successor_stderr) = read_child_output(&mut successor).await;
+    assert!(
+        successor_stderr.is_empty(),
+        "session successor wrote stderr: {successor_stderr}"
+    );
     remove_tree(&profiles).await;
 }
 
@@ -664,7 +874,7 @@ async fn read_child_output(child: &mut tokio::process::Child) -> (String, String
 }
 
 fn spawn_stationd(stationd: &str, pipe_name: &str, profiles: &Path) -> tokio::process::Child {
-    spawn_stationd_with_task_permissions(stationd, pipe_name, profiles, true)
+    spawn_stationd_with_permissions(stationd, pipe_name, profiles, true, true)
 }
 
 fn spawn_stationd_with_task_permissions(
@@ -672,6 +882,22 @@ fn spawn_stationd_with_task_permissions(
     pipe_name: &str,
     profiles: &Path,
     allow_active_tasks: bool,
+) -> tokio::process::Child {
+    spawn_stationd_with_permissions(
+        stationd,
+        pipe_name,
+        profiles,
+        allow_active_tasks,
+        false,
+    )
+}
+
+fn spawn_stationd_with_permissions(
+    stationd: &str,
+    pipe_name: &str,
+    profiles: &Path,
+    allow_active_tasks: bool,
+    allow_session_state_updates: bool,
 ) -> tokio::process::Child {
     let mut command = tokio::process::Command::new(stationd);
     command.args([
@@ -694,6 +920,12 @@ fn spawn_stationd_with_task_permissions(
     if allow_active_tasks {
         command.args(["--allow-interactive-tasks", "--allow-scripted-tasks"]);
     }
+    if allow_session_state_updates {
+        command.args([
+            "--allow-identity-status",
+            "--allow-session-state-updates",
+        ]);
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -701,6 +933,13 @@ fn spawn_stationd_with_task_permissions(
         .kill_on_drop(true)
         .spawn()
         .expect("spawn station daemon")
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
 }
 
 fn e2e_temp_base() -> PathBuf {

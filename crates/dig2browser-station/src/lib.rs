@@ -5,6 +5,7 @@
 //! crawling, monitoring schedules and evidence storage stay in consumers.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -17,11 +18,14 @@ use dig2browser::agentic::{
     WorkerLifecycle,
 };
 use dig2browser::identity::{
-    BrowserBackend, DevicePersona, IdentityClass, IdentityError, IdentityProfile,
-    ProfileOwnershipGuard,
+    validate_profile_id, BrowserBackend, DevicePersona, IdentityClass,
+    IdentityError, IdentityProfile, ProfileOwnershipGuard,
 };
 use dig2browser::stealth::{ClientHintsProfile, LocaleProfile};
-use dig2browser_protocol::{BrowserPersona, PersonaKind};
+use dig2browser_protocol::{
+    BrowserPersona, IdentitySessionStatus, PersonaKind, ProfileClass,
+    SessionPhase, SessionStateUpdate,
+};
 use tokio::sync::{Mutex, RwLock, Semaphore};
 
 pub mod ipc;
@@ -186,12 +190,25 @@ impl IdentityRequest {
         Self::with_persona(id, IdentityClass::Public, BrowserBackend::Chromium, persona)
     }
 
+    pub fn authenticated_persona(id: impl Into<String>, persona: BrowserPersona) -> Self {
+        Self::with_persona(
+            id,
+            IdentityClass::Authenticated,
+            BrowserBackend::Chromium,
+            persona,
+        )
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }
 
     pub fn persona(&self) -> &BrowserPersona {
         &self.persona
+    }
+
+    pub fn class(&self) -> IdentityClass {
+        self.class
     }
 }
 
@@ -266,6 +283,8 @@ pub struct BrowserTaskStepMetrics {
 }
 
 const PERSONA_MANIFEST: &str = ".dig2browser-persona-v1";
+const PROFILE_CLASS_MANIFEST: &str = ".dig2browser-profile-class-v1";
+const SESSION_STATE_JOURNAL: &str = ".dig2browser-session-state-v1";
 
 fn apply_persona(
     worker: &mut BrowserWorkerConfig,
@@ -303,7 +322,7 @@ fn apply_persona(
     Ok(())
 }
 
-fn bind_persona_contract(
+fn bind_identity_contract(
     profile: &IdentityProfile,
     persona: &BrowserPersona,
 ) -> Result<(), StationError> {
@@ -311,39 +330,75 @@ fn bind_persona_contract(
     let _owner = ProfileOwnershipGuard::acquire(profile.profile_dir())?;
     let manifest = profile.profile_dir().join(PERSONA_MANIFEST);
     let expected = persona_contract(persona);
-    match std::fs::read_to_string(&manifest) {
-        Ok(current) if current == expected => return Ok(()),
+    let persona_existed = match std::fs::read_to_string(&manifest) {
+        Ok(current) if current == expected => true,
         Ok(_) => return Err(StationError::PersonaMismatch),
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
             return Err(StationError::PersonaIo(error))
         }
-        Err(_) => {}
-    }
+        Err(_) => false,
+    };
     let has_existing_state = std::fs::read_dir(profile.profile_dir())
         .map_err(StationError::PersonaIo)?
         .filter_map(Result::ok)
         .any(|entry| {
             let name = entry.file_name();
-            name != PERSONA_MANIFEST && name != ".dig2browser-profile.lock"
+            name != PERSONA_MANIFEST
+                && name != PROFILE_CLASS_MANIFEST
+                && name != SESSION_STATE_JOURNAL
+                && name != ".dig2browser-profile.lock"
         });
-    if has_existing_state && persona != &BrowserPersona::desktop_default() {
-        return Err(StationError::PersonaBindingRequired);
+    let class_manifest = profile.profile_dir().join(PROFILE_CLASS_MANIFEST);
+    let expected_class = identity_class_contract(profile.class());
+    match std::fs::read_to_string(&class_manifest) {
+        Ok(current) if current == expected_class => Ok(()),
+        Ok(_) => Err(StationError::IdentityClassMismatch),
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            Err(StationError::PersonaIo(error))
+        }
+        Err(_) => {
+            if (persona_existed || has_existing_state)
+                && profile.class() != IdentityClass::Public
+            {
+                return Err(StationError::IdentityClassBindingRequired);
+            }
+            write_once_manifest(&class_manifest, expected_class)
+        }
+    }?;
+
+    if !persona_existed {
+        if has_existing_state && persona != &BrowserPersona::desktop_default() {
+            return Err(StationError::PersonaBindingRequired);
+        }
+        write_once_manifest(&manifest, &expected)?;
     }
-    let temporary = profile.profile_dir().join(format!(
-        "{PERSONA_MANIFEST}.tmp-{}",
-        std::process::id()
-    ));
+    Ok(())
+}
+
+fn write_once_manifest(path: &Path, expected: &str) -> Result<(), StationError> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(StationError::InvalidPersona)?;
+    let temporary = path.with_file_name(format!("{file_name}.tmp-{}", std::process::id()));
     std::fs::write(&temporary, expected.as_bytes()).map_err(StationError::PersonaIo)?;
-    match std::fs::rename(&temporary, &manifest) {
+    match std::fs::rename(&temporary, path) {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = std::fs::remove_file(&temporary);
-            match std::fs::read_to_string(&manifest) {
+            match std::fs::read_to_string(path) {
                 Ok(current) if current == expected => Ok(()),
                 Ok(_) => Err(StationError::PersonaMismatch),
                 Err(_) => Err(StationError::PersonaIo(error)),
             }
         }
+    }
+}
+
+fn identity_class_contract(class: IdentityClass) -> &'static str {
+    match class {
+        IdentityClass::Public => "Public",
+        IdentityClass::Authenticated => "Authenticated",
     }
 }
 
@@ -367,6 +422,96 @@ fn persona_contract(persona: &BrowserPersona) -> String {
     )
 }
 
+fn read_identity_session_status(
+    profiles_root: &Path,
+    profile_id: &str,
+) -> Result<IdentitySessionStatus, StationError> {
+    let profile_dir = profiles_root.join(profile_id);
+    let profile_exists = match std::fs::metadata(&profile_dir) {
+        Ok(metadata) => metadata.is_dir(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(StationError::SessionIo(error)),
+    };
+    if !profile_exists {
+        return Ok(IdentitySessionStatus::unknown());
+    }
+
+    let persona_bound = match std::fs::read_to_string(profile_dir.join(PERSONA_MANIFEST)) {
+        Ok(contract) if contract.starts_with("v1|kind=") => true,
+        Ok(_) => return Err(StationError::SessionStateCorrupt),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(StationError::SessionIo(error)),
+    };
+    let profile_class = match std::fs::read_to_string(
+        profile_dir.join(PROFILE_CLASS_MANIFEST),
+    ) {
+        Ok(contract) if contract == "Public" => Some(ProfileClass::Public),
+        Ok(contract) if contract == "Authenticated" => {
+            Some(ProfileClass::Authenticated)
+        }
+        Ok(_) => return Err(StationError::SessionStateCorrupt),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && persona_bound => {
+            Some(ProfileClass::Public)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(StationError::SessionIo(error)),
+    };
+    let baseline = IdentitySessionStatus {
+        profile_exists: true,
+        persona_bound,
+        profile_class,
+        phase: SessionPhase::Unknown,
+        updated_at_unix_ms: 0,
+        expires_at_unix_ms: None,
+    };
+    let bytes = match std::fs::read(profile_dir.join(SESSION_STATE_JOURNAL)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(baseline),
+        Err(error) => return Err(StationError::SessionIo(error)),
+    };
+    let mut records = bytes.chunks_exact(IdentitySessionStatus::ENCODED_LEN);
+    let mut latest = None;
+    for record in &mut records {
+        latest = Some(
+            IdentitySessionStatus::decode(record)
+                .map_err(|_| StationError::SessionStateCorrupt)?,
+        );
+    }
+    let Some(mut latest) = latest else {
+        return Err(StationError::SessionStateCorrupt);
+    };
+    if latest.profile_class != profile_class
+        || latest.persona_bound != persona_bound
+        || !latest.profile_exists
+    {
+        return Err(StationError::SessionStateCorrupt);
+    }
+    if latest.phase == SessionPhase::Ready
+        && latest
+            .expires_at_unix_ms
+            .is_some_and(|expiry| expiry <= unix_time_ms())
+    {
+        latest.phase = SessionPhase::Expired;
+    }
+    Ok(latest)
+}
+
+fn append_session_status(
+    profile_dir: &Path,
+    status: &IdentitySessionStatus,
+) -> Result<(), StationError> {
+    let encoded = status
+        .encode()
+        .map_err(|_| StationError::InvalidSessionState)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(profile_dir.join(SESSION_STATE_JOURNAL))
+        .map_err(StationError::SessionIo)?;
+    file.write_all(&encoded).map_err(StationError::SessionIo)?;
+    file.sync_data().map_err(StationError::SessionIo)
+}
+
 struct Slot {
     worker: BrowserWorker,
     session_gate: Mutex<()>,
@@ -386,6 +531,7 @@ struct Inner {
     shutting_down: AtomicBool,
     clock: AtomicU64,
     command_waiters: AtomicUsize,
+    session_state_gate: Mutex<()>,
 }
 
 /// Cloneable facade over one station-owned browser fleet.
@@ -407,6 +553,7 @@ impl BrowserStation {
                 shutting_down: AtomicBool::new(false),
                 clock: AtomicU64::new(0),
                 command_waiters: AtomicUsize::new(0),
+                session_state_gate: Mutex::new(()),
             }),
         }
     }
@@ -488,7 +635,7 @@ impl BrowserStation {
             identity.backend,
             identity.device,
         )?;
-        bind_persona_contract(&profile, identity.persona())?;
+        bind_identity_contract(&profile, identity.persona())?;
         let mut worker_config = self.inner.config.worker.clone();
         apply_persona(&mut worker_config, identity.persona())?;
         let worker = BrowserWorker::spawn(
@@ -570,6 +717,59 @@ impl BrowserStation {
             }
         }
         status
+    }
+
+    /// Read one profile's non-secret session lifecycle. This never inspects or
+    /// returns Chromium cookie storage.
+    pub async fn identity_session_status(
+        &self,
+        profile_id: &str,
+    ) -> Result<IdentitySessionStatus, StationError> {
+        validate_profile_id(profile_id)?;
+        let _gate = self.inner.session_state_gate.lock().await;
+        read_identity_session_status(&self.inner.config.profiles_root, profile_id)
+    }
+
+    /// Persist an explicit operator transition for an already-bound
+    /// authenticated profile. Public profiles cannot acquire authenticated
+    /// state through this API.
+    pub async fn update_identity_session(
+        &self,
+        profile_id: &str,
+        update: SessionStateUpdate,
+    ) -> Result<(), StationError> {
+        validate_profile_id(profile_id)?;
+        update
+            .validate()
+            .map_err(|_| StationError::InvalidSessionState)?;
+        let now = unix_time_ms();
+        if update.phase == SessionPhase::Ready
+            && update.expires_at_unix_ms.is_some_and(|expiry| expiry <= now)
+        {
+            return Err(StationError::InvalidSessionState);
+        }
+        let _gate = self.inner.session_state_gate.lock().await;
+        let current = read_identity_session_status(
+            &self.inner.config.profiles_root,
+            profile_id,
+        )?;
+        if !current.persona_bound
+            || current.profile_class != Some(ProfileClass::Authenticated)
+        {
+            return Err(StationError::AuthenticatedProfileRequired);
+        }
+        let status = IdentitySessionStatus {
+            profile_exists: true,
+            persona_bound: true,
+            profile_class: Some(ProfileClass::Authenticated),
+            phase: update.phase,
+            updated_at_unix_ms: now,
+            expires_at_unix_ms: update.expires_at_unix_ms,
+        };
+        append_session_status(
+            &self.inner.config.profiles_root.join(profile_id),
+            &status,
+        )
     }
 
     /// Stop admission, drain in-flight commands, close every runtime and return
@@ -1026,12 +1226,24 @@ pub enum StationError {
     WorkerUnavailable,
     #[error("browser profile is bound to a different persona")]
     PersonaMismatch,
+    #[error("browser profile is bound to a different identity class")]
+    IdentityClassMismatch,
     #[error("existing profile must be bound as desktop before persona migration")]
     PersonaBindingRequired,
+    #[error("existing public profile cannot be promoted to authenticated")]
+    IdentityClassBindingRequired,
     #[error("browser persona is invalid")]
     InvalidPersona,
     #[error("browser persona manifest I/O failed")]
     PersonaIo(#[source] std::io::Error),
+    #[error("an authenticated profile is required")]
+    AuthenticatedProfileRequired,
+    #[error("browser session transition is invalid")]
+    InvalidSessionState,
+    #[error("browser session state is corrupt")]
+    SessionStateCorrupt,
+    #[error("browser session state I/O failed")]
+    SessionIo(#[source] std::io::Error),
     #[error("browser worker returned an invalid reply")]
     InvalidWorkerReply,
     #[error("browser task step {index} failed")]

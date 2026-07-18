@@ -46,6 +46,10 @@ struct Cli {
     allow_interactive_tasks: bool,
     #[arg(long, default_value_t = false)]
     allow_scripted_tasks: bool,
+    #[arg(long, default_value_t = false)]
+    allow_session_state_updates: bool,
+    #[arg(long, default_value_t = false)]
+    allow_identity_status: bool,
 }
 
 #[cfg(windows)]
@@ -88,7 +92,9 @@ async fn run(cli: Cli) -> Result<ServerReport, DaemonError> {
     )?
     .allow_remote_shutdown(cli.allow_remote_shutdown)
     .allow_interactive_tasks(cli.allow_interactive_tasks)
-    .allow_scripted_tasks(cli.allow_scripted_tasks);
+    .allow_scripted_tasks(cli.allow_scripted_tasks)
+    .allow_identity_status(cli.allow_identity_status)
+    .allow_session_state_updates(cli.allow_session_state_updates);
     let station = BrowserStation::new(station_config);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
