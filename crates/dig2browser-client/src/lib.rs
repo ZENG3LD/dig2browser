@@ -9,7 +9,7 @@ use dig2browser_protocol::{
 };
 use tokio::sync::Mutex;
 
-pub use dig2browser_protocol::ResponseStatus;
+pub use dig2browser_protocol::{FailureClass, ResponseStatus, StationStatus};
 
 const MIN_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -70,7 +70,7 @@ impl StationClient {
                 stream: Mutex::new(Some(stream)),
             };
             client.health().await?;
-            return Ok(client);
+            Ok(client)
         }
 
         #[cfg(not(windows))]
@@ -84,6 +84,15 @@ impl StationClient {
         let request = WorkerRequest::health(self.take_request_id());
         let response = self.call(request).await?;
         require_ok(&response)
+    }
+
+    pub async fn status(&self) -> Result<StationStatus, ClientError> {
+        let request = WorkerRequest::status(self.take_request_id());
+        let response = self.call(request).await?;
+        require_ok(&response)?;
+        response
+            .decode_station_status()
+            .map_err(|_| ClientError::InvalidResponse)
     }
 
     pub async fn capture(
@@ -213,7 +222,7 @@ impl StationClient {
                 *locked = None;
                 return Err(ClientError::InvalidResponse);
             }
-            return Ok(response);
+            Ok(response)
         }
 
         #[cfg(not(windows))]
@@ -244,6 +253,10 @@ impl BlockingStationClient {
 
     pub fn health(&self) -> Result<(), ClientError> {
         self.runtime.block_on(self.client.health())
+    }
+
+    pub fn status(&self) -> Result<StationStatus, ClientError> {
+        self.runtime.block_on(self.client.status())
     }
 
     pub fn capture(
@@ -384,5 +397,6 @@ mod tests {
         assert_eq!(RequestKind::Capture as u8, 1);
         assert_eq!(RequestKind::Health as u8, 2);
         assert_eq!(RequestKind::Shutdown as u8, 3);
+        assert_eq!(RequestKind::Status as u8, 4);
     }
 }

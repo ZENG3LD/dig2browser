@@ -16,6 +16,10 @@ const REQUEST_MAGIC: [u8; 4] = *b"D2BQ";
 const RESPONSE_MAGIC: [u8; 4] = *b"D2BR";
 const REQUEST_HEADER_BYTES: usize = 22;
 const RESPONSE_HEADER_BYTES: usize = 56;
+const STATUS_MAGIC: [u8; 4] = *b"D2ST";
+const STATUS_SCHEMA_VERSION: u16 = 1;
+const STATUS_FIELDS: usize = 22;
+const STATUS_PAYLOAD_BYTES: usize = 8 + STATUS_FIELDS * 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -23,6 +27,7 @@ pub enum RequestKind {
     Capture = 1,
     Health = 2,
     Shutdown = 3,
+    Status = 4,
 }
 
 impl RequestKind {
@@ -31,6 +36,7 @@ impl RequestKind {
             1 => Ok(Self::Capture),
             2 => Ok(Self::Health),
             3 => Ok(Self::Shutdown),
+            4 => Ok(Self::Status),
             _ => Err(ProtocolError::InvalidRequest),
         }
     }
@@ -60,6 +66,10 @@ impl WorkerRequest {
 
     pub fn shutdown(request_id: u64) -> Self {
         Self::control(RequestKind::Shutdown, request_id)
+    }
+
+    pub fn status(request_id: u64) -> Self {
+        Self::control(RequestKind::Status, request_id)
     }
 
     fn control(kind: RequestKind, request_id: u64) -> Self {
@@ -103,7 +113,7 @@ impl WorkerRequest {
                 validate_profile_id(&self.profile_id)?;
                 validate_http_url(&self.url)
             }
-            RequestKind::Health | RequestKind::Shutdown => {
+            RequestKind::Health | RequestKind::Shutdown | RequestKind::Status => {
                 if self.profile_id.is_empty() && self.url.is_empty() {
                     Ok(())
                 } else {
@@ -111,6 +121,142 @@ impl WorkerRequest {
                 }
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub enum FailureClass {
+    None = 0,
+    Unavailable = 1,
+    CaptureFailed = 2,
+    TooLarge = 3,
+    Protocol = 4,
+    Timeout = 5,
+    Cancelled = 6,
+}
+
+impl FailureClass {
+    fn from_wire(value: u64) -> Result<Self, ProtocolError> {
+        match value {
+            0 => Ok(Self::None),
+            1 => Ok(Self::Unavailable),
+            2 => Ok(Self::CaptureFailed),
+            3 => Ok(Self::TooLarge),
+            4 => Ok(Self::Protocol),
+            5 => Ok(Self::Timeout),
+            6 => Ok(Self::Cancelled),
+            _ => Err(ProtocolError::InvalidStatusPayload),
+        }
+    }
+}
+
+/// Sanitized aggregate station telemetry. It intentionally contains no
+/// identity IDs, URLs, cookies, profile paths or raw error messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StationStatus {
+    pub shutting_down: bool,
+    pub resident_identities: u64,
+    pub starting_workers: u64,
+    pub ready_workers: u64,
+    pub degraded_workers: u64,
+    pub restarting_workers: u64,
+    pub shutting_down_workers: u64,
+    pub stopped_workers: u64,
+    pub active_leases: u64,
+    pub command_limit: u64,
+    pub command_available: u64,
+    pub command_waiters: u64,
+    pub accepted_connections: u64,
+    pub active_connections: u64,
+    pub completed_connections: u64,
+    pub aborted_connections: u64,
+    pub captures_started: u64,
+    pub captures_in_flight: u64,
+    pub captures_succeeded: u64,
+    pub captures_failed: u64,
+    pub captures_timed_out: u64,
+    pub last_failure_unix_ms: u64,
+    pub last_failure_class: FailureClass,
+}
+
+impl StationStatus {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(STATUS_PAYLOAD_BYTES);
+        payload.extend_from_slice(&STATUS_MAGIC);
+        payload.extend_from_slice(&STATUS_SCHEMA_VERSION.to_le_bytes());
+        payload.extend_from_slice(&u16::from(self.shutting_down).to_le_bytes());
+        for field in [
+            self.resident_identities,
+            self.starting_workers,
+            self.ready_workers,
+            self.degraded_workers,
+            self.restarting_workers,
+            self.shutting_down_workers,
+            self.stopped_workers,
+            self.active_leases,
+            self.command_limit,
+            self.command_available,
+            self.command_waiters,
+            self.accepted_connections,
+            self.active_connections,
+            self.completed_connections,
+            self.aborted_connections,
+            self.captures_started,
+            self.captures_in_flight,
+            self.captures_succeeded,
+            self.captures_failed,
+            self.captures_timed_out,
+            self.last_failure_unix_ms,
+            self.last_failure_class as u64,
+        ] {
+            payload.extend_from_slice(&field.to_le_bytes());
+        }
+        payload
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, ProtocolError> {
+        if payload.len() != STATUS_PAYLOAD_BYTES
+            || payload[..4] != STATUS_MAGIC
+            || u16::from_le_bytes(payload[4..6].try_into().unwrap()) != STATUS_SCHEMA_VERSION
+        {
+            return Err(ProtocolError::InvalidStatusPayload);
+        }
+        let flags = u16::from_le_bytes(payload[6..8].try_into().unwrap());
+        if flags & !1 != 0 {
+            return Err(ProtocolError::InvalidStatusPayload);
+        }
+        let mut offset = 8;
+        let mut next = || {
+            let value = u64::from_le_bytes(payload[offset..offset + 8].try_into().unwrap());
+            offset += 8;
+            value
+        };
+        Ok(Self {
+            shutting_down: flags & 1 == 1,
+            resident_identities: next(),
+            starting_workers: next(),
+            ready_workers: next(),
+            degraded_workers: next(),
+            restarting_workers: next(),
+            shutting_down_workers: next(),
+            stopped_workers: next(),
+            active_leases: next(),
+            command_limit: next(),
+            command_available: next(),
+            command_waiters: next(),
+            accepted_connections: next(),
+            active_connections: next(),
+            completed_connections: next(),
+            aborted_connections: next(),
+            captures_started: next(),
+            captures_in_flight: next(),
+            captures_succeeded: next(),
+            captures_failed: next(),
+            captures_timed_out: next(),
+            last_failure_unix_ms: next(),
+            last_failure_class: FailureClass::from_wire(next())?,
+        })
     }
 }
 
@@ -175,6 +321,26 @@ impl WorkerResponse {
         response
     }
 
+    pub fn station_status(request: &WorkerRequest, status: &StationStatus) -> Self {
+        let mut response = Self::empty(request, ResponseStatus::Ok);
+        response.html = status.encode();
+        response
+    }
+
+    pub fn decode_station_status(&self) -> Result<StationStatus, ProtocolError> {
+        if self.kind != RequestKind::Status
+            || self.status != ResponseStatus::Ok
+            || self.http_status.is_some()
+            || !self.final_url.is_empty()
+            || !self.title.is_empty()
+            || !self.error.is_empty()
+            || !self.png.is_empty()
+        {
+            return Err(ProtocolError::InvalidStatusPayload);
+        }
+        StationStatus::decode(&self.html)
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
         self.validate()?;
         let capacity = RESPONSE_HEADER_BYTES
@@ -202,6 +368,9 @@ impl WorkerResponse {
             || self.png.len() > MAX_PNG_BYTES
         {
             return Err(ProtocolError::ResponseTooLarge);
+        }
+        if self.kind == RequestKind::Status && self.status == ResponseStatus::Ok {
+            self.decode_station_status()?;
         }
         Ok(())
     }
@@ -437,6 +606,7 @@ impl std::error::Error for PipeNameError {}
 pub enum ProtocolError {
     InvalidRequest,
     ResponseTooLarge,
+    InvalidStatusPayload,
 }
 
 impl std::fmt::Display for ProtocolError {
@@ -444,6 +614,7 @@ impl std::fmt::Display for ProtocolError {
         match self {
             Self::InvalidRequest => write!(formatter, "invalid request"),
             Self::ResponseTooLarge => write!(formatter, "response exceeds protocol limits"),
+            Self::InvalidStatusPayload => write!(formatter, "station status payload is invalid"),
         }
     }
 }
@@ -520,5 +691,42 @@ mod tests {
                 .expect("decode"),
             response
         );
+    }
+
+    #[test]
+    fn station_status_round_trips_without_sensitive_fields() {
+        let request = WorkerRequest::status(73);
+        let status = StationStatus {
+            shutting_down: false,
+            resident_identities: 3,
+            starting_workers: 0,
+            ready_workers: 2,
+            degraded_workers: 1,
+            restarting_workers: 0,
+            shutting_down_workers: 0,
+            stopped_workers: 0,
+            active_leases: 4,
+            command_limit: 8,
+            command_available: 5,
+            command_waiters: 2,
+            accepted_connections: 11,
+            active_connections: 3,
+            completed_connections: 7,
+            aborted_connections: 1,
+            captures_started: 20,
+            captures_in_flight: 2,
+            captures_succeeded: 16,
+            captures_failed: 2,
+            captures_timed_out: 1,
+            last_failure_unix_ms: 1_784_402_400_000,
+            last_failure_class: FailureClass::Timeout,
+        };
+        let response = WorkerResponse::station_status(&request, &status);
+        assert_eq!(response.decode_station_status().expect("status"), status);
+        assert_eq!(response.html.len(), STATUS_PAYLOAD_BYTES);
+        assert!(response.final_url.is_empty());
+        assert!(response.title.is_empty());
+        assert!(response.error.is_empty());
+        assert!(response.png.is_empty());
     }
 }

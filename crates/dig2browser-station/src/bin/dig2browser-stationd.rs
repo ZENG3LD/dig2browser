@@ -39,8 +39,10 @@ struct Cli {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let command_timeout = Duration::from_secs(cli.timeout_seconds);
-    let mut worker = BrowserWorkerConfig::default();
-    worker.command_timeout = command_timeout;
+    let worker = BrowserWorkerConfig {
+        command_timeout,
+        ..BrowserWorkerConfig::default()
+    };
     let station_config = StationConfig::new(
         &cli.profiles_root,
         cli.max_resident,

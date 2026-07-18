@@ -99,8 +99,10 @@ async fn station_reuses_identity_enforces_ownership_and_drains_real_browser_e2e(
         std::process::id(),
         uuid::Uuid::new_v4()
     ));
-    let mut worker = BrowserWorkerConfig::default();
-    worker.command_timeout = Duration::from_secs(60);
+    let mut worker = BrowserWorkerConfig {
+        command_timeout: Duration::from_secs(60),
+        ..BrowserWorkerConfig::default()
+    };
     worker.launch.restart_after_pages = 2;
     let config = StationConfig::new(&profiles, 1, 2)
         .expect("valid station config")

@@ -134,6 +134,7 @@ struct Inner {
     operation_gate: RwLock<()>,
     shutting_down: AtomicBool,
     clock: AtomicU64,
+    command_waiters: AtomicUsize,
 }
 
 /// Cloneable facade over one station-owned browser fleet.
@@ -154,6 +155,7 @@ impl BrowserStation {
                 operation_gate: RwLock::new(()),
                 shutting_down: AtomicBool::new(false),
                 clock: AtomicU64::new(0),
+                command_waiters: AtomicUsize::new(0),
             }),
         }
     }
@@ -271,6 +273,36 @@ impl BrowserStation {
         }
     }
 
+    /// Aggregate fleet status suitable for sanitized operator telemetry. No
+    /// identity key, profile path, URL or browser content is returned.
+    pub async fn fleet_status(&self) -> StationFleetStatus {
+        let state = self.inner.state.lock().await;
+        let mut status = StationFleetStatus {
+            resident_identities: state.slots.len(),
+            active_leases: state
+                .slots
+                .values()
+                .map(|slot| slot.active_leases.load(Ordering::Acquire))
+                .sum(),
+            command_limit: self.inner.config.max_in_flight,
+            command_available: self.inner.command_slots.available_permits(),
+            command_waiters: self.inner.command_waiters.load(Ordering::Acquire),
+            shutting_down: self.inner.shutting_down.load(Ordering::Acquire),
+            ..StationFleetStatus::default()
+        };
+        for slot in state.slots.values() {
+            match slot.worker.snapshot().lifecycle {
+                WorkerLifecycle::Starting => status.starting_workers += 1,
+                WorkerLifecycle::Ready => status.ready_workers += 1,
+                WorkerLifecycle::Degraded => status.degraded_workers += 1,
+                WorkerLifecycle::Restarting => status.restarting_workers += 1,
+                WorkerLifecycle::ShuttingDown => status.shutting_down_workers += 1,
+                WorkerLifecycle::Stopped => status.stopped_workers += 1,
+            }
+        }
+        status
+    }
+
     /// Stop admission, drain in-flight commands, close every runtime and return
     /// only after each worker actor has dropped its runtime and process handles.
     pub async fn shutdown(&self) -> Result<ShutdownReport, StationError> {
@@ -343,6 +375,7 @@ impl BrowserLease {
             return Err(StationError::ShuttingDown);
         }
         let _session = self.slot.session_gate.lock().await;
+        let waiter = CommandWaiter::new(&self.station.inner.command_waiters);
         let _command = self
             .station
             .inner
@@ -350,6 +383,7 @@ impl BrowserLease {
             .acquire()
             .await
             .map_err(|_| StationError::ShuttingDown)?;
+        drop(waiter);
         let now = self.station.inner.clock.fetch_add(1, Ordering::AcqRel) + 1;
         self.slot.last_used.store(now, Ordering::Release);
         self.slot.worker.execute(command).await.map_err(Into::into)
@@ -374,6 +408,7 @@ impl BrowserLease {
             return Err(StationError::ShuttingDown);
         }
         let _session = self.slot.session_gate.lock().await;
+        let waiter = CommandWaiter::new(&self.station.inner.command_waiters);
         let _command = self
             .station
             .inner
@@ -381,6 +416,7 @@ impl BrowserLease {
             .acquire()
             .await
             .map_err(|_| StationError::ShuttingDown)?;
+        drop(waiter);
         self.slot.worker.execute(navigate).await?;
         let reply = self.slot.worker.execute(capture).await?;
         let AgentReply::Capture(artifact) = reply else {
@@ -389,6 +425,23 @@ impl BrowserLease {
         let now = self.station.inner.clock.fetch_add(1, Ordering::AcqRel) + 1;
         self.slot.last_used.store(now, Ordering::Release);
         Ok(artifact)
+    }
+}
+
+struct CommandWaiter<'a> {
+    count: &'a AtomicUsize,
+}
+
+impl<'a> CommandWaiter<'a> {
+    fn new(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self { count }
+    }
+}
+
+impl Drop for CommandWaiter<'_> {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -416,6 +469,22 @@ pub struct StationSnapshot {
     pub active_leases: usize,
     pub shutting_down: bool,
     pub workers: Vec<(IdentityRequest, BrowserSnapshot)>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StationFleetStatus {
+    pub shutting_down: bool,
+    pub resident_identities: usize,
+    pub starting_workers: usize,
+    pub ready_workers: usize,
+    pub degraded_workers: usize,
+    pub restarting_workers: usize,
+    pub shutting_down_workers: usize,
+    pub stopped_workers: usize,
+    pub active_leases: usize,
+    pub command_limit: usize,
+    pub command_available: usize,
+    pub command_waiters: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

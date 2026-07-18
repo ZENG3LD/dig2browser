@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use dig2browser_client::{ClientConfig, StationClient};
+use dig2browser_client::{ClientConfig, FailureClass, StationClient, StationStatus};
 
 struct FixtureServer {
     address: SocketAddr,
@@ -77,6 +77,9 @@ fn serve_connection(mut stream: TcpStream) -> std::io::Result<()> {
         .next()
         .unwrap_or("/");
     let marker = path.trim_start_matches('/');
+    if marker == "force-close" {
+        return Ok(());
+    }
     let body = format!(
         "<!doctype html><title>{marker}</title><main data-daemon-e2e=\"{marker}\">{marker}</main>"
     );
@@ -89,6 +92,7 @@ fn serve_connection(mut stream: TcpStream) -> std::io::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stationd_serves_concurrent_clients_and_drains_real_chromium_e2e() {
+    let _serial = e2e_serial_guard().await;
     let fixture = FixtureServer::start();
     let unique = uuid::Uuid::new_v4();
     let pipe_name = format!("dig2browser-stationd-e2e-{unique}");
@@ -106,18 +110,48 @@ async fn stationd_serves_concurrent_clients_and_drains_real_chromium_e2e() {
     let first = StationClient::connect(client_config.clone())
         .await
         .expect("connect first station client");
-    let second = StationClient::connect(client_config)
+    let second = StationClient::connect(client_config.clone())
         .await
         .expect("connect second station client");
+    let observer = StationClient::connect(client_config)
+        .await
+        .expect("connect observer station client");
+
+    let baseline = observer.status().await.expect("read baseline status");
+    assert_eq!(baseline.resident_identities, 0);
+    assert_eq!(baseline.captures_started, 0);
+    assert_eq!(baseline.captures_in_flight, 0);
+    assert!(baseline.accepted_connections >= 3);
+    assert!(baseline.active_connections >= 3);
+    assert_eq!(baseline.command_limit, 4);
+    assert!(baseline.command_available <= baseline.command_limit);
 
     let first_url = fixture.url("/first-client");
     let second_url = fixture.url("/second-client");
-    let (first_capture, second_capture) = tokio::join!(
-        first.capture("shared-public-profile", &first_url),
-        second.capture("shared-public-profile", &second_url),
-    );
-    let first_capture = first_capture.expect("capture through first client");
-    let second_capture = second_capture.expect("capture through second client");
+    let first_task = tokio::spawn(async move {
+        first
+            .capture("shared-public-profile", &first_url)
+            .await
+    });
+    let second_task = tokio::spawn(async move {
+        second
+            .capture("shared-public-profile", &second_url)
+            .await
+    });
+    let during = wait_for_status(&observer, |status| status.captures_in_flight >= 2).await;
+    assert_eq!(during.captures_started, 2);
+    assert!(during.resident_identities >= 1);
+    assert!(during.active_leases >= 1);
+    assert!(during.command_available <= during.command_limit);
+
+    let first_capture = first_task
+        .await
+        .expect("join first capture")
+        .expect("capture through first client");
+    let second_capture = second_task
+        .await
+        .expect("join second capture")
+        .expect("capture through second client");
     assert_eq!(first_capture.title.as_deref(), Some("first-client"));
     assert!(
         String::from_utf8_lossy(&first_capture.html)
@@ -131,7 +165,32 @@ async fn stationd_serves_concurrent_clients_and_drains_real_chromium_e2e() {
     assert_eq!(&first_capture.png[..8], b"\x89PNG\r\n\x1a\n");
     assert_eq!(&second_capture.png[..8], b"\x89PNG\r\n\x1a\n");
 
-    first.shutdown().await.expect("request station drain");
+    let after_success = observer.status().await.expect("read successful status");
+    assert_eq!(after_success.resident_identities, 1);
+    assert_eq!(after_success.ready_workers, 1);
+    assert_eq!(after_success.active_leases, 0);
+    assert_eq!(after_success.captures_started, 2);
+    assert_eq!(after_success.captures_in_flight, 0);
+    assert_eq!(after_success.captures_succeeded, 2);
+    assert_eq!(after_success.captures_failed, 0);
+    assert_eq!(after_success.last_failure_class, FailureClass::None);
+
+    assert!(
+        observer
+            .capture("failure-profile", fixture.url("/force-close"))
+            .await
+            .is_err(),
+        "forced connection close unexpectedly produced a capture"
+    );
+    let after_failure = observer.status().await.expect("read failed status");
+    assert_eq!(after_failure.captures_started, 3);
+    assert_eq!(after_failure.captures_in_flight, 0);
+    assert_eq!(after_failure.captures_succeeded, 2);
+    assert_eq!(after_failure.captures_failed, 1);
+    assert_eq!(after_failure.last_failure_class, FailureClass::CaptureFailed);
+    assert!(after_failure.last_failure_unix_ms > 0);
+
+    observer.shutdown().await.expect("request station drain");
     let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
         .await
         .expect("station daemon exit timeout")
@@ -142,6 +201,7 @@ async fn stationd_serves_concurrent_clients_and_drains_real_chromium_e2e() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stationd_hard_kill_releases_profile_and_client_reconnects_e2e() {
+    let _serial = e2e_serial_guard().await;
     let fixture = FixtureServer::start();
     let unique = uuid::Uuid::new_v4();
     let pipe_name = format!("dig2browser-stationd-crash-e2e-{unique}");
@@ -175,6 +235,12 @@ async fn stationd_hard_kill_releases_profile_and_client_reconnects_e2e() {
         .health()
         .await
         .expect("client reconnects to successor stationd");
+    let fresh = client.status().await.expect("read successor baseline status");
+    assert_eq!(fresh.resident_identities, 0);
+    assert_eq!(fresh.captures_started, 0);
+    assert_eq!(fresh.captures_succeeded, 0);
+    assert_eq!(fresh.captures_failed, 0);
+    assert!(fresh.accepted_connections >= 1);
     let capture = client
         .capture("crash-recovery-profile", fixture.url("/after-crash"))
         .await
@@ -184,6 +250,11 @@ async fn stationd_hard_kill_releases_profile_and_client_reconnects_e2e() {
         String::from_utf8_lossy(&capture.html)
             .contains("data-daemon-e2e=\"after-crash\"")
     );
+    let recovered = client.status().await.expect("read successor capture status");
+    assert_eq!(recovered.resident_identities, 1);
+    assert_eq!(recovered.captures_started, 1);
+    assert_eq!(recovered.captures_succeeded, 1);
+    assert_eq!(recovered.captures_failed, 0);
     client.shutdown().await.expect("shutdown successor stationd");
     let status = tokio::time::timeout(Duration::from_secs(30), successor.wait())
         .await
@@ -191,6 +262,32 @@ async fn stationd_hard_kill_releases_profile_and_client_reconnects_e2e() {
         .expect("wait for successor stationd");
     assert!(status.success(), "successor stationd failed: {status}");
     remove_tree(&profiles).await;
+}
+
+async fn wait_for_status(
+    client: &StationClient,
+    predicate: impl Fn(&StationStatus) -> bool,
+) -> StationStatus {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = client.status().await.expect("poll station status");
+        if predicate(&status) {
+            return status;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "station status predicate timed out: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn e2e_serial_guard() -> tokio::sync::SemaphorePermit<'static> {
+    static E2E_SERIAL: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+    E2E_SERIAL
+        .acquire()
+        .await
+        .expect("daemon E2E semaphore remains open")
 }
 
 fn spawn_stationd(stationd: &str, pipe_name: &str, profiles: &Path) -> tokio::process::Child {
