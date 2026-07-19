@@ -119,6 +119,53 @@ impl OwnedProcessTree {
             Ok(())
         }
     }
+
+    /// Wait for every process in the owned tree to exit without terminating it.
+    ///
+    /// Chromium may keep its network service alive briefly after the root
+    /// process exits so profile databases and WAL files can be committed.
+    pub(crate) async fn wait_until_empty(
+        &self,
+        timeout: std::time::Duration,
+    ) -> io::Result<bool> {
+        #[cfg(windows)]
+        {
+            use windows::Win32::System::JobObjects::{
+                JobObjectBasicAccountingInformation, QueryInformationJobObject,
+                JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+            };
+
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+                // SAFETY: the buffer matches the requested information class
+                // and remains alive for the duration of the call.
+                unsafe {
+                    QueryInformationJobObject(
+                        self.job,
+                        JobObjectBasicAccountingInformation,
+                        &mut accounting as *mut _ as *mut std::ffi::c_void,
+                        std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                        None,
+                    )
+                }
+                .map_err(windows_error)?;
+                if accounting.ActiveProcesses == 0 {
+                    return Ok(true);
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Ok(false);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = timeout;
+            Ok(true)
+        }
+    }
 }
 
 #[cfg(windows)]
