@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 #[cfg(windows)]
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 #[cfg(windows)]
 use dig2browser::agentic::BrowserWorkerConfig;
 #[cfg(windows)]
@@ -19,8 +19,27 @@ use dig2browser_station::ipc::{
 #[cfg(windows)]
 use dig2browser_station::{
     BrowserStation, ConfigError as StationConfigError, ProfilesRootError,
-    ProfilesRootOwnership, StationConfig,
+    ProfilesRootOwnership, RuntimeKind, RuntimeSelector, StationConfig,
 };
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RuntimeArg {
+    Auto,
+    Chrome,
+    Edge,
+}
+
+#[cfg(windows)]
+impl RuntimeArg {
+    fn selector(self) -> RuntimeSelector {
+        match self {
+            Self::Auto => RuntimeSelector::Auto,
+            Self::Chrome => RuntimeSelector::Exact(RuntimeKind::Chrome),
+            Self::Edge => RuntimeSelector::Exact(RuntimeKind::Edge),
+        }
+    }
+}
 
 #[cfg(windows)]
 #[derive(Debug, Parser)]
@@ -34,6 +53,8 @@ struct Cli {
     max_resident: usize,
     #[arg(long, default_value_t = 32)]
     max_in_flight: usize,
+    #[arg(long, value_enum, default_value_t = RuntimeArg::Auto)]
+    runtime: RuntimeArg,
     #[arg(long, default_value_t = 64)]
     max_connections: usize,
     #[arg(long, default_value_t = 90)]
@@ -88,6 +109,7 @@ async fn run(cli: Cli) -> Result<ServerReport, DaemonError> {
         cli.max_resident,
         cli.max_in_flight,
     )?
+    .with_runtime_selector(cli.runtime.selector())
     .with_worker_config(worker);
     let server_config = ServerConfig::new(
         cli.pipe_name,

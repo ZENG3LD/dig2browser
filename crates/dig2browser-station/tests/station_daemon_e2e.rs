@@ -346,6 +346,124 @@ async fn stationd_serves_concurrent_clients_and_drains_real_chromium_e2e() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stationd_explicit_chrome_and_edge_runtime_selection_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+
+    for (runtime, expects_edge_brand) in [("chrome", false), ("edge", true)] {
+        let unique = uuid::Uuid::new_v4();
+        let pipe_name = format!("dig2browser-stationd-{runtime}-e2e-{unique}");
+        let profiles = e2e_temp_base().join(format!(
+            "dig2browser-stationd-{runtime}-e2e-{unique}"
+        ));
+        std::fs::create_dir_all(&profiles).expect("create explicit-runtime profiles root");
+        let mut daemon = spawn_stationd_for_runtime(
+            stationd,
+            &pipe_name,
+            &profiles,
+            runtime,
+        );
+        let daemon_pid = daemon.id().expect("explicit-runtime stationd PID");
+
+        let client = StationClient::connect(
+            ClientConfig::new(
+                &pipe_name,
+                Duration::from_secs(15),
+                Duration::from_secs(90),
+            )
+            .expect("valid explicit-runtime client config"),
+        )
+        .await
+        .expect("connect explicit-runtime station client");
+        let marker = format!("explicit-{runtime}-runtime");
+        let url = fixture.url(&format!("/{marker}"));
+        let task = CollectionTask::new(vec![
+            TaskStep::Navigate { url: url.clone() },
+            TaskStep::Evaluate {
+                script: "navigator.userAgent".to_owned(),
+            },
+            TaskStep::Capture {
+                policy: TaskCapturePolicy::EvidenceViewport,
+            },
+        ])
+        .expect("valid explicit-runtime typed task");
+        let result = client
+            .run_task(&format!("explicit-{runtime}-profile"), task)
+            .await
+            .expect("run task through explicit browser runtime");
+
+        assert_eq!(result.replies().len(), 3);
+        let TaskReply::ScriptJson(user_agent_json) = &result.replies()[1] else {
+            panic!("explicit {runtime} task did not return user agent JSON");
+        };
+        let user_agent = user_agent_json
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .expect("user agent is a JSON string");
+        assert!(
+            user_agent.contains("Chrome/"),
+            "{runtime} user agent lacks Chromium brand: {user_agent}"
+        );
+        assert_eq!(
+            user_agent.contains("Edg/"),
+            expects_edge_brand,
+            "{runtime} user agent did not match selected runtime: {user_agent}"
+        );
+
+        let TaskReply::Capture(capture) = &result.replies()[2] else {
+            panic!("explicit {runtime} task did not return evidence capture");
+        };
+        assert_eq!(capture.requested_url, url);
+        assert_eq!(capture.final_url, url);
+        assert_eq!(capture.http_status, Some(200));
+        assert_eq!(capture.title, marker);
+        assert_eq!(capture.ready_state, "complete");
+        assert!(
+            String::from_utf8_lossy(&capture.html)
+                .contains(&format!("data-daemon-e2e=\"{marker}\""))
+        );
+        assert_eq!(&capture.png[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(
+            capture.html_sha256,
+            dig2browser::digest::sha256_bytes(&capture.html)
+        );
+        assert_eq!(
+            capture.png_sha256,
+            Some(dig2browser::digest::sha256_bytes(&capture.png))
+        );
+
+        client
+            .shutdown()
+            .await
+            .expect("request explicit-runtime station drain");
+        let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+            .await
+            .expect("explicit-runtime station daemon exit timeout")
+            .expect("wait for explicit-runtime station daemon");
+        assert!(
+            status.success(),
+            "{runtime} station daemon {daemon_pid} failed: {status}"
+        );
+        assert_eq!(
+            daemon.try_wait().expect("recheck station daemon exit"),
+            Some(status),
+            "{runtime} station daemon {daemon_pid} remained alive"
+        );
+        let (stdout, stderr) = read_child_output(&mut daemon).await;
+        assert!(
+            stderr.is_empty(),
+            "clean {runtime} station wrote stderr: {stderr}"
+        );
+        assert!(stdout.contains("\"event\":\"station_exit\""));
+        assert!(stdout.contains("\"outcome\":\"clean\""));
+        assert!(stdout.contains("\"stop_reason\":\"remote_request\""));
+        assert!(stdout.contains("\"drain_timed_out\":false"));
+        remove_tree(&profiles).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stationd_denies_active_task_capabilities_by_default_e2e() {
     let _serial = e2e_serial_guard().await;
     let fixture = FixtureServer::start();
@@ -1192,6 +1310,23 @@ fn spawn_stationd(stationd: &str, pipe_name: &str, profiles: &Path) -> tokio::pr
     spawn_stationd_with_permissions(stationd, pipe_name, profiles, true, true, false)
 }
 
+fn spawn_stationd_for_runtime(
+    stationd: &str,
+    pipe_name: &str,
+    profiles: &Path,
+    runtime: &str,
+) -> tokio::process::Child {
+    spawn_stationd_with_runtime_permissions(
+        stationd,
+        pipe_name,
+        profiles,
+        Some(runtime),
+        true,
+        true,
+        false,
+    )
+}
+
 fn spawn_stationd_with_task_permissions(
     stationd: &str,
     pipe_name: &str,
@@ -1224,6 +1359,26 @@ fn spawn_stationd_with_permissions(
     allow_session_state_updates: bool,
     allow_headful_auth: bool,
 ) -> tokio::process::Child {
+    spawn_stationd_with_runtime_permissions(
+        stationd,
+        pipe_name,
+        profiles,
+        None,
+        allow_active_tasks,
+        allow_session_state_updates,
+        allow_headful_auth,
+    )
+}
+
+fn spawn_stationd_with_runtime_permissions(
+    stationd: &str,
+    pipe_name: &str,
+    profiles: &Path,
+    runtime: Option<&str>,
+    allow_active_tasks: bool,
+    allow_session_state_updates: bool,
+    allow_headful_auth: bool,
+) -> tokio::process::Child {
     let mut command = tokio::process::Command::new(stationd);
     command.args([
             "--pipe-name",
@@ -1242,6 +1397,9 @@ fn spawn_stationd_with_permissions(
             "15",
             "--allow-remote-shutdown",
         ]);
+    if let Some(runtime) = runtime {
+        command.args(["--runtime", runtime]);
+    }
     if allow_active_tasks {
         command.args(["--allow-interactive-tasks", "--allow-scripted-tasks"]);
     }

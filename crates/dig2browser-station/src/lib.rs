@@ -26,9 +26,16 @@ use dig2browser_protocol::{
     BrowserPersona, IdentitySessionStatus, PersonaKind, ProfileClass,
     SessionHealthProbe, SessionPhase, SessionStateUpdate,
 };
+use dig2browser_core::{
+    RuntimeFeature, RuntimeRequirements, RuntimeRequirementsError,
+};
 use tokio::sync::{Mutex, RwLock, Semaphore};
 
 pub mod ipc;
+pub mod runtime;
+
+pub use dig2browser_core::{ResolvedRuntime, RuntimeKind, RuntimeSelector};
+pub use runtime::{RuntimeFactory, RuntimeRegistry, RuntimeRegistryError};
 
 const MAX_RESIDENT: usize = 256;
 const MAX_IN_FLIGHT: usize = 4_096;
@@ -81,6 +88,8 @@ pub struct StationConfig {
     max_in_flight: usize,
     worker: BrowserWorkerConfig,
     worker_capabilities: CapabilitySet,
+    runtime_selector: RuntimeSelector,
+    runtime_registry: RuntimeRegistry,
 }
 
 impl StationConfig {
@@ -105,11 +114,23 @@ impl StationConfig {
             max_in_flight,
             worker: BrowserWorkerConfig::default(),
             worker_capabilities: CapabilitySet::all(),
+            runtime_selector: RuntimeSelector::Auto,
+            runtime_registry: RuntimeRegistry::default(),
         })
     }
 
     pub fn with_worker_config(mut self, worker: BrowserWorkerConfig) -> Self {
         self.worker = worker;
+        self
+    }
+
+    pub fn with_runtime_selector(mut self, selector: RuntimeSelector) -> Self {
+        self.runtime_selector = selector;
+        self
+    }
+
+    pub fn with_runtime_registry(mut self, registry: RuntimeRegistry) -> Self {
+        self.runtime_registry = registry;
         self
     }
 
@@ -322,6 +343,56 @@ fn apply_persona(
     Ok(())
 }
 
+fn runtime_requirements(
+    capabilities: &CapabilitySet,
+    persona: &BrowserPersona,
+    headful_authentication: bool,
+) -> Result<RuntimeRequirements, RuntimeRequirementsError> {
+    let mut features = Vec::new();
+    for capability in capabilities.iter() {
+        match capability {
+            Capability::L1(L1Capability::Pointer) => {
+                features.push(RuntimeFeature::PointerInput)
+            }
+            Capability::L1(L1Capability::Keyboard) => {
+                features.push(RuntimeFeature::KeyboardInput)
+            }
+            Capability::L1(L1Capability::Scroll) => {
+                features.push(RuntimeFeature::ScrollInput)
+            }
+            Capability::L2(L2Capability::Inspect) => {
+                features.push(RuntimeFeature::DomInspect)
+            }
+            Capability::L2(L2Capability::Interact) => {
+                features.push(RuntimeFeature::DomInteract)
+            }
+            Capability::L2(L2Capability::Evaluate) => {
+                features.push(RuntimeFeature::ScriptEvaluate)
+            }
+            Capability::L3(L3Capability::Navigate) => {
+                features.push(RuntimeFeature::Navigate)
+            }
+            Capability::L3(L3Capability::Capture) => {
+                features.push(RuntimeFeature::CaptureState);
+                features.push(RuntimeFeature::CaptureHtml);
+                features.push(RuntimeFeature::CaptureViewportPng);
+            }
+            Capability::L3(L3Capability::Lifecycle) => {
+                features.push(RuntimeFeature::Lifecycle)
+            }
+        }
+    }
+    features.push(RuntimeFeature::PersistentProfile);
+    features.push(match persona.kind() {
+        PersonaKind::Desktop => RuntimeFeature::DesktopWeb,
+        PersonaKind::Mobile => RuntimeFeature::MobileWebEmulation,
+    });
+    if headful_authentication {
+        features.push(RuntimeFeature::HeadfulAuthentication);
+    }
+    RuntimeRequirements::new(features, false)
+}
+
 fn bind_identity_contract(
     profile: &IdentityProfile,
     persona: &BrowserPersona,
@@ -514,6 +585,7 @@ fn append_session_status(
 
 struct Slot {
     worker: BrowserWorker,
+    resolved_runtime: ResolvedRuntime,
     session_gate: Mutex<()>,
     active_leases: AtomicUsize,
     last_used: AtomicU64,
@@ -576,6 +648,11 @@ impl BrowserStation {
         {
             return Err(StationError::CapabilityDenied);
         }
+        let requirements = runtime_requirements(&capabilities, identity.persona(), false)?;
+        let runtime = self.inner.config.runtime_registry.prepare(
+            self.inner.config.runtime_selector,
+            &requirements,
+        )?;
 
         let mut state = self.inner.state.lock().await;
         if self.inner.shutting_down.load(Ordering::Acquire) {
@@ -650,7 +727,7 @@ impl BrowserStation {
         bind_identity_contract(&profile, identity.persona())?;
         let mut worker_config = self.inner.config.worker.clone();
         apply_persona(&mut worker_config, identity.persona())?;
-        let worker = BrowserWorker::spawn(
+        let worker = runtime.spawn(
             profile,
             self.inner.config.worker_capabilities.clone(),
             worker_config,
@@ -670,6 +747,7 @@ impl BrowserStation {
         }
         let slot = Arc::new(Slot {
             worker,
+            resolved_runtime: runtime.resolved().clone(),
             session_gate: Mutex::new(()),
             active_leases: AtomicUsize::new(1),
             last_used: AtomicU64::new(now),
@@ -764,6 +842,16 @@ impl BrowserStation {
         if self.inner.shutting_down.load(Ordering::Acquire) {
             return Err(StationError::ShuttingDown);
         }
+        let worker_capabilities = CapabilitySet::monitoring();
+        let requirements = runtime_requirements(
+            &worker_capabilities,
+            identity.persona(),
+            true,
+        )?;
+        let runtime = self.inner.config.runtime_registry.prepare(
+            self.inner.config.runtime_selector,
+            &requirements,
+        )?;
         let _operation = self.inner.operation_gate.read().await;
 
         let evicted = {
@@ -843,9 +931,9 @@ impl BrowserStation {
             self.remove_auth_reservation(&identity).await;
             return Err(error);
         }
-        let worker = match BrowserWorker::spawn(
+        let worker = match runtime.spawn(
             profile,
-            CapabilitySet::monitoring(),
+            worker_capabilities,
             worker_config,
         ) {
             Ok(worker) => worker,
@@ -1154,6 +1242,10 @@ impl BrowserLease {
 
     pub fn snapshot(&self) -> BrowserSnapshot {
         self.slot.worker.snapshot()
+    }
+
+    pub fn resolved_runtime(&self) -> &ResolvedRuntime {
+        &self.slot.resolved_runtime
     }
 
     pub async fn execute(&self, command: AgentCommand) -> Result<AgentReply, StationError> {
@@ -1584,6 +1676,10 @@ pub enum StationError {
     ShutdownIncomplete { stopped: usize, failed: usize },
     #[error(transparent)]
     Identity(#[from] IdentityError),
+    #[error(transparent)]
+    RuntimeRequirements(#[from] RuntimeRequirementsError),
+    #[error(transparent)]
+    RuntimeRegistry(#[from] RuntimeRegistryError),
     #[error(transparent)]
     Worker(#[from] WorkerError),
 }

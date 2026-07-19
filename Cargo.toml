@@ -13,6 +13,7 @@ readme = "README.md"
 members = [
     ".",
     "crates/dig2browser-client",
+    "crates/dig2browser-core",
     "crates/dig2browser-protocol",
     "crates/dig2browser-station",
 ]
