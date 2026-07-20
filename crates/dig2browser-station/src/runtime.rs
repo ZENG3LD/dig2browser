@@ -89,12 +89,22 @@ impl RuntimeRegistry {
         selector: RuntimeSelector,
         requirements: &RuntimeRequirements,
     ) -> Result<PreparedRuntime, RuntimeRegistryError> {
+        self.prepare_all(selector, &[requirements])
+    }
+
+    pub(crate) fn prepare_all(
+        &self,
+        selector: RuntimeSelector,
+        requirement_sets: &[&RuntimeRequirements],
+    ) -> Result<PreparedRuntime, RuntimeRegistryError> {
         match selector {
-            RuntimeSelector::Exact(kind) => self.prepare_exact(kind, requirements),
+            RuntimeSelector::Exact(kind) => {
+                self.prepare_exact(kind, requirement_sets)
+            }
             RuntimeSelector::Auto => {
                 let mut last_incompatible = None;
                 for kind in &self.auto_order {
-                    match self.prepare_exact(*kind, requirements) {
+                    match self.prepare_exact(*kind, requirement_sets) {
                         Ok(prepared) => return Ok(prepared),
                         Err(RuntimeRegistryError::Unavailable(_))
                         | Err(RuntimeRegistryError::NotRegistered(_)) => {}
@@ -112,18 +122,19 @@ impl RuntimeRegistry {
     fn prepare_exact(
         &self,
         kind: RuntimeKind,
-        requirements: &RuntimeRequirements,
+        requirement_sets: &[&RuntimeRequirements],
     ) -> Result<PreparedRuntime, RuntimeRegistryError> {
         let factory = Arc::clone(
             self.factories
                 .get(&kind)
                 .ok_or(RuntimeRegistryError::NotRegistered(kind))?,
         );
-        let version = factory.probe_version()?;
         let resolved = factory
             .descriptor()
-            .negotiate(requirements, version)
+            .negotiate_all(requirement_sets, None)
             .map_err(|source| RuntimeRegistryError::Incompatible { kind, source })?;
+        let version = factory.probe_version()?;
+        let resolved = resolved.with_version(version);
         Ok(PreparedRuntime { factory, resolved })
     }
 }
@@ -271,4 +282,78 @@ pub enum RuntimeRegistryError {
         #[source]
         source: NegotiationError,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    struct ProbeCountingFactory {
+        descriptor: RuntimeDescriptor,
+        probes: Arc<AtomicUsize>,
+    }
+
+    impl RuntimeFactory for ProbeCountingFactory {
+        fn descriptor(&self) -> &RuntimeDescriptor {
+            &self.descriptor
+        }
+
+        fn probe_version(&self) -> Result<Option<String>, RuntimeRegistryError> {
+            self.probes.fetch_add(1, Ordering::AcqRel);
+            Ok(Some("test-version".to_owned()))
+        }
+
+        fn spawn(
+            &self,
+            _identity: IdentityProfile,
+            _capabilities: CapabilitySet,
+            _config: BrowserWorkerConfig,
+        ) -> Result<BrowserWorker, WorkerError> {
+            panic!("static incompatibility must never reach spawn")
+        }
+    }
+
+    #[test]
+    fn static_incompatibility_does_not_probe_host_readiness() {
+        let descriptor = RuntimeDescriptor::new(
+            RuntimeKind::Chrome,
+            EngineFamily::Chromium,
+            ControlTransport::Cdp,
+            vec![FeatureSupport::new(
+                RuntimeFeature::NativeMobileDevice,
+                SupportLevel::Unsupported,
+                vec![RuntimeLimitation::NoNativeMobileApis],
+            )],
+        )
+        .expect("valid test descriptor");
+        let probes = Arc::new(AtomicUsize::new(0));
+        let mut registry = RuntimeRegistry::empty();
+        registry
+            .register(
+                ProbeCountingFactory {
+                    descriptor,
+                    probes: Arc::clone(&probes),
+                },
+                true,
+            )
+            .expect("register test runtime");
+        let requirements = RuntimeRequirements::new(
+            vec![RuntimeFeature::NativeMobileDevice],
+            false,
+        )
+        .expect("valid requirements");
+
+        assert!(matches!(
+            registry.resolve(RuntimeSelector::Auto, &requirements),
+            Err(RuntimeRegistryError::Incompatible {
+                kind: RuntimeKind::Chrome,
+                source: NegotiationError::UnsupportedFeature(
+                    RuntimeFeature::NativeMobileDevice
+                ),
+            })
+        ));
+        assert_eq!(probes.load(Ordering::Acquire), 0);
+    }
 }

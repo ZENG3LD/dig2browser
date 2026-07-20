@@ -27,14 +27,16 @@ use dig2browser_protocol::{
     SessionHealthProbe, SessionPhase, SessionStateUpdate,
 };
 use dig2browser_core::{
-    RuntimeFeature, RuntimeRequirements, RuntimeRequirementsError,
+    ControlTransport, EngineFamily, RuntimeFeature, RuntimeRequirementsError,
 };
 use tokio::sync::{Mutex, RwLock, Semaphore};
 
 pub mod ipc;
 pub mod runtime;
 
-pub use dig2browser_core::{ResolvedRuntime, RuntimeKind, RuntimeSelector};
+pub use dig2browser_core::{
+    ResolvedRuntime, RuntimeKind, RuntimeRequirements, RuntimeSelector,
+};
 pub use runtime::{RuntimeFactory, RuntimeRegistry, RuntimeRegistryError};
 
 const MAX_RESIDENT: usize = 256;
@@ -393,6 +395,27 @@ fn runtime_requirements(
     RuntimeRequirements::new(features, false)
 }
 
+fn constrained_runtime_selector(
+    configured: RuntimeSelector,
+    requested: RuntimeSelector,
+) -> Result<RuntimeSelector, StationError> {
+    match (configured, requested) {
+        (RuntimeSelector::Auto, requested) => Ok(requested),
+        (configured @ RuntimeSelector::Exact(_), RuntimeSelector::Auto) => Ok(configured),
+        (RuntimeSelector::Exact(configured), RuntimeSelector::Exact(requested))
+            if configured == requested =>
+        {
+            Ok(RuntimeSelector::Exact(configured))
+        }
+        (RuntimeSelector::Exact(configured), RuntimeSelector::Exact(requested)) => {
+            Err(StationError::RuntimeSelectionDenied {
+                configured,
+                requested,
+            })
+        }
+    }
+}
+
 fn bind_identity_contract(
     profile: &IdentityProfile,
     persona: &BrowserPersona,
@@ -583,9 +606,35 @@ fn append_session_status(
     file.sync_data().map_err(StationError::SessionIo)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeInstanceIdentity {
+    kind: RuntimeKind,
+    engine: EngineFamily,
+    control: ControlTransport,
+    version: Option<String>,
+}
+
+impl RuntimeInstanceIdentity {
+    fn from_resolved(runtime: &ResolvedRuntime) -> Self {
+        Self {
+            kind: runtime.kind(),
+            engine: runtime.engine(),
+            control: runtime.control(),
+            version: runtime.version().map(str::to_owned),
+        }
+    }
+
+    fn matches(&self, runtime: &ResolvedRuntime) -> bool {
+        self.kind == runtime.kind()
+            && self.engine == runtime.engine()
+            && self.control == runtime.control()
+            && self.version.as_deref() == runtime.version()
+    }
+}
+
 struct Slot {
     worker: BrowserWorker,
-    resolved_runtime: ResolvedRuntime,
+    runtime: RuntimeInstanceIdentity,
     session_gate: Mutex<()>,
     active_leases: AtomicUsize,
     last_used: AtomicU64,
@@ -639,6 +688,24 @@ impl BrowserStation {
         identity: IdentityRequest,
         capabilities: CapabilitySet,
     ) -> Result<BrowserLease, StationError> {
+        self.lease_with_runtime_requirements(
+            identity,
+            capabilities,
+            RuntimeSelector::Auto,
+            None,
+        )
+        .await
+    }
+
+    /// Acquire a lease with an opt-in runtime selector and additional runtime
+    /// requirements. Caller grants remain governed by `capabilities`.
+    pub async fn lease_with_runtime_requirements(
+        &self,
+        identity: IdentityRequest,
+        capabilities: CapabilitySet,
+        requested_selector: RuntimeSelector,
+        additional_requirements: Option<&RuntimeRequirements>,
+    ) -> Result<BrowserLease, StationError> {
         if self.inner.shutting_down.load(Ordering::Acquire) {
             return Err(StationError::ShuttingDown);
         }
@@ -648,11 +715,22 @@ impl BrowserStation {
         {
             return Err(StationError::CapabilityDenied);
         }
-        let requirements = runtime_requirements(&capabilities, identity.persona(), false)?;
-        let runtime = self.inner.config.runtime_registry.prepare(
+        let selector = constrained_runtime_selector(
             self.inner.config.runtime_selector,
-            &requirements,
+            requested_selector,
         )?;
+        let requirements = runtime_requirements(&capabilities, identity.persona(), false)?;
+        let runtime = match additional_requirements {
+            Some(additional) => self.inner.config.runtime_registry.prepare_all(
+                selector,
+                &[&requirements, additional],
+            )?,
+            None => self
+                .inner
+                .config
+                .runtime_registry
+                .prepare(selector, &requirements)?,
+        };
 
         let mut state = self.inner.state.lock().await;
         if self.inner.shutting_down.load(Ordering::Acquire) {
@@ -675,24 +753,37 @@ impl BrowserStation {
             return Err(StationError::AuthSessionBusy);
         }
         if let Some(slot) = state.slots.get(&identity).cloned() {
-            let ready = match slot.worker.snapshot().lifecycle {
-                WorkerLifecycle::Ready => true,
-                WorkerLifecycle::Degraded => slot
-                    .worker
-                    .execute(AgentCommand::Restart)
-                    .await
-                    .is_ok(),
-                WorkerLifecycle::Starting | WorkerLifecycle::Restarting => slot
-                    .worker
-                    .wait_until_settled()
-                    .await
-                    .is_ok_and(|snapshot| snapshot.lifecycle == WorkerLifecycle::Ready),
-                WorkerLifecycle::ShuttingDown | WorkerLifecycle::Stopped => false,
-            };
-            if ready {
-                slot.active_leases.fetch_add(1, Ordering::AcqRel);
-                slot.last_used.store(now, Ordering::Release);
-                return Ok(BrowserLease::new(self.clone(), identity, slot, capabilities));
+            if !slot.runtime.matches(runtime.resolved())
+                && slot.active_leases.load(Ordering::Acquire) != 0
+            {
+                return Err(StationError::RuntimeSelectionBusy);
+            }
+            if slot.runtime.matches(runtime.resolved()) {
+                let ready = match slot.worker.snapshot().lifecycle {
+                    WorkerLifecycle::Ready => true,
+                    WorkerLifecycle::Degraded => slot
+                        .worker
+                        .execute(AgentCommand::Restart)
+                        .await
+                        .is_ok(),
+                    WorkerLifecycle::Starting | WorkerLifecycle::Restarting => slot
+                        .worker
+                        .wait_until_settled()
+                        .await
+                        .is_ok_and(|snapshot| snapshot.lifecycle == WorkerLifecycle::Ready),
+                    WorkerLifecycle::ShuttingDown | WorkerLifecycle::Stopped => false,
+                };
+                if ready {
+                    slot.active_leases.fetch_add(1, Ordering::AcqRel);
+                    slot.last_used.store(now, Ordering::Release);
+                    return Ok(BrowserLease::new(
+                        self.clone(),
+                        identity,
+                        slot,
+                        capabilities,
+                        runtime.resolved().clone(),
+                    ));
+                }
             }
             state.slots.remove(&identity);
             let _ = slot.worker.shutdown().await;
@@ -727,6 +818,7 @@ impl BrowserStation {
         bind_identity_contract(&profile, identity.persona())?;
         let mut worker_config = self.inner.config.worker.clone();
         apply_persona(&mut worker_config, identity.persona())?;
+        let resolved_runtime = runtime.resolved().clone();
         let worker = runtime.spawn(
             profile,
             self.inner.config.worker_capabilities.clone(),
@@ -747,7 +839,7 @@ impl BrowserStation {
         }
         let slot = Arc::new(Slot {
             worker,
-            resolved_runtime: runtime.resolved().clone(),
+            runtime: RuntimeInstanceIdentity::from_resolved(&resolved_runtime),
             session_gate: Mutex::new(()),
             active_leases: AtomicUsize::new(1),
             last_used: AtomicU64::new(now),
@@ -757,7 +849,13 @@ impl BrowserStation {
             return Err(StationError::ShuttingDown);
         }
         state.slots.insert(identity.clone(), Arc::clone(&slot));
-        Ok(BrowserLease::new(self.clone(), identity, slot, capabilities))
+        Ok(BrowserLease::new(
+            self.clone(),
+            identity,
+            slot,
+            capabilities,
+            resolved_runtime,
+        ))
     }
 
     pub async fn snapshot(&self) -> StationSnapshot {
@@ -1219,6 +1317,7 @@ pub struct BrowserLease {
     identity: IdentityRequest,
     slot: Arc<Slot>,
     capabilities: CapabilitySet,
+    resolved_runtime: ResolvedRuntime,
 }
 
 impl BrowserLease {
@@ -1227,12 +1326,14 @@ impl BrowserLease {
         identity: IdentityRequest,
         slot: Arc<Slot>,
         capabilities: CapabilitySet,
+        resolved_runtime: ResolvedRuntime,
     ) -> Self {
         Self {
             station,
             identity,
             slot,
             capabilities,
+            resolved_runtime,
         }
     }
 
@@ -1245,7 +1346,7 @@ impl BrowserLease {
     }
 
     pub fn resolved_runtime(&self) -> &ResolvedRuntime {
-        &self.slot.resolved_runtime
+        &self.resolved_runtime
     }
 
     pub async fn execute(&self, command: AgentCommand) -> Result<AgentReply, StationError> {
@@ -1555,6 +1656,7 @@ impl Clone for BrowserLease {
             identity: self.identity.clone(),
             slot: Arc::clone(&self.slot),
             capabilities: self.capabilities.clone(),
+            resolved_runtime: self.resolved_runtime.clone(),
         }
     }
 }
@@ -1640,6 +1742,13 @@ pub enum StationError {
     AtCapacity,
     #[error("browser worker did not become ready")]
     WorkerUnavailable,
+    #[error("requested runtime conflicts with station runtime policy")]
+    RuntimeSelectionDenied {
+        configured: RuntimeKind,
+        requested: RuntimeKind,
+    },
+    #[error("the identity is leased by a different runtime instance")]
+    RuntimeSelectionBusy,
     #[error("browser profile is bound to a different persona")]
     PersonaMismatch,
     #[error("browser profile is bound to a different identity class")]

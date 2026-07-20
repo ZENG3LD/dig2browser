@@ -159,22 +159,43 @@ impl RuntimeDescriptor {
         requirements: &RuntimeRequirements,
         version: Option<String>,
     ) -> Result<ResolvedRuntime, NegotiationError> {
-        let mut granted = Vec::with_capacity(requirements.features.len());
-        for feature in &requirements.features {
-            let support = self
-                .support_for(*feature)
-                .ok_or(NegotiationError::MissingFeature(*feature))?;
-            match support.level {
-                SupportLevel::Native | SupportLevel::Emulated => {}
-                SupportLevel::Partial if requirements.allow_partial => {}
-                SupportLevel::Partial => {
-                    return Err(NegotiationError::PartialSupportDenied(*feature));
+        self.negotiate_all(&[requirements], version)
+    }
+
+    /// Negotiate independent requirement sets without letting one set's
+    /// partial-support policy weaken another set.
+    pub fn negotiate_all(
+        &self,
+        requirement_sets: &[&RuntimeRequirements],
+        version: Option<String>,
+    ) -> Result<ResolvedRuntime, NegotiationError> {
+        let capacity = requirement_sets
+            .iter()
+            .map(|requirements| requirements.features.len())
+            .sum();
+        let mut granted: Vec<FeatureSupport> = Vec::with_capacity(capacity);
+        for requirements in requirement_sets {
+            for feature in &requirements.features {
+                let support = self
+                    .support_for(*feature)
+                    .ok_or(NegotiationError::MissingFeature(*feature))?;
+                match support.level {
+                    SupportLevel::Native | SupportLevel::Emulated => {}
+                    SupportLevel::Partial if requirements.allow_partial => {}
+                    SupportLevel::Partial => {
+                        return Err(NegotiationError::PartialSupportDenied(*feature));
+                    }
+                    SupportLevel::Unsupported => {
+                        return Err(NegotiationError::UnsupportedFeature(*feature));
+                    }
                 }
-                SupportLevel::Unsupported => {
-                    return Err(NegotiationError::UnsupportedFeature(*feature));
+                if !granted
+                    .iter()
+                    .any(|granted| granted.feature == *feature)
+                {
+                    granted.push(support.clone());
                 }
             }
-            granted.push(support.clone());
         }
         Ok(ResolvedRuntime {
             kind: self.kind,
@@ -243,6 +264,11 @@ impl ResolvedRuntime {
 
     pub fn granted(&self) -> &[FeatureSupport] {
         &self.granted
+    }
+
+    pub fn with_version(mut self, version: Option<String>) -> Self {
+        self.version = version;
+        self
     }
 }
 
@@ -467,6 +493,28 @@ mod tests {
             requirements,
             Err(RuntimeRequirementsError::DuplicateFeature(
                 RuntimeFeature::Navigate
+            ))
+        );
+    }
+
+    #[test]
+    fn independent_requirement_sets_keep_their_partial_policy() {
+        let descriptor = descriptor(vec![
+            support(RuntimeFeature::Navigate, SupportLevel::Native),
+            support(RuntimeFeature::DomInspect, SupportLevel::Partial),
+        ]);
+        let base = requirements(vec![RuntimeFeature::Navigate], false);
+        let optional = requirements(vec![RuntimeFeature::DomInspect], true);
+        let resolved = descriptor
+            .negotiate_all(&[&base, &optional], None)
+            .expect("partial policy applies only to the optional set");
+        assert_eq!(resolved.granted().len(), 2);
+
+        let strict = requirements(vec![RuntimeFeature::DomInspect], false);
+        assert_eq!(
+            descriptor.negotiate_all(&[&base, &optional, &strict], None),
+            Err(NegotiationError::PartialSupportDenied(
+                RuntimeFeature::DomInspect
             ))
         );
     }

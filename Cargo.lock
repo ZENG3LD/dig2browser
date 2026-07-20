@@ -525,6 +525,7 @@ dependencies = [
 name = "dig2browser-client"
 version = "0.1.0"
 dependencies = [
+ "dig2browser-core",
  "dig2browser-protocol",
  "thiserror",
  "tokio",
@@ -538,6 +539,7 @@ version = "0.1.0"
 name = "dig2browser-protocol"
 version = "0.1.0"
 dependencies = [
+ "dig2browser-core",
  "tokio",
 ]
 

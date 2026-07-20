@@ -12,9 +12,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use dig2browser::identity::ProfileOwnershipGuard;
 use dig2browser_client::{
     BrowserPersona, ClientConfig, ClientError, CollectionTask, FailureClass,
-    IdentitySessionStatus, MobilePersonaConfig, ProfileClass, ResponseStatus,
-    SessionHealthProbe, SessionPhase, SessionStateUpdate, StationClient, StationStatus,
-    TaskCapturePolicy, TaskReply, TaskStep,
+    ControlTransport, EngineFamily, IdentitySessionStatus, MobilePersonaConfig,
+    ProfileClass, ResponseStatus, RuntimeFeature, RuntimeKind,
+    RuntimeRequirements, RuntimeSelector, SessionHealthProbe, SessionPhase,
+    SessionStateUpdate, StationClient, StationStatus, SupportLevel,
+    TaskCapturePolicy, TaskReply, TaskRuntimeContract, TaskStep,
 };
 use tokio::io::AsyncReadExt;
 
@@ -352,6 +354,11 @@ async fn stationd_explicit_chrome_and_edge_runtime_selection_e2e() {
     let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
 
     for (runtime, expects_edge_brand) in [("chrome", false), ("edge", true)] {
+        let runtime_kind = if expects_edge_brand {
+            RuntimeKind::Edge
+        } else {
+            RuntimeKind::Chrome
+        };
         let unique = uuid::Uuid::new_v4();
         let pipe_name = format!("dig2browser-stationd-{runtime}-e2e-{unique}");
         let profiles = e2e_temp_base().join(format!(
@@ -378,21 +385,55 @@ async fn stationd_explicit_chrome_and_edge_runtime_selection_e2e() {
         .expect("connect explicit-runtime station client");
         let marker = format!("explicit-{runtime}-runtime");
         let url = fixture.url(&format!("/{marker}"));
-        let task = CollectionTask::new(vec![
-            TaskStep::Navigate { url: url.clone() },
-            TaskStep::Evaluate {
-                script: "navigator.userAgent".to_owned(),
-            },
-            TaskStep::Capture {
-                policy: TaskCapturePolicy::EvidenceViewport,
-            },
-        ])
+        let runtime_contract = TaskRuntimeContract::new(
+            RuntimeSelector::Exact(runtime_kind),
+            RuntimeRequirements::new(Vec::new(), false)
+                .expect("valid evidence-only runtime requirements"),
+        )
+        .expect("valid explicit runtime contract");
+        let task = CollectionTask::new_with_runtime(
+            vec![
+                TaskStep::Navigate { url: url.clone() },
+                TaskStep::Evaluate {
+                    script: "navigator.userAgent".to_owned(),
+                },
+                TaskStep::Capture {
+                    policy: TaskCapturePolicy::EvidenceViewport,
+                },
+            ],
+            runtime_contract,
+        )
         .expect("valid explicit-runtime typed task");
         let result = client
             .run_task(&format!("explicit-{runtime}-profile"), task)
             .await
             .expect("run task through explicit browser runtime");
 
+        let resolved = result
+            .runtime()
+            .expect("opt-in task returns resolved runtime evidence");
+        assert_eq!(resolved.kind(), runtime_kind);
+        assert_eq!(resolved.engine(), EngineFamily::Chromium);
+        assert_eq!(resolved.control(), ControlTransport::Cdp);
+        assert!(resolved.version().is_some_and(|version| !version.is_empty()));
+        for feature in [
+            RuntimeFeature::ScriptEvaluate,
+            RuntimeFeature::Navigate,
+            RuntimeFeature::CaptureState,
+            RuntimeFeature::CaptureHtml,
+            RuntimeFeature::CaptureViewportPng,
+            RuntimeFeature::Lifecycle,
+            RuntimeFeature::PersistentProfile,
+            RuntimeFeature::DesktopWeb,
+        ] {
+            assert!(
+                resolved.granted().iter().any(|support| {
+                    support.feature() == feature
+                        && support.level() == SupportLevel::Native
+                }),
+                "{runtime} did not record granted feature {feature:?}"
+            );
+        }
         assert_eq!(result.replies().len(), 3);
         let TaskReply::ScriptJson(user_agent_json) = &result.replies()[1] else {
             panic!("explicit {runtime} task did not return user agent JSON");
@@ -433,6 +474,28 @@ async fn stationd_explicit_chrome_and_edge_runtime_selection_e2e() {
             Some(dig2browser::digest::sha256_bytes(&capture.png))
         );
 
+        let legacy_url = fixture.url(&format!("/legacy-{runtime}-runtime"));
+        let legacy = client
+            .run_task(
+                &format!("explicit-{runtime}-profile"),
+                CollectionTask::new(vec![
+                    TaskStep::Navigate {
+                        url: legacy_url.clone(),
+                    },
+                    TaskStep::Capture {
+                        policy: TaskCapturePolicy::HtmlOnly,
+                    },
+                ])
+                .expect("valid legacy typed task"),
+            )
+            .await
+            .expect("legacy D2TK v1 remains supported");
+        assert!(legacy.runtime().is_none());
+        let TaskReply::Capture(legacy_capture) = &legacy.replies()[1] else {
+            panic!("legacy {runtime} task did not return capture");
+        };
+        assert_eq!(legacy_capture.final_url, legacy_url);
+
         client
             .shutdown()
             .await
@@ -461,6 +524,85 @@ async fn stationd_explicit_chrome_and_edge_runtime_selection_e2e() {
         assert!(stdout.contains("\"drain_timed_out\":false"));
         remove_tree(&profiles).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stationd_rejects_native_mobile_before_profile_or_runtime_spawn_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-stationd-runtime-reject-e2e-{unique}");
+    let profiles = e2e_temp_base().join(format!(
+        "dig2browser-stationd-runtime-reject-e2e-{unique}"
+    ));
+    std::fs::create_dir_all(&profiles).expect("create runtime-reject profiles root");
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+    let mut daemon = spawn_stationd_for_runtime(
+        stationd,
+        &pipe_name,
+        &profiles,
+        "chrome",
+    );
+    let client = StationClient::connect(
+        ClientConfig::new(
+            &pipe_name,
+            Duration::from_secs(15),
+            Duration::from_secs(30),
+        )
+        .expect("valid runtime-reject client config"),
+    )
+    .await
+    .expect("connect runtime-reject station client");
+    let profile_id = "native-mobile-rejected";
+    let contract = TaskRuntimeContract::new(
+        RuntimeSelector::Exact(RuntimeKind::Chrome),
+        RuntimeRequirements::new(
+            vec![RuntimeFeature::NativeMobileDevice],
+            false,
+        )
+        .expect("valid unsupported runtime requirement"),
+    )
+    .expect("valid runtime-reject contract");
+    let task = CollectionTask::new_with_runtime(
+        vec![TaskStep::Wait {
+            duration: Duration::from_millis(1),
+        }],
+        contract,
+    )
+    .expect("valid runtime-reject task");
+
+    let error = client
+        .run_task(profile_id, task)
+        .await
+        .expect_err("native mobile must fail closed on Chrome");
+    match error {
+        ClientError::Remote { status, message } => {
+            assert_eq!(status, ResponseStatus::Unsupported);
+            assert_eq!(message, "runtime contract unsupported");
+        }
+        other => panic!("unexpected runtime rejection: {other}"),
+    }
+    assert!(
+        !profiles.join(profile_id).exists(),
+        "runtime rejection created a profile"
+    );
+    let status = client.status().await.expect("read runtime-reject status");
+    assert_eq!(status.resident_identities, 0);
+    assert_eq!(status.active_leases, 0);
+
+    client
+        .shutdown()
+        .await
+        .expect("shutdown runtime-reject station");
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("runtime-reject station exit timeout")
+        .expect("wait for runtime-reject station");
+    assert!(status.success(), "runtime-reject station failed: {status}");
+    let (stdout, stderr) = read_child_output(&mut daemon).await;
+    assert!(stderr.is_empty(), "runtime-reject station wrote stderr: {stderr}");
+    assert!(stdout.contains("\"outcome\":\"clean\""));
+    assert!(stdout.contains("\"stopped_workers\":0"));
+    remove_tree(&profiles).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

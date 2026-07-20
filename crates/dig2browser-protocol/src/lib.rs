@@ -16,8 +16,13 @@ pub use session::{
 
 pub use task::{
     CaptureCompleteness, CollectionTask, CollectionTaskResult, EvidenceCapture,
-    TaskCapturePolicy, TaskReply, TaskStep, MAX_TASK_RESULT_BYTES, MAX_TASK_STEPS,
-    MAX_TASK_WAIT,
+    ResolvedRuntimeRecord, TaskCapturePolicy, TaskReply, TaskRuntimeContract,
+    TaskStep, MAX_TASK_RESULT_BYTES, MAX_TASK_STEPS, MAX_TASK_WAIT,
+};
+pub use dig2browser_core::{
+    ControlTransport, EngineFamily, FeatureSupport, ResolvedRuntime,
+    RuntimeFeature, RuntimeKind, RuntimeLimitation, RuntimeRequirements,
+    RuntimeRequirementsError, RuntimeSelector, SupportLevel,
 };
 
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -625,6 +630,7 @@ pub enum ResponseStatus {
     CaptureFailed = 3,
     TooLarge = 4,
     Protocol = 5,
+    Unsupported = 6,
 }
 
 impl ResponseStatus {
@@ -636,6 +642,7 @@ impl ResponseStatus {
             3 => Ok(Self::CaptureFailed),
             4 => Ok(Self::TooLarge),
             5 => Ok(Self::Protocol),
+            6 => Ok(Self::Unsupported),
             _ => Err(FrameError::InvalidResponse),
         }
     }
@@ -1304,6 +1311,15 @@ impl From<ProtocolError> for FrameError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_response_status_has_stable_wire_code() {
+        assert_eq!(ResponseStatus::Unsupported as u8, 6);
+        assert_eq!(
+            ResponseStatus::from_wire(6).expect("decode unsupported"),
+            ResponseStatus::Unsupported
+        );
+    }
 
     #[tokio::test]
     async fn request_and_response_round_trip_fixed_v1_layout() {

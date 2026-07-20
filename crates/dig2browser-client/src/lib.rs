@@ -11,10 +11,13 @@ use tokio::sync::Mutex;
 
 pub use dig2browser_protocol::{
     BrowserPersona, CaptureCompleteness, CollectionTask, CollectionTaskResult,
-    EvidenceCapture, FailureClass, IdentitySessionStatus, MobilePersonaConfig,
-    PersonaKind, ProfileClass, ResponseStatus, SessionPhase,
-    SessionHealthProbe, SessionStateUpdate, StationStatus, TaskCapturePolicy,
-    TaskReply, TaskStep, DEFAULT_STATION_PIPE,
+    ControlTransport, EngineFamily, EvidenceCapture, FailureClass,
+    IdentitySessionStatus, MobilePersonaConfig, PersonaKind, ProfileClass,
+    ResolvedRuntimeRecord, ResponseStatus, RuntimeFeature, RuntimeKind,
+    RuntimeLimitation, RuntimeRequirements, RuntimeSelector, SessionPhase,
+    SessionHealthProbe, SessionStateUpdate, StationStatus, SupportLevel,
+    TaskCapturePolicy, TaskReply, TaskRuntimeContract, TaskStep,
+    DEFAULT_STATION_PIPE,
 };
 
 const MIN_TIMEOUT: Duration = Duration::from_millis(100);
@@ -134,12 +137,10 @@ impl StationClient {
         profile_id: impl Into<String>,
         task: CollectionTask,
     ) -> Result<CollectionTaskResult, ClientError> {
+        let runtime_contract = task.runtime_contract().cloned();
         let request = WorkerRequest::task(self.take_request_id(), profile_id, task);
         let response = self.call(request).await?;
-        require_ok(&response)?;
-        response
-            .decode_task_result()
-            .map_err(|_| ClientError::InvalidResponse)
+        require_task_result(&response, runtime_contract.as_ref())
     }
 
     pub async fn run_task_with_persona(
@@ -148,6 +149,7 @@ impl StationClient {
         persona: BrowserPersona,
         task: CollectionTask,
     ) -> Result<CollectionTaskResult, ClientError> {
+        let runtime_contract = task.runtime_contract().cloned();
         let request = WorkerRequest::task_with_persona(
             self.take_request_id(),
             profile_id,
@@ -155,10 +157,7 @@ impl StationClient {
             task,
         );
         let response = self.call(request).await?;
-        require_ok(&response)?;
-        response
-            .decode_task_result()
-            .map_err(|_| ClientError::InvalidResponse)
+        require_task_result(&response, runtime_contract.as_ref())
     }
 
     pub async fn run_task_with_identity(
@@ -168,6 +167,7 @@ impl StationClient {
         persona: BrowserPersona,
         task: CollectionTask,
     ) -> Result<CollectionTaskResult, ClientError> {
+        let runtime_contract = task.runtime_contract().cloned();
         let request = WorkerRequest::task_with_identity(
             self.take_request_id(),
             profile_id,
@@ -176,10 +176,7 @@ impl StationClient {
             task,
         );
         let response = self.call(request).await?;
-        require_ok(&response)?;
-        response
-            .decode_task_result()
-            .map_err(|_| ClientError::InvalidResponse)
+        require_task_result(&response, runtime_contract.as_ref())
     }
 
     /// Run a public-profile task while periodically yielding for lease
@@ -622,6 +619,46 @@ fn require_ok(response: &WorkerResponse) -> Result<(), ClientError> {
     })
 }
 
+fn require_task_result(
+    response: &WorkerResponse,
+    runtime_contract: Option<&TaskRuntimeContract>,
+) -> Result<CollectionTaskResult, ClientError> {
+    require_ok(response)?;
+    let result = response
+        .decode_task_result()
+        .map_err(|_| ClientError::InvalidResponse)?;
+    let runtime_is_valid = match (runtime_contract, result.runtime()) {
+        (None, None) => true,
+        (Some(contract), Some(runtime)) => runtime_satisfies_contract(runtime, contract),
+        _ => false,
+    };
+    if !runtime_is_valid {
+        return Err(ClientError::InvalidResponse);
+    }
+    Ok(result)
+}
+
+fn runtime_satisfies_contract(
+    runtime: &ResolvedRuntimeRecord,
+    contract: &TaskRuntimeContract,
+) -> bool {
+    if let RuntimeSelector::Exact(kind) = contract.selector() {
+        if runtime.kind() != kind {
+            return false;
+        }
+    }
+    contract.requirements().features().iter().all(|required| {
+        runtime.granted().iter().any(|support| {
+            support.feature() == *required
+                && match support.level() {
+                    SupportLevel::Native | SupportLevel::Emulated => true,
+                    SupportLevel::Partial => contract.requirements().allow_partial(),
+                    SupportLevel::Unsupported => false,
+                }
+        })
+    })
+}
+
 #[derive(Debug)]
 pub struct CaptureResult {
     pub final_url: String,
@@ -672,7 +709,30 @@ pub enum CaptureProgressError<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dig2browser_core::{FeatureSupport, RuntimeDescriptor};
     use dig2browser_protocol::RequestKind;
+
+    fn runtime_record(
+        kind: RuntimeKind,
+        support: Vec<FeatureSupport>,
+        allow_partial: bool,
+    ) -> ResolvedRuntimeRecord {
+        let features = support.iter().map(FeatureSupport::feature).collect();
+        let descriptor = RuntimeDescriptor::new(
+            kind,
+            EngineFamily::Chromium,
+            ControlTransport::Cdp,
+            support,
+        )
+        .expect("valid test runtime descriptor");
+        let requirements = RuntimeRequirements::new(features, allow_partial)
+            .expect("valid test runtime requirements");
+        let resolved = descriptor
+            .negotiate(&requirements, Some("test-version".to_owned()))
+            .expect("test runtime resolves");
+        ResolvedRuntimeRecord::from_resolved(&resolved)
+            .expect("valid test runtime record")
+    }
 
     #[test]
     fn validates_pipe_and_timeouts() {
@@ -701,5 +761,65 @@ mod tests {
         assert_eq!(RequestKind::Task as u8, 5);
         assert_eq!(RequestKind::IdentityStatus as u8, 6);
         assert_eq!(RequestKind::UpdateIdentityState as u8, 7);
+    }
+
+    #[test]
+    fn runtime_contract_validation_is_fail_closed() {
+        let native = runtime_record(
+            RuntimeKind::Chrome,
+            vec![FeatureSupport::new(
+                RuntimeFeature::Navigate,
+                SupportLevel::Native,
+                Vec::new(),
+            )],
+            false,
+        );
+        let exact_chrome = TaskRuntimeContract::new(
+            RuntimeSelector::Exact(RuntimeKind::Chrome),
+            RuntimeRequirements::new(vec![RuntimeFeature::Navigate], false)
+                .expect("valid exact Chrome requirements"),
+        )
+        .expect("valid exact Chrome contract");
+        assert!(runtime_satisfies_contract(&native, &exact_chrome));
+
+        let exact_edge = TaskRuntimeContract::new(
+            RuntimeSelector::Exact(RuntimeKind::Edge),
+            RuntimeRequirements::new(vec![RuntimeFeature::Navigate], false)
+                .expect("valid exact Edge requirements"),
+        )
+        .expect("valid exact Edge contract");
+        assert!(!runtime_satisfies_contract(&native, &exact_edge));
+
+        let missing = TaskRuntimeContract::new(
+            RuntimeSelector::Auto,
+            RuntimeRequirements::new(vec![RuntimeFeature::ScriptEvaluate], false)
+                .expect("valid missing-feature requirements"),
+        )
+        .expect("valid missing-feature contract");
+        assert!(!runtime_satisfies_contract(&native, &missing));
+
+        let partial = runtime_record(
+            RuntimeKind::Chrome,
+            vec![FeatureSupport::new(
+                RuntimeFeature::DomInspect,
+                SupportLevel::Partial,
+                vec![RuntimeLimitation::NoNativeMobileApis],
+            )],
+            true,
+        );
+        let strict_partial = TaskRuntimeContract::new(
+            RuntimeSelector::Auto,
+            RuntimeRequirements::new(vec![RuntimeFeature::DomInspect], false)
+                .expect("valid strict requirements"),
+        )
+        .expect("valid strict contract");
+        assert!(!runtime_satisfies_contract(&partial, &strict_partial));
+        let allowed_partial = TaskRuntimeContract::new(
+            RuntimeSelector::Auto,
+            RuntimeRequirements::new(vec![RuntimeFeature::DomInspect], true)
+                .expect("valid partial requirements"),
+        )
+        .expect("valid partial contract");
+        assert!(runtime_satisfies_contract(&partial, &allowed_partial));
     }
 }

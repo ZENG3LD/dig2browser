@@ -1,8 +1,14 @@
 use std::time::Duration;
 
+use dig2browser_core::{
+    ControlTransport, EngineFamily, FeatureSupport, ResolvedRuntime,
+    RuntimeFeature, RuntimeKind, RuntimeLimitation, RuntimeRequirements,
+    RuntimeSelector, SupportLevel,
+};
+
 use crate::{
     validate_http_url, ProtocolError, MAX_HTML_BYTES, MAX_PNG_BYTES,
-    PROTOCOL_VERSION,
+    MAX_REQUEST_BYTES, PROTOCOL_VERSION,
 };
 
 pub const MAX_TASK_STEPS: usize = 64;
@@ -11,7 +17,11 @@ pub const MAX_TASK_RESULT_BYTES: usize = MAX_HTML_BYTES;
 
 const TASK_MAGIC: [u8; 4] = *b"D2TK";
 const TASK_RESULT_MAGIC: [u8; 4] = *b"D2TR";
-const TASK_SCHEMA_VERSION: u16 = 1;
+const TASK_SCHEMA_VERSION_V1: u16 = 1;
+const TASK_SCHEMA_VERSION_V2: u16 = 2;
+const MAX_RUNTIME_FEATURES: usize = 16;
+const MAX_RUNTIME_LIMITATIONS: usize = 3;
+const MAX_RUNTIME_VERSION_BYTES: usize = 128;
 const MAX_SELECTOR_BYTES: usize = 4_096;
 const MAX_KEY_BYTES: usize = 64;
 const MAX_TEXT_BYTES: usize = 64 * 1024;
@@ -56,20 +66,89 @@ pub enum TaskStep {
     Capture { policy: TaskCapturePolicy },
 }
 
+/// Opt-in runtime selection and capability requirements for a task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRuntimeContract {
+    selector: RuntimeSelector,
+    requirements: RuntimeRequirements,
+}
+
+impl TaskRuntimeContract {
+    pub fn new(
+        selector: RuntimeSelector,
+        requirements: RuntimeRequirements,
+    ) -> Result<Self, ProtocolError> {
+        let contract = Self {
+            selector,
+            requirements,
+        };
+        contract.validate()?;
+        Ok(contract)
+    }
+
+    pub fn selector(&self) -> RuntimeSelector {
+        self.selector
+    }
+
+    pub fn requirements(&self) -> &RuntimeRequirements {
+        &self.requirements
+    }
+
+    fn validate(&self) -> Result<(), ProtocolError> {
+        let features = self.requirements.features();
+        if features.len() > MAX_RUNTIME_FEATURES
+            || (features.is_empty() && self.requirements.allow_partial())
+            || duplicate_runtime_feature(features.iter().copied())
+        {
+            return Err(ProtocolError::InvalidTaskPayload);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CollectionTask {
     steps: Vec<TaskStep>,
+    runtime: Option<TaskRuntimeContract>,
 }
 
 impl CollectionTask {
     pub fn new(steps: Vec<TaskStep>) -> Result<Self, ProtocolError> {
-        let task = Self { steps };
+        let task = Self {
+            steps,
+            runtime: None,
+        };
         task.validate()?;
         Ok(task)
     }
 
+    pub fn new_with_runtime(
+        steps: Vec<TaskStep>,
+        runtime: TaskRuntimeContract,
+    ) -> Result<Self, ProtocolError> {
+        let task = Self {
+            steps,
+            runtime: Some(runtime),
+        };
+        task.validate()?;
+        Ok(task)
+    }
+
+    pub fn with_runtime_contract(
+        mut self,
+        runtime: TaskRuntimeContract,
+    ) -> Result<Self, ProtocolError> {
+        self.runtime = Some(runtime);
+        self.validate()?;
+        Ok(self)
+    }
+
     pub fn steps(&self) -> &[TaskStep] {
         &self.steps
+    }
+
+    pub fn runtime_contract(&self) -> Option<&TaskRuntimeContract> {
+        self.runtime.as_ref()
     }
 
     pub fn requires_interaction(&self) -> bool {
@@ -92,6 +171,9 @@ impl CollectionTask {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.steps.is_empty() || self.steps.len() > MAX_TASK_STEPS {
             return Err(ProtocolError::InvalidTaskPayload);
+        }
+        if let Some(runtime) = &self.runtime {
+            runtime.validate()?;
         }
         let mut total_wait = Duration::ZERO;
         let mut navigated = false;
@@ -149,8 +231,16 @@ impl CollectionTask {
         self.validate()?;
         let mut output = Vec::new();
         output.extend_from_slice(&TASK_MAGIC);
-        output.extend_from_slice(&TASK_SCHEMA_VERSION.to_le_bytes());
+        let schema_version = if self.runtime.is_some() {
+            TASK_SCHEMA_VERSION_V2
+        } else {
+            TASK_SCHEMA_VERSION_V1
+        };
+        output.extend_from_slice(&schema_version.to_le_bytes());
         output.extend_from_slice(&(self.steps.len() as u16).to_le_bytes());
+        if let Some(runtime) = &self.runtime {
+            encode_runtime_contract(&mut output, runtime)?;
+        }
         for step in &self.steps {
             match step {
                 TaskStep::Navigate { url } => {
@@ -201,17 +291,27 @@ impl CollectionTask {
                 }
             }
         }
+        if output.len() > MAX_REQUEST_BYTES {
+            return Err(ProtocolError::InvalidTaskPayload);
+        }
         Ok(output)
     }
 
     pub(crate) fn decode_payload(payload: &[u8]) -> Result<Self, ProtocolError> {
         let mut input = Input::new(payload);
-        if input.bytes(4)? != TASK_MAGIC
-            || input.u16()? != TASK_SCHEMA_VERSION
-        {
+        if payload.len() > MAX_REQUEST_BYTES || input.bytes(4)? != TASK_MAGIC {
             return Err(ProtocolError::InvalidTaskPayload);
         }
+        let schema_version = input.u16()?;
         let count = usize::from(input.u16()?);
+        if count == 0 || count > MAX_TASK_STEPS {
+            return Err(ProtocolError::InvalidTaskPayload);
+        }
+        let runtime = match schema_version {
+            TASK_SCHEMA_VERSION_V1 => None,
+            TASK_SCHEMA_VERSION_V2 => Some(decode_runtime_contract(&mut input)?),
+            _ => return Err(ProtocolError::InvalidTaskPayload),
+        };
         let mut steps = Vec::with_capacity(count);
         for _ in 0..count {
             let step = match input.u8()? {
@@ -253,8 +353,138 @@ impl CollectionTask {
         if !input.is_empty() {
             return Err(ProtocolError::InvalidTaskPayload);
         }
-        Self::new(steps)
+        match runtime {
+            Some(runtime) => Self::new_with_runtime(steps, runtime),
+            None => Self::new(steps),
+        }
     }
+}
+
+fn encode_runtime_contract(
+    output: &mut Vec<u8>,
+    contract: &TaskRuntimeContract,
+) -> Result<(), ProtocolError> {
+    contract.validate()?;
+    output.push(runtime_selector_to_wire(contract.selector));
+    output.push(u8::from(contract.requirements.allow_partial()));
+    output.push(contract.requirements.features().len() as u8);
+    for feature in contract.requirements.features() {
+        output.push(runtime_feature_to_wire(*feature));
+    }
+    Ok(())
+}
+
+fn decode_runtime_contract(input: &mut Input<'_>) -> Result<TaskRuntimeContract, ProtocolError> {
+    let selector = runtime_selector_from_wire(input.u8()?)?;
+    let allow_partial = match input.u8()? {
+        0 => false,
+        1 => true,
+        _ => return Err(ProtocolError::InvalidTaskPayload),
+    };
+    let count = usize::from(input.u8()?);
+    if count > MAX_RUNTIME_FEATURES || (count == 0 && allow_partial) {
+        return Err(ProtocolError::InvalidTaskPayload);
+    }
+    let mut features = Vec::with_capacity(count);
+    for _ in 0..count {
+        features.push(runtime_feature_from_wire(input.u8()?)?);
+    }
+    let requirements = RuntimeRequirements::new(features, allow_partial)
+        .map_err(|_| ProtocolError::InvalidTaskPayload)?;
+    TaskRuntimeContract::new(selector, requirements)
+}
+
+fn runtime_selector_to_wire(selector: RuntimeSelector) -> u8 {
+    match selector {
+        RuntimeSelector::Auto => 0,
+        RuntimeSelector::Exact(kind) => runtime_kind_to_wire(kind),
+    }
+}
+
+fn runtime_selector_from_wire(value: u8) -> Result<RuntimeSelector, ProtocolError> {
+    match value {
+        0 => Ok(RuntimeSelector::Auto),
+        value => runtime_kind_from_wire(value).map(RuntimeSelector::Exact),
+    }
+}
+
+fn runtime_kind_to_wire(kind: RuntimeKind) -> u8 {
+    match kind {
+        RuntimeKind::Chrome => 1,
+        RuntimeKind::Edge => 2,
+        RuntimeKind::Firefox => 3,
+        RuntimeKind::Lightweight => 4,
+        RuntimeKind::Android => 5,
+        RuntimeKind::WebView2 => 6,
+        RuntimeKind::Servo => 7,
+    }
+}
+
+fn runtime_kind_from_wire(value: u8) -> Result<RuntimeKind, ProtocolError> {
+    match value {
+        1 => Ok(RuntimeKind::Chrome),
+        2 => Ok(RuntimeKind::Edge),
+        3 => Ok(RuntimeKind::Firefox),
+        4 => Ok(RuntimeKind::Lightweight),
+        5 => Ok(RuntimeKind::Android),
+        6 => Ok(RuntimeKind::WebView2),
+        7 => Ok(RuntimeKind::Servo),
+        _ => Err(ProtocolError::InvalidTaskPayload),
+    }
+}
+
+fn runtime_feature_to_wire(feature: RuntimeFeature) -> u8 {
+    match feature {
+        RuntimeFeature::PointerInput => 1,
+        RuntimeFeature::KeyboardInput => 2,
+        RuntimeFeature::ScrollInput => 3,
+        RuntimeFeature::DomInspect => 4,
+        RuntimeFeature::DomInteract => 5,
+        RuntimeFeature::ScriptEvaluate => 6,
+        RuntimeFeature::Navigate => 7,
+        RuntimeFeature::CaptureState => 8,
+        RuntimeFeature::CaptureHtml => 9,
+        RuntimeFeature::CaptureViewportPng => 10,
+        RuntimeFeature::Lifecycle => 11,
+        RuntimeFeature::PersistentProfile => 12,
+        RuntimeFeature::HeadfulAuthentication => 13,
+        RuntimeFeature::DesktopWeb => 14,
+        RuntimeFeature::MobileWebEmulation => 15,
+        RuntimeFeature::NativeMobileDevice => 16,
+    }
+}
+
+fn runtime_feature_from_wire(value: u8) -> Result<RuntimeFeature, ProtocolError> {
+    match value {
+        1 => Ok(RuntimeFeature::PointerInput),
+        2 => Ok(RuntimeFeature::KeyboardInput),
+        3 => Ok(RuntimeFeature::ScrollInput),
+        4 => Ok(RuntimeFeature::DomInspect),
+        5 => Ok(RuntimeFeature::DomInteract),
+        6 => Ok(RuntimeFeature::ScriptEvaluate),
+        7 => Ok(RuntimeFeature::Navigate),
+        8 => Ok(RuntimeFeature::CaptureState),
+        9 => Ok(RuntimeFeature::CaptureHtml),
+        10 => Ok(RuntimeFeature::CaptureViewportPng),
+        11 => Ok(RuntimeFeature::Lifecycle),
+        12 => Ok(RuntimeFeature::PersistentProfile),
+        13 => Ok(RuntimeFeature::HeadfulAuthentication),
+        14 => Ok(RuntimeFeature::DesktopWeb),
+        15 => Ok(RuntimeFeature::MobileWebEmulation),
+        16 => Ok(RuntimeFeature::NativeMobileDevice),
+        _ => Err(ProtocolError::InvalidTaskPayload),
+    }
+}
+
+fn duplicate_runtime_feature(features: impl IntoIterator<Item = RuntimeFeature>) -> bool {
+    let mut seen = Vec::new();
+    for feature in features {
+        if seen.contains(&feature) {
+            return true;
+        }
+        seen.push(feature);
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,9 +533,88 @@ pub enum TaskReply {
     Capture(Box<EvidenceCapture>),
 }
 
+/// The exact runtime identity and feature support granted for a task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRuntimeRecord {
+    kind: RuntimeKind,
+    engine: EngineFamily,
+    control: ControlTransport,
+    version: Option<String>,
+    granted: Vec<FeatureSupport>,
+}
+
+impl ResolvedRuntimeRecord {
+    pub fn from_resolved(runtime: &ResolvedRuntime) -> Result<Self, ProtocolError> {
+        let record = Self {
+            kind: runtime.kind(),
+            engine: runtime.engine(),
+            control: runtime.control(),
+            version: runtime.version().map(str::to_owned),
+            granted: runtime.granted().to_vec(),
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub fn kind(&self) -> RuntimeKind {
+        self.kind
+    }
+
+    pub fn engine(&self) -> EngineFamily {
+        self.engine
+    }
+
+    pub fn control(&self) -> ControlTransport {
+        self.control
+    }
+
+    pub fn version(&self) -> Option<&str> {
+        self.version.as_deref()
+    }
+
+    pub fn granted(&self) -> &[FeatureSupport] {
+        &self.granted
+    }
+
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.granted.len() > MAX_RUNTIME_FEATURES
+            || duplicate_runtime_feature(self.granted.iter().map(FeatureSupport::feature))
+        {
+            return Err(ProtocolError::InvalidTaskResult);
+        }
+        if let Some(version) = &self.version {
+            if version.is_empty()
+                || version.len() > MAX_RUNTIME_VERSION_BYTES
+                || version.contains('\0')
+                || version.chars().any(char::is_control)
+            {
+                return Err(ProtocolError::InvalidTaskResult);
+            }
+        }
+        for support in &self.granted {
+            if support.level() == SupportLevel::Unsupported
+                || support.limitations().len() > MAX_RUNTIME_LIMITATIONS
+                || duplicate_runtime_limitation(support.limitations().iter().copied())
+            {
+                return Err(ProtocolError::InvalidTaskResult);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl TryFrom<&ResolvedRuntime> for ResolvedRuntimeRecord {
+    type Error = ProtocolError;
+
+    fn try_from(runtime: &ResolvedRuntime) -> Result<Self, Self::Error> {
+        Self::from_resolved(runtime)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionTaskResult {
     replies: Vec<TaskReply>,
+    runtime: Option<ResolvedRuntimeRecord>,
 }
 
 impl CollectionTaskResult {
@@ -313,7 +622,22 @@ impl CollectionTaskResult {
         if replies.is_empty() || replies.len() > MAX_TASK_STEPS {
             return Err(ProtocolError::InvalidTaskResult);
         }
-        let result = Self { replies };
+        let result = Self {
+            replies,
+            runtime: None,
+        };
+        result.validate()?;
+        Ok(result)
+    }
+
+    pub fn new_with_runtime(
+        replies: Vec<TaskReply>,
+        runtime: ResolvedRuntimeRecord,
+    ) -> Result<Self, ProtocolError> {
+        let result = Self {
+            replies,
+            runtime: Some(runtime),
+        };
         result.validate()?;
         Ok(result)
     }
@@ -322,12 +646,24 @@ impl CollectionTaskResult {
         &self.replies
     }
 
+    pub fn runtime(&self) -> Option<&ResolvedRuntimeRecord> {
+        self.runtime.as_ref()
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
         self.validate()?;
         let mut output = Vec::new();
         output.extend_from_slice(&TASK_RESULT_MAGIC);
-        output.extend_from_slice(&TASK_SCHEMA_VERSION.to_le_bytes());
+        let schema_version = if self.runtime.is_some() {
+            TASK_SCHEMA_VERSION_V2
+        } else {
+            TASK_SCHEMA_VERSION_V1
+        };
+        output.extend_from_slice(&schema_version.to_le_bytes());
         output.extend_from_slice(&(self.replies.len() as u16).to_le_bytes());
+        if let Some(runtime) = &self.runtime {
+            encode_resolved_runtime(&mut output, runtime)?;
+        }
         for reply in &self.replies {
             match reply {
                 TaskReply::Acknowledged => output.push(1),
@@ -356,12 +692,21 @@ impl CollectionTaskResult {
             return Err(ProtocolError::ResponseTooLarge);
         }
         let mut input = Input::new(payload);
-        if input.bytes(4)? != TASK_RESULT_MAGIC
-            || input.u16()? != TASK_SCHEMA_VERSION
+        if input.bytes(4).map_err(|_| ProtocolError::InvalidTaskResult)?
+            != TASK_RESULT_MAGIC
         {
             return Err(ProtocolError::InvalidTaskResult);
         }
+        let schema_version = input.u16().map_err(|_| ProtocolError::InvalidTaskResult)?;
         let count = usize::from(input.u16()?);
+        if count == 0 || count > MAX_TASK_STEPS {
+            return Err(ProtocolError::InvalidTaskResult);
+        }
+        let runtime = match schema_version {
+            TASK_SCHEMA_VERSION_V1 => None,
+            TASK_SCHEMA_VERSION_V2 => Some(decode_resolved_runtime(&mut input)?),
+            _ => return Err(ProtocolError::InvalidTaskResult),
+        };
         let mut replies = Vec::with_capacity(count);
         for _ in 0..count {
             replies.push(match input.u8()? {
@@ -375,10 +720,19 @@ impl CollectionTaskResult {
         if !input.is_empty() {
             return Err(ProtocolError::InvalidTaskResult);
         }
-        Self::new(replies)
+        match runtime {
+            Some(runtime) => Self::new_with_runtime(replies, runtime),
+            None => Self::new(replies),
+        }
     }
 
     fn validate(&self) -> Result<(), ProtocolError> {
+        if self.replies.is_empty() || self.replies.len() > MAX_TASK_STEPS {
+            return Err(ProtocolError::InvalidTaskResult);
+        }
+        if let Some(runtime) = &self.runtime {
+            runtime.validate()?;
+        }
         for reply in &self.replies {
             match reply {
                 TaskReply::Acknowledged => {}
@@ -391,6 +745,163 @@ impl CollectionTaskResult {
         }
         Ok(())
     }
+}
+
+fn encode_resolved_runtime(
+    output: &mut Vec<u8>,
+    runtime: &ResolvedRuntimeRecord,
+) -> Result<(), ProtocolError> {
+    runtime.validate()?;
+    output.push(runtime_kind_to_wire(runtime.kind));
+    output.push(engine_to_wire(runtime.engine));
+    output.push(control_to_wire(runtime.control));
+    output.push(u8::from(runtime.version.is_some()));
+    if let Some(version) = &runtime.version {
+        put_result_u16_bytes(output, version.as_bytes())?;
+    }
+    output.push(runtime.granted.len() as u8);
+    for support in &runtime.granted {
+        output.push(runtime_feature_to_wire(support.feature()));
+        output.push(support_level_to_wire(support.level()));
+        output.push(support.limitations().len() as u8);
+        for limitation in support.limitations() {
+            output.push(runtime_limitation_to_wire(*limitation));
+        }
+    }
+    Ok(())
+}
+
+fn decode_resolved_runtime(input: &mut Input<'_>) -> Result<ResolvedRuntimeRecord, ProtocolError> {
+    let kind = runtime_kind_from_wire(input.u8()?)
+        .map_err(|_| ProtocolError::InvalidTaskResult)?;
+    let engine = engine_from_wire(input.u8()?)?;
+    let control = control_from_wire(input.u8()?)?;
+    let version = match input.u8()? {
+        0 => None,
+        1 => Some(input.utf8_u16_result()?),
+        _ => return Err(ProtocolError::InvalidTaskResult),
+    };
+    let count = usize::from(input.u8()?);
+    if count > MAX_RUNTIME_FEATURES {
+        return Err(ProtocolError::InvalidTaskResult);
+    }
+    let mut granted = Vec::with_capacity(count);
+    for _ in 0..count {
+        let feature = runtime_feature_from_wire(input.u8()?)
+            .map_err(|_| ProtocolError::InvalidTaskResult)?;
+        let level = support_level_from_wire(input.u8()?)?;
+        let limitation_count = usize::from(input.u8()?);
+        if limitation_count > MAX_RUNTIME_LIMITATIONS {
+            return Err(ProtocolError::InvalidTaskResult);
+        }
+        let mut limitations = Vec::with_capacity(limitation_count);
+        for _ in 0..limitation_count {
+            limitations.push(runtime_limitation_from_wire(input.u8()?)?);
+        }
+        granted.push(FeatureSupport::new(feature, level, limitations));
+    }
+    let record = ResolvedRuntimeRecord {
+        kind,
+        engine,
+        control,
+        version,
+        granted,
+    };
+    record.validate()?;
+    Ok(record)
+}
+
+fn engine_to_wire(engine: EngineFamily) -> u8 {
+    match engine {
+        EngineFamily::Chromium => 1,
+        EngineFamily::Gecko => 2,
+        EngineFamily::Dig2Lightweight => 3,
+        EngineFamily::AndroidChromium => 4,
+        EngineFamily::WebView2 => 5,
+        EngineFamily::Servo => 6,
+    }
+}
+
+fn engine_from_wire(value: u8) -> Result<EngineFamily, ProtocolError> {
+    match value {
+        1 => Ok(EngineFamily::Chromium),
+        2 => Ok(EngineFamily::Gecko),
+        3 => Ok(EngineFamily::Dig2Lightweight),
+        4 => Ok(EngineFamily::AndroidChromium),
+        5 => Ok(EngineFamily::WebView2),
+        6 => Ok(EngineFamily::Servo),
+        _ => Err(ProtocolError::InvalidTaskResult),
+    }
+}
+
+fn control_to_wire(control: ControlTransport) -> u8 {
+    match control {
+        ControlTransport::Cdp => 1,
+        ControlTransport::WebDriverBidi => 2,
+        ControlTransport::Native => 3,
+        ControlTransport::Adb => 4,
+        ControlTransport::Embedder => 5,
+    }
+}
+
+fn control_from_wire(value: u8) -> Result<ControlTransport, ProtocolError> {
+    match value {
+        1 => Ok(ControlTransport::Cdp),
+        2 => Ok(ControlTransport::WebDriverBidi),
+        3 => Ok(ControlTransport::Native),
+        4 => Ok(ControlTransport::Adb),
+        5 => Ok(ControlTransport::Embedder),
+        _ => Err(ProtocolError::InvalidTaskResult),
+    }
+}
+
+fn support_level_to_wire(level: SupportLevel) -> u8 {
+    match level {
+        SupportLevel::Native => 1,
+        SupportLevel::Emulated => 2,
+        SupportLevel::Partial => 3,
+        SupportLevel::Unsupported => 4,
+    }
+}
+
+fn support_level_from_wire(value: u8) -> Result<SupportLevel, ProtocolError> {
+    match value {
+        1 => Ok(SupportLevel::Native),
+        2 => Ok(SupportLevel::Emulated),
+        3 => Ok(SupportLevel::Partial),
+        4 => Ok(SupportLevel::Unsupported),
+        _ => Err(ProtocolError::InvalidTaskResult),
+    }
+}
+
+fn runtime_limitation_to_wire(limitation: RuntimeLimitation) -> u8 {
+    match limitation {
+        RuntimeLimitation::NoNativeMobileApis => 1,
+        RuntimeLimitation::NoCarrierState => 2,
+        RuntimeLimitation::NoHardwareAttestation => 3,
+    }
+}
+
+fn runtime_limitation_from_wire(value: u8) -> Result<RuntimeLimitation, ProtocolError> {
+    match value {
+        1 => Ok(RuntimeLimitation::NoNativeMobileApis),
+        2 => Ok(RuntimeLimitation::NoCarrierState),
+        3 => Ok(RuntimeLimitation::NoHardwareAttestation),
+        _ => Err(ProtocolError::InvalidTaskResult),
+    }
+}
+
+fn duplicate_runtime_limitation(
+    limitations: impl IntoIterator<Item = RuntimeLimitation>,
+) -> bool {
+    let mut seen = Vec::new();
+    for limitation in limitations {
+        if seen.contains(&limitation) {
+            return true;
+        }
+        seen.push(limitation);
+    }
+    false
 }
 
 fn encode_capture(output: &mut Vec<u8>, capture: &EvidenceCapture) -> Result<(), ProtocolError> {
@@ -517,6 +1028,13 @@ fn put_u16_bytes(output: &mut Vec<u8>, value: &[u8]) -> Result<(), ProtocolError
     Ok(())
 }
 
+fn put_result_u16_bytes(output: &mut Vec<u8>, value: &[u8]) -> Result<(), ProtocolError> {
+    let len = u16::try_from(value.len()).map_err(|_| ProtocolError::InvalidTaskResult)?;
+    output.extend_from_slice(&len.to_le_bytes());
+    output.extend_from_slice(value);
+    Ok(())
+}
+
 fn put_u32_bytes(output: &mut Vec<u8>, value: &[u8]) -> Result<(), ProtocolError> {
     let len = u32::try_from(value.len()).map_err(|_| ProtocolError::InvalidTaskPayload)?;
     output.extend_from_slice(&len.to_le_bytes());
@@ -619,6 +1137,186 @@ impl<'a> Input<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dig2browser_core::RuntimeDescriptor;
+
+    fn navigate_step() -> TaskStep {
+        TaskStep::Navigate {
+            url: "https://example.test".to_owned(),
+        }
+    }
+
+    #[test]
+    fn legacy_task_keeps_v1_bytes_and_decodes_without_runtime() {
+        let task = CollectionTask::new(vec![navigate_step()]).expect("valid task");
+        let mut expected = Vec::from(*b"D2TK");
+        expected.extend_from_slice(&1_u16.to_le_bytes());
+        expected.extend_from_slice(&1_u16.to_le_bytes());
+        expected.push(1);
+        expected.extend_from_slice(&20_u32.to_le_bytes());
+        expected.extend_from_slice(b"https://example.test");
+
+        let encoded = task.encode_payload().expect("encode task");
+        assert_eq!(encoded, expected);
+        let decoded = CollectionTask::decode_payload(&encoded).expect("decode task");
+        assert_eq!(decoded, task);
+        assert_eq!(decoded.runtime_contract(), None);
+    }
+
+    #[test]
+    fn runtime_task_uses_v2_and_round_trips() {
+        let requirements = RuntimeRequirements::new(
+            vec![RuntimeFeature::Navigate, RuntimeFeature::DomInspect],
+            true,
+        )
+        .expect("valid requirements");
+        let contract = TaskRuntimeContract::new(
+            RuntimeSelector::Exact(RuntimeKind::Firefox),
+            requirements,
+        )
+        .expect("valid runtime contract");
+        let task = CollectionTask::new_with_runtime(vec![navigate_step()], contract)
+            .expect("valid runtime task");
+
+        let encoded = task.encode_payload().expect("encode task");
+        assert_eq!(&encoded[4..6], &2_u16.to_le_bytes());
+        assert_eq!(
+            CollectionTask::decode_payload(&encoded).expect("decode task"),
+            task
+        );
+    }
+
+    #[test]
+    fn runtime_task_decoder_rejects_unknown_flags_enums_and_duplicates() {
+        let requirements = RuntimeRequirements::new(
+            vec![RuntimeFeature::Navigate, RuntimeFeature::DomInspect],
+            true,
+        )
+        .expect("valid requirements");
+        let contract = TaskRuntimeContract::new(RuntimeSelector::Auto, requirements)
+            .expect("valid runtime contract");
+        let task = CollectionTask::new_with_runtime(vec![navigate_step()], contract)
+            .expect("valid runtime task");
+        let encoded = task.encode_payload().expect("encode task");
+
+        let mut unknown_selector = encoded.clone();
+        unknown_selector[8] = u8::MAX;
+        assert!(CollectionTask::decode_payload(&unknown_selector).is_err());
+
+        let mut unknown_flags = encoded.clone();
+        unknown_flags[9] = 2;
+        assert!(CollectionTask::decode_payload(&unknown_flags).is_err());
+
+        let mut duplicate_feature = encoded;
+        duplicate_feature[12] = duplicate_feature[11];
+        assert!(CollectionTask::decode_payload(&duplicate_feature).is_err());
+    }
+
+    #[test]
+    fn resolved_runtime_result_uses_v2_and_round_trips_exact_support() {
+        let support = FeatureSupport::new(
+            RuntimeFeature::MobileWebEmulation,
+            SupportLevel::Partial,
+            vec![
+                RuntimeLimitation::NoNativeMobileApis,
+                RuntimeLimitation::NoCarrierState,
+            ],
+        );
+        let descriptor = RuntimeDescriptor::new(
+            RuntimeKind::Chrome,
+            EngineFamily::Chromium,
+            ControlTransport::Cdp,
+            vec![support],
+        )
+        .expect("valid descriptor");
+        let requirements = RuntimeRequirements::new(
+            vec![RuntimeFeature::MobileWebEmulation],
+            true,
+        )
+        .expect("valid requirements");
+        let resolved = descriptor
+            .negotiate(&requirements, Some("127.0.6533.72".to_owned()))
+            .expect("resolved runtime");
+        let runtime = ResolvedRuntimeRecord::from_resolved(&resolved)
+            .expect("valid runtime record");
+        let result = CollectionTaskResult::new_with_runtime(
+            vec![TaskReply::Acknowledged],
+            runtime,
+        )
+        .expect("valid result");
+
+        let encoded = result.encode().expect("encode result");
+        assert_eq!(&encoded[4..6], &2_u16.to_le_bytes());
+        let decoded = CollectionTaskResult::decode(&encoded).expect("decode result");
+        assert_eq!(decoded, result);
+        let decoded_runtime = decoded.runtime().expect("runtime record");
+        assert_eq!(decoded_runtime.version(), Some("127.0.6533.72"));
+        assert_eq!(decoded_runtime.granted(), resolved.granted());
+    }
+
+    #[test]
+    fn runtime_result_decoder_rejects_unknown_flags_enums_and_duplicates() {
+        let descriptor = RuntimeDescriptor::new(
+            RuntimeKind::Chrome,
+            EngineFamily::Chromium,
+            ControlTransport::Cdp,
+            vec![
+                FeatureSupport::new(
+                    RuntimeFeature::Navigate,
+                    SupportLevel::Native,
+                    Vec::new(),
+                ),
+                FeatureSupport::new(
+                    RuntimeFeature::DomInspect,
+                    SupportLevel::Native,
+                    Vec::new(),
+                ),
+            ],
+        )
+        .expect("valid descriptor");
+        let requirements = RuntimeRequirements::new(
+            vec![RuntimeFeature::Navigate, RuntimeFeature::DomInspect],
+            false,
+        )
+        .expect("valid requirements");
+        let resolved = descriptor
+            .negotiate(&requirements, None)
+            .expect("resolved runtime");
+        let runtime = ResolvedRuntimeRecord::from_resolved(&resolved)
+            .expect("valid runtime record");
+        let result = CollectionTaskResult::new_with_runtime(
+            vec![TaskReply::Acknowledged],
+            runtime,
+        )
+        .expect("valid result");
+        let encoded = result.encode().expect("encode result");
+
+        let mut unknown_kind = encoded.clone();
+        unknown_kind[8] = u8::MAX;
+        assert!(CollectionTaskResult::decode(&unknown_kind).is_err());
+
+        let mut unknown_flags = encoded.clone();
+        unknown_flags[11] = 2;
+        assert!(CollectionTaskResult::decode(&unknown_flags).is_err());
+
+        let mut unknown_level = encoded.clone();
+        unknown_level[14] = u8::MAX;
+        assert!(CollectionTaskResult::decode(&unknown_level).is_err());
+
+        let mut duplicate_feature = encoded;
+        duplicate_feature[16] = duplicate_feature[13];
+        assert!(CollectionTaskResult::decode(&duplicate_feature).is_err());
+    }
+
+    #[test]
+    fn legacy_result_keeps_v1_bytes_and_decodes_without_runtime() {
+        let result = CollectionTaskResult::new(vec![TaskReply::Acknowledged])
+            .expect("valid result");
+        let encoded = result.encode().expect("encode result");
+        assert_eq!(encoded, b"D2TR\x01\x00\x01\x00\x01");
+        let decoded = CollectionTaskResult::decode(&encoded).expect("decode result");
+        assert_eq!(decoded.runtime(), None);
+        assert_eq!(decoded, result);
+    }
 
     #[test]
     fn task_and_evidence_result_round_trip() {

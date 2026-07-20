@@ -10,6 +10,7 @@ name = "dig2browser_protocol"
 path = "src/lib.rs"
 
 [dependencies]
+dig2browser-core = { path = "../dig2browser-core" }
 tokio = { version = "1", features = ["io-util"] }
 
 [dev-dependencies]

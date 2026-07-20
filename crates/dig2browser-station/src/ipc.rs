@@ -11,16 +11,17 @@ use dig2browser::agentic::{
 use dig2browser_protocol::{
     read_worker_request, validate_pipe_suffix, write_worker_response,
     CaptureCompleteness, CollectionTask, CollectionTaskResult, EvidenceCapture,
-    FailureClass, ProfileClass, RequestKind, ResponseStatus, StationStatus,
-    TaskCapturePolicy, TaskReply, TaskStep, WorkerRequest, WorkerResponse,
-    PROTOCOL_VERSION,
+    FailureClass, ProfileClass, RequestKind, ResolvedRuntimeRecord, ResponseStatus,
+    StationStatus, TaskCapturePolicy, TaskReply, TaskStep, WorkerRequest,
+    WorkerResponse, PROTOCOL_VERSION,
 };
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 
 use crate::{
     BrowserLease, BrowserStation, BrowserTask, BrowserTaskStep, IdentityRequest,
-    StationError, StationFleetStatus,
+    RuntimeRegistryError, RuntimeRequirements, RuntimeSelector, StationError,
+    StationFleetStatus,
 };
 
 const MAX_CONNECTIONS: usize = 1_024;
@@ -790,7 +791,21 @@ async fn run_task(
             );
         }
     };
-    let lease = match acquire_lease(station, identity, capabilities).await {
+    let runtime_contract = task.runtime_contract();
+    let lease = match runtime_contract {
+        Some(contract) => {
+            acquire_runtime_lease(
+                station,
+                identity,
+                capabilities,
+                contract.selector(),
+                contract.requirements(),
+            )
+            .await
+        }
+        None => acquire_lease(station, identity, capabilities).await,
+    };
+    let lease = match lease {
         Ok(lease) => lease,
         Err(
             error @ (StationError::PersonaMismatch
@@ -804,6 +819,15 @@ async fn run_task(
                 request,
                 ResponseStatus::Invalid,
                 "persona contract rejected",
+                started,
+            );
+        }
+        Err(error) if runtime_contract.is_some() && is_runtime_contract_unsupported(&error) => {
+            observation.failure(station_error_class(&error, FailureClass::Unavailable));
+            return failure(
+                request,
+                ResponseStatus::Unsupported,
+                "runtime contract unsupported",
                 started,
             );
         }
@@ -833,7 +857,11 @@ async fn run_task(
             );
         }
     };
-    let protocol_result = match to_protocol_result(task, result) {
+    let protocol_result = match runtime_contract
+        .map(|_| ResolvedRuntimeRecord::from_resolved(lease.resolved_runtime()))
+        .transpose()
+        .and_then(|runtime| to_protocol_result(task, result, runtime))
+    {
         Ok(result) => result,
         Err(_) => {
             observation.failure(FailureClass::Protocol);
@@ -942,6 +970,7 @@ fn task_capabilities(task: &CollectionTask) -> CapabilitySet {
 fn to_protocol_result(
     task: &CollectionTask,
     result: crate::BrowserTaskResult,
+    runtime: Option<ResolvedRuntimeRecord>,
 ) -> Result<CollectionTaskResult, dig2browser_protocol::ProtocolError> {
     if result.replies.len() != task.steps().len()
         || result.step_metrics.len() != task.steps().len()
@@ -981,7 +1010,10 @@ fn to_protocol_result(
         };
         replies.push(reply);
     }
-    CollectionTaskResult::new(replies)
+    match runtime {
+        Some(runtime) => CollectionTaskResult::new_with_runtime(replies, runtime),
+        None => CollectionTaskResult::new(replies),
+    }
 }
 
 fn evidence_capture(
@@ -1141,19 +1173,64 @@ async fn acquire_lease(
             .await
         {
             Ok(lease) => return Ok(lease),
-            Err(error @ StationError::ShuttingDown)
-            | Err(error @ StationError::CapabilityDenied)
-            | Err(error @ StationError::Identity(_))
-            | Err(error @ StationError::PersonaMismatch)
-            | Err(error @ StationError::PersonaBindingRequired)
-            | Err(error @ StationError::IdentityClassMismatch)
-            | Err(error @ StationError::IdentityClassBindingRequired)
-            | Err(error @ StationError::InvalidPersona)
-            | Err(error @ StationError::PersonaIo(_)) => return Err(error),
+            Err(error) if is_terminal_admission_error(&error) => return Err(error),
             Err(error) if tokio::time::Instant::now() >= deadline => return Err(error),
             Err(_) => tokio::time::sleep(ACQUIRE_RETRY_DELAY).await,
         }
     }
+}
+
+async fn acquire_runtime_lease(
+    station: &BrowserStation,
+    identity: IdentityRequest,
+    capabilities: CapabilitySet,
+    selector: RuntimeSelector,
+    requirements: &RuntimeRequirements,
+) -> Result<BrowserLease, StationError> {
+    let deadline = tokio::time::Instant::now() + ACQUIRE_RETRY_WINDOW;
+    loop {
+        match station
+            .lease_with_runtime_requirements(
+                identity.clone(),
+                capabilities.clone(),
+                selector,
+                Some(requirements),
+            )
+            .await
+        {
+            Ok(lease) => return Ok(lease),
+            Err(error) if is_terminal_admission_error(&error) => return Err(error),
+            Err(error) if tokio::time::Instant::now() >= deadline => return Err(error),
+            Err(_) => tokio::time::sleep(ACQUIRE_RETRY_DELAY).await,
+        }
+    }
+}
+
+fn is_terminal_admission_error(error: &StationError) -> bool {
+    matches!(
+        error,
+        StationError::ShuttingDown
+            | StationError::CapabilityDenied
+            | StationError::Identity(_)
+            | StationError::PersonaMismatch
+            | StationError::PersonaBindingRequired
+            | StationError::IdentityClassMismatch
+            | StationError::IdentityClassBindingRequired
+            | StationError::InvalidPersona
+            | StationError::PersonaIo(_)
+            | StationError::RuntimeSelectionDenied { .. }
+            | StationError::RuntimeSelectionBusy
+            | StationError::RuntimeRequirements(_)
+            | StationError::RuntimeRegistry(RuntimeRegistryError::Incompatible { .. })
+    )
+}
+
+fn is_runtime_contract_unsupported(error: &StationError) -> bool {
+    matches!(
+        error,
+        StationError::RuntimeSelectionDenied { .. }
+            | StationError::RuntimeRegistry(RuntimeRegistryError::Incompatible { .. })
+    )
 }
 
 fn failure(
