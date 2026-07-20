@@ -96,6 +96,9 @@ impl CollectionManager {
             return Err(CollectionError::AtCapacity);
         }
 
+        self.inner
+            .station
+            .validate_task_targets(&collection.task)?;
         let lease = self
             .inner
             .station

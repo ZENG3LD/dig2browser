@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cookies::CookieJar;
+use crate::agentic::NavigationPolicy;
 
 use crate::browser::backend::{BoundingBox, ElementHandle, PageBackend, PrintOptions};
 use crate::browser::devtools::{DevToolsEvent, PageDevTools};
@@ -407,6 +408,21 @@ impl StealthPage {
         params: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, BrowserError> {
         self.backend.cdp_call(method, params).await
+    }
+
+    pub(crate) async fn install_page_request_policy(
+        &self,
+        policy: NavigationPolicy,
+    ) -> Result<(), BrowserError> {
+        self.backend.install_page_request_policy(policy).await
+    }
+
+    pub(crate) async fn clear_page_request_policy(&self) -> Result<(), BrowserError> {
+        self.backend.clear_page_request_policy().await
+    }
+
+    pub(crate) fn page_request_policy_healthy(&self) -> bool {
+        self.backend.page_request_policy_healthy()
     }
 
     // ── Task 6: Network log streaming ────────────────────────────────────────

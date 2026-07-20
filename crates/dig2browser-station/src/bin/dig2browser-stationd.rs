@@ -8,7 +8,9 @@ use std::time::Duration;
 #[cfg(windows)]
 use clap::{Parser, ValueEnum};
 #[cfg(windows)]
-use dig2browser::agentic::BrowserWorkerConfig;
+use dig2browser::agentic::{
+    BrowserWorkerConfig, NavigationPolicy, NavigationPolicyError,
+};
 #[cfg(windows)]
 use dig2browser_core::{RouteRef, RouteRefError};
 #[cfg(windows)]
@@ -64,6 +66,11 @@ struct Cli {
     runtime: RuntimeArg,
     #[arg(long = "direct-route-ref", default_value = "host.direct")]
     direct_route_refs: Vec<String>,
+    #[arg(
+        long = "allow-origin",
+        help = "Allow an HTTP(S) URL origin for explicit and page-target requests; this is not DNS or peer-IP isolation"
+    )]
+    allowed_origins: Vec<String>,
     #[arg(long, default_value_t = 64)]
     max_connections: usize,
     #[arg(long, default_value_t = 90)]
@@ -113,6 +120,11 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<ServerReport, DaemonError> {
     let profiles_owner = ProfilesRootOwnership::acquire(&cli.profiles_root)?;
     let route_registry = direct_route_registry(&cli.direct_route_refs)?;
+    let navigation_policy = if cli.allowed_origins.is_empty() {
+        NavigationPolicy::default()
+    } else {
+        NavigationPolicy::exact_origins(&cli.allowed_origins)?
+    };
     let command_timeout = Duration::from_secs(cli.timeout_seconds);
     let worker = BrowserWorkerConfig {
         command_timeout,
@@ -125,6 +137,7 @@ async fn run(cli: Cli) -> Result<ServerReport, DaemonError> {
     )?
     .with_runtime_selector(cli.runtime.selector())
     .with_route_registry(route_registry)
+    .with_navigation_policy(navigation_policy)
     .with_worker_config(worker);
     let mut server_config = ServerConfig::new(
         cli.pipe_name,
@@ -199,6 +212,8 @@ enum DaemonError {
     #[error(transparent)]
     RouteRegistry(#[from] RouteRegistryError),
     #[error(transparent)]
+    NavigationPolicy(#[from] NavigationPolicyError),
+    #[error(transparent)]
     ServerConfig(#[from] ServerConfigError),
     #[error(transparent)]
     Server(#[from] ServerError),
@@ -214,6 +229,7 @@ impl DaemonError {
             | Self::NoDirectRoutes
             | Self::RouteRef(_)
             | Self::RouteRegistry(_)
+            | Self::NavigationPolicy(_)
             | Self::ServerConfig(_) => "invalid_config",
             Self::Server(ServerError::UnsupportedPlatform) => "unsupported_platform",
             Self::Server(ServerError::Io(_)) => "station_endpoint_unavailable",

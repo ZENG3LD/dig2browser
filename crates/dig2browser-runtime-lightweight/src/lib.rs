@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use dig2browser::agentic::{
     BrowserRuntime, CaptureArtifact, CapturePolicy, DocumentState, RuntimeError,
-    RuntimeFailureKind, RuntimeResult,
+    RuntimeFailureKind, RuntimeResult, NavigationPolicy,
 };
 use dig2browser::identity::{
     BrowserBackend, DevicePersona, IdentityProfile, ProfileOwnershipGuard,
@@ -124,6 +124,7 @@ impl std::error::Error for LightweightRuntimeConfigError {}
 pub struct LightweightRuntime {
     identity: IdentityProfile,
     config: LightweightRuntimeConfig,
+    navigation_policy: NavigationPolicy,
     client: reqwest::Client,
     profile_owner: Option<ProfileOwnershipGuard>,
     html: Option<String>,
@@ -137,6 +138,14 @@ impl LightweightRuntime {
         identity: IdentityProfile,
         config: LightweightRuntimeConfig,
     ) -> RuntimeResult<Self> {
+        Self::new_with_navigation_policy(identity, config, NavigationPolicy::default())
+    }
+
+    pub fn new_with_navigation_policy(
+        identity: IdentityProfile,
+        config: LightweightRuntimeConfig,
+        navigation_policy: NavigationPolicy,
+    ) -> RuntimeResult<Self> {
         config
             .validate()
             .map_err(|_| RuntimeError::new(RuntimeFailureKind::Protocol))?;
@@ -147,12 +156,13 @@ impl LightweightRuntime {
         }
 
         let redirect_limit = config.redirect_limit;
+        let redirect_navigation_policy = navigation_policy.clone();
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::custom(move |attempt| {
                 if attempt.previous().len() > redirect_limit {
                     attempt.error("lightweight redirect limit exceeded")
-                } else if navigation_url_allowed(attempt.url()) {
+                } else if redirect_navigation_policy.allows(attempt.url().as_str()) {
                     attempt.follow()
                 } else {
                     attempt.error("lightweight redirect target rejected")
@@ -167,6 +177,7 @@ impl LightweightRuntime {
         Ok(Self {
             identity,
             config,
+            navigation_policy,
             client,
             profile_owner: None,
             html: None,
@@ -218,11 +229,12 @@ impl LightweightRuntime {
         client: reqwest::Client,
         max_document_bytes: usize,
         selector_text_limit: usize,
+        navigation_policy: &NavigationPolicy,
         value: &str,
     ) -> RuntimeResult<FetchedDocument> {
         let url = reqwest::Url::parse(value)
             .map_err(|_| RuntimeError::new(RuntimeFailureKind::Navigation))?;
-        if !navigation_url_allowed(&url) {
+        if !navigation_policy.allows(url.as_str()) {
             return Err(RuntimeError::new(RuntimeFailureKind::Navigation));
         }
 
@@ -308,13 +320,6 @@ fn validate_content_type(response: &reqwest::Response) -> RuntimeResult<()> {
     }
 }
 
-fn navigation_url_allowed(url: &reqwest::Url) -> bool {
-    matches!(url.scheme(), "http" | "https")
-        && url.host_str().is_some()
-        && url.username().is_empty()
-        && url.password().is_none()
-}
-
 fn map_network_error(error: reqwest::Error) -> RuntimeError {
     if error.is_timeout() {
         RuntimeError::new(RuntimeFailureKind::Timeout)
@@ -397,6 +402,7 @@ impl BrowserRuntime for LightweightRuntime {
                 self.client.clone(),
                 self.config.max_document_bytes,
                 self.config.selector_text_limit,
+                &self.navigation_policy,
                 url,
             )
             .await?;

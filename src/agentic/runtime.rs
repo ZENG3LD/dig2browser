@@ -7,6 +7,7 @@ use crate::stealth::StealthConfig;
 
 use super::contract::{CaptureArtifact, CapturePolicy, DocumentState, RuntimeFailureKind};
 use super::mobile::MobileLayout;
+use super::navigation::NavigationPolicy;
 
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
 
@@ -16,6 +17,9 @@ pub trait BrowserRuntime: Send + 'static {
     fn restart(&mut self) -> BoxFuture<'_, RuntimeResult<()>>;
     fn close(&mut self) -> BoxFuture<'_, RuntimeResult<()>>;
     fn needs_restart(&self) -> bool;
+    fn navigation_policy_healthy(&self) -> bool {
+        true
+    }
 
     fn navigate<'a>(&'a mut self, url: &'a str) -> BoxFuture<'a, RuntimeResult<DocumentState>>;
     fn click_at(&mut self, x: f64, y: f64) -> BoxFuture<'_, RuntimeResult<()>>;
@@ -51,6 +55,7 @@ pub struct RealBrowserRuntime {
     launch: LaunchConfig,
     stealth: StealthConfig,
     mobile_layout: Option<MobileLayout>,
+    navigation_policy: NavigationPolicy,
     browser: Option<StealthBrowser>,
     page: Option<StealthPage>,
     devtools: Option<PageDevTools>,
@@ -61,9 +66,25 @@ pub struct RealBrowserRuntime {
 impl RealBrowserRuntime {
     pub fn new(
         identity: IdentityProfile,
+        launch: LaunchConfig,
+        stealth: StealthConfig,
+        mobile_layout: Option<MobileLayout>,
+    ) -> RuntimeResult<Self> {
+        Self::new_with_navigation_policy(
+            identity,
+            launch,
+            stealth,
+            mobile_layout,
+            NavigationPolicy::default(),
+        )
+    }
+
+    pub fn new_with_navigation_policy(
+        identity: IdentityProfile,
         mut launch: LaunchConfig,
         mut stealth: StealthConfig,
         mobile_layout: Option<MobileLayout>,
+        navigation_policy: NavigationPolicy,
     ) -> RuntimeResult<Self> {
         if identity.backend() != BrowserBackend::Chromium
             || launch.browser_pref == BrowserPreference::Firefox
@@ -90,6 +111,7 @@ impl RealBrowserRuntime {
             launch,
             stealth,
             mobile_layout,
+            navigation_policy,
             browser: None,
             page: None,
             devtools: None,
@@ -147,6 +169,14 @@ impl RealBrowserRuntime {
                 return Err(RuntimeError::new(RuntimeFailureKind::Protocol));
             }
         }
+        if page
+            .install_page_request_policy(self.navigation_policy.clone())
+            .await
+            .is_err()
+        {
+            let _ = browser.close().await;
+            return Err(RuntimeError::new(RuntimeFailureKind::Protocol));
+        }
 
         self.page = Some(page);
         self.devtools = Some(devtools);
@@ -160,20 +190,6 @@ impl RealBrowserRuntime {
         self.devtools.take();
         self.document_http_status = None;
         self.navigation_count = 0;
-        self.page.take();
-        if let Some(browser) = self.browser.take() {
-            browser
-                .close()
-                .await
-                .map_err(|_| RuntimeError::new(RuntimeFailureKind::Shutdown))?;
-        }
-        self.start_inner().await
-    }
-
-    async fn close_inner(&mut self) -> RuntimeResult<()> {
-        self.devtools.take();
-        self.document_http_status = None;
-        self.page.take();
         let close_result = if let Some(browser) = self.browser.take() {
             browser
                 .close()
@@ -182,6 +198,39 @@ impl RealBrowserRuntime {
         } else {
             Ok(())
         };
+        let policy_result = match &self.page {
+            Some(page) => page
+                .clear_page_request_policy()
+                .await
+                .map_err(|_| RuntimeError::new(RuntimeFailureKind::Shutdown)),
+            None => Ok(()),
+        };
+        self.page.take();
+        close_result?;
+        policy_result?;
+        self.start_inner().await
+    }
+
+    async fn close_inner(&mut self) -> RuntimeResult<()> {
+        self.devtools.take();
+        self.document_http_status = None;
+        let close_result = if let Some(browser) = self.browser.take() {
+            browser
+                .close()
+                .await
+                .map_err(|_| RuntimeError::new(RuntimeFailureKind::Shutdown))
+        } else {
+            Ok(())
+        };
+        let policy_result = match &self.page {
+            Some(page) => page
+                .clear_page_request_policy()
+                .await
+                .map_err(|_| RuntimeError::new(RuntimeFailureKind::Shutdown)),
+            None => Ok(()),
+        };
+        self.page.take();
+        policy_result?;
         close_result
     }
 
@@ -266,8 +315,19 @@ impl BrowserRuntime for RealBrowserRuntime {
         limit > 0 && self.navigation_count >= limit
     }
 
+    fn navigation_policy_healthy(&self) -> bool {
+        self.page
+            .as_ref()
+            .is_some_and(StealthPage::page_request_policy_healthy)
+    }
+
     fn navigate<'a>(&'a mut self, url: &'a str) -> BoxFuture<'a, RuntimeResult<DocumentState>> {
         Box::pin(async move {
+            if !self.navigation_policy.allows(url)
+                || !self.page()?.page_request_policy_healthy()
+            {
+                return Err(RuntimeError::new(RuntimeFailureKind::Navigation));
+            }
             self.clear_devtools_events();
             self.document_http_status = None;
             self.page()?

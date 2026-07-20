@@ -2,6 +2,7 @@
 
 mod contract;
 mod mobile;
+mod navigation;
 mod runtime;
 mod worker;
 
@@ -11,5 +12,8 @@ pub use contract::{
     L3Capability, RuntimeFailureKind, WorkerLifecycle, MAX_CAPABILITIES,
 };
 pub use mobile::{MobileLayout, MobileLayoutError};
+pub use navigation::{
+    NavigationPolicy, NavigationPolicyError, MAX_ALLOWED_ORIGINS,
+};
 pub use runtime::{BrowserRuntime, RealBrowserRuntime, RuntimeError, RuntimeResult};
 pub use worker::{BrowserWorker, BrowserWorkerConfig, WorkerError};

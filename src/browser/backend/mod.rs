@@ -8,6 +8,7 @@ pub mod cdp;
 
 use futures::future::BoxFuture;
 
+use crate::agentic::NavigationPolicy;
 use crate::browser::devtools::DevToolsEvent;
 use crate::browser::error::BrowserError;
 
@@ -206,6 +207,34 @@ pub trait PageBackend: Send + Sync {
 
     /// Clear a previous viewport override.
     fn clear_viewport_override<'a>(&'a self) -> BoxFuture<'a, Result<(), BrowserError>>;
+
+    /// Install request-stage enforcement for this page target tree.
+    fn install_page_request_policy<'a>(
+        &'a self,
+        policy: NavigationPolicy,
+    ) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move {
+            if policy.is_exact() {
+                Err(BrowserError::Other(
+                    "page request policy is not supported by this backend".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    /// Remove request-stage enforcement before page or browser shutdown.
+    fn clear_page_request_policy<'a>(
+        &'a self,
+    ) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    /// Whether the page-session policy handler is still processing events.
+    fn page_request_policy_healthy(&self) -> bool {
+        true
+    }
 
     // ── Raw CDP escape hatch ──────────────────────────────────────────────
 

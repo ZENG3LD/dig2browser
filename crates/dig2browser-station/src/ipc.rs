@@ -794,6 +794,7 @@ fn collection_error_response(
             | StationError::IdentityClassMismatch
             | StationError::IdentityClassBindingRequired
             | StationError::InvalidPersona
+            | StationError::Worker(WorkerError::InvalidInput)
             | StationError::Route(_),
         )
         | CollectionError::Ledger(
@@ -915,6 +916,7 @@ async fn begin_auth_session(
             | StationError::IdentityClassBindingRequired
             | StationError::InvalidPersona
             | StationError::AuthenticatedProfileRequired
+            | StationError::Worker(WorkerError::InvalidInput)
             | StationError::Route(_),
         ) => WorkerResponse::failure(
             request,
@@ -1067,6 +1069,15 @@ async fn run_task(
             return failure(request, ResponseStatus::Invalid, "invalid task", started);
         }
     };
+    if station.validate_task_targets(&station_task).is_err() {
+        observation.failure(FailureClass::Protocol);
+        return failure(
+            request,
+            ResponseStatus::Invalid,
+            "navigation target rejected",
+            started,
+        );
+    }
     let capabilities = task_capabilities(task);
     let Some(persona) = request.persona.clone() else {
         observation.failure(FailureClass::Protocol);
@@ -1361,6 +1372,15 @@ async fn capture(
 ) -> WorkerResponse {
     let started = Instant::now();
     let observation = CaptureObservation::start(telemetry);
+    if station.validate_navigation_target(&request.url).is_err() {
+        observation.failure(FailureClass::Protocol);
+        return failure(
+            request,
+            ResponseStatus::Invalid,
+            "navigation target rejected",
+            started,
+        );
+    }
     let lease = match monitoring_lease(station, &request.profile_id).await {
         Ok(lease) => lease,
         Err(error) => {
@@ -1532,6 +1552,7 @@ fn is_terminal_admission_error(error: &StationError) -> bool {
             | StationError::RuntimeBackendUnsupported(_)
             | StationError::RuntimeRequirements(_)
             | StationError::RuntimeRegistry(RuntimeRegistryError::Incompatible { .. })
+            | StationError::Worker(WorkerError::InvalidInput)
     )
 }
 

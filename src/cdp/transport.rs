@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, warn};
 
@@ -24,10 +24,16 @@ const OUTBOUND_CHANNEL_CAPACITY: usize = 128;
 /// Cloning / sharing is done via `Arc<CdpClient>`. Multiple [`CdpSession`]
 /// handles can share the same underlying connection.
 pub struct CdpClient {
-    sender: mpsc::Sender<CdpOutbound>,
+    sender: mpsc::Sender<CdpTransportCommand>,
     event_tx: broadcast::Sender<CdpEvent>,
+    terminal_tx: watch::Sender<bool>,
     next_id: AtomicU64,
     pending: Arc<DashMap<u64, oneshot::Sender<Result<serde_json::Value, CdpError>>>>,
+}
+
+enum CdpTransportCommand {
+    Send(CdpOutbound),
+    Close,
 }
 
 impl CdpClient {
@@ -40,20 +46,43 @@ impl CdpClient {
         let (mut ws_sink, mut ws_source) = ws_stream.split();
 
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        let (outbound_tx, mut outbound_rx) = mpsc::channel::<CdpOutbound>(OUTBOUND_CHANNEL_CAPACITY);
+        let (outbound_tx, mut outbound_rx) =
+            mpsc::channel::<CdpTransportCommand>(OUTBOUND_CHANNEL_CAPACITY);
+        let (terminal_tx, _) = watch::channel(false);
         let pending: Arc<DashMap<u64, oneshot::Sender<Result<serde_json::Value, CdpError>>>> =
             Arc::new(DashMap::new());
 
         let client = Arc::new(CdpClient {
             sender: outbound_tx,
             event_tx: event_tx.clone(),
+            terminal_tx: terminal_tx.clone(),
             next_id: AtomicU64::new(1),
             pending: pending.clone(),
         });
 
         // ── outbound writer task ──────────────────────────────────────────────
+        let terminal_tx_writer = terminal_tx.clone();
+        let mut terminal_rx_writer = terminal_tx.subscribe();
         tokio::spawn(async move {
-            while let Some(cmd) = outbound_rx.recv().await {
+            loop {
+                let command = tokio::select! {
+                    biased;
+                    _ = terminal_rx_writer.changed() => break,
+                    command = outbound_rx.recv() => command,
+                };
+                let Some(command) = command else {
+                    break;
+                };
+                let cmd = match command {
+                    CdpTransportCommand::Send(cmd) => cmd,
+                    CdpTransportCommand::Close => {
+                        if ws_sink.send(Message::Close(None)).await.is_err() {
+                            terminal_tx_writer.send_replace(true);
+                        }
+                        pending.retain(|_, _| false);
+                        break;
+                    }
+                };
                 let frame = CdpOutboundFrame::from(&cmd);
                 let text = match serde_json::to_string(&frame) {
                     Ok(t) => t,
@@ -67,12 +96,31 @@ impl CdpClient {
                     cmd.id,
                     cmd.response_tx,
                 );
-                if let Err(e) = ws_sink.send(Message::Text(text.into())).await {
+                if *terminal_rx_writer.borrow() {
+                    if let Some((_, tx)) = pending.remove(&cmd.id) {
+                        let _ = tx.send(Err(CdpError::ConnectionClosed));
+                    }
+                    break;
+                }
+                let send_result = tokio::select! {
+                    biased;
+                    _ = terminal_rx_writer.changed() => {
+                        if let Some((_, tx)) = pending.remove(&cmd.id) {
+                            let _ = tx.send(Err(CdpError::ConnectionClosed));
+                        }
+                        break;
+                    }
+                    result = ws_sink.send(Message::Text(text.into())) => result,
+                };
+                if let Err(e) = send_result {
                     error!("CDP ws send error: {e}");
                     // Remove the pending entry and report failure.
                     if let Some((_, tx)) = pending.remove(&cmd.id) {
                         let _ = tx.send(Err(CdpError::WebSocket(e.to_string())));
                     }
+                    terminal_tx_writer.send_replace(true);
+                    pending.retain(|_, _| false);
+                    break;
                 }
             }
             debug!("CDP outbound writer exiting");
@@ -81,6 +129,7 @@ impl CdpClient {
         // ── inbound reader task ───────────────────────────────────────────────
         let pending_reader = Arc::clone(&client.pending);
         let event_tx_reader = event_tx.clone();
+        let terminal_tx_reader = terminal_tx;
         tokio::spawn(async move {
             while let Some(msg_result) = ws_source.next().await {
                 let raw = match msg_result {
@@ -94,15 +143,6 @@ impl CdpClient {
                     },
                     Ok(Message::Close(_)) => {
                         debug!("CDP WebSocket closed by server");
-                        // Wake all pending requests with ConnectionClosed.
-                        pending_reader.retain(|_, tx| {
-                            // `retain` keeps entries where closure returns true.
-                            // We want to drain all — send and remove.
-                            // We can't move `tx` out of a shared ref in `retain`,
-                            // so we use a workaround: collect keys first.
-                            let _ = tx; // satisfy borrow checker below via separate drain
-                            false
-                        });
                         break;
                     }
                     Ok(_) => continue,
@@ -146,7 +186,7 @@ impl CdpClient {
             }
 
             debug!("CDP inbound reader exiting");
-            // Drain remaining pending entries.
+            terminal_tx_reader.send_replace(true);
             pending_reader.retain(|_, _| false);
         });
 
@@ -156,6 +196,21 @@ impl CdpClient {
     /// Subscribe to the broadcast stream of inbound CDP events.
     pub fn subscribe(&self) -> broadcast::Receiver<CdpEvent> {
         self.event_tx.subscribe()
+    }
+
+    pub(crate) fn subscribe_terminal(&self) -> watch::Receiver<bool> {
+        self.terminal_tx.subscribe()
+    }
+
+    pub(crate) fn is_terminal(&self) -> bool {
+        *self.terminal_tx.borrow()
+    }
+
+    pub(crate) async fn close_transport(&self) -> Result<(), CdpError> {
+        self.sender
+            .send(CdpTransportCommand::Close)
+            .await
+            .map_err(|_| CdpError::ConnectionClosed)
     }
 
     /// Create a root-level [`CdpSession`] (no session_id — targets the browser
@@ -171,6 +226,10 @@ impl CdpClient {
         params: Option<serde_json::Value>,
         session_id: Option<String>,
     ) -> Result<serde_json::Value, CdpError> {
+        let mut terminal = self.subscribe_terminal();
+        if *terminal.borrow() {
+            return Err(CdpError::ConnectionClosed);
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -183,10 +242,14 @@ impl CdpClient {
         };
 
         self.sender
-            .send(cmd)
+            .send(CdpTransportCommand::Send(cmd))
             .await
             .map_err(|_| CdpError::ConnectionClosed)?;
 
-        response_rx.await.map_err(|_| CdpError::ConnectionClosed)?
+        tokio::select! {
+            biased;
+            _ = terminal.changed() => Err(CdpError::ConnectionClosed),
+            response = response_rx => response.map_err(|_| CdpError::ConnectionClosed)?,
+        }
     }
 }

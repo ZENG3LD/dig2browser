@@ -11,6 +11,7 @@ use super::contract::{
     ContractError, DocumentState, ElementRef, RuntimeFailureKind, WorkerLifecycle,
 };
 use super::mobile::MobileLayout;
+use super::navigation::NavigationPolicy;
 use super::runtime::{BrowserRuntime, RealBrowserRuntime, RuntimeError};
 
 const MAX_QUEUE_CAPACITY: usize = 256;
@@ -49,6 +50,7 @@ pub struct BrowserWorker {
     commands: mpsc::Sender<Envelope>,
     snapshot: watch::Receiver<BrowserSnapshot>,
     stopped: watch::Receiver<bool>,
+    navigation_policy: NavigationPolicy,
 }
 
 impl BrowserWorker {
@@ -57,19 +59,35 @@ impl BrowserWorker {
         capabilities: CapabilitySet,
         config: BrowserWorkerConfig,
     ) -> Result<Self, WorkerError> {
+        Self::spawn_with_navigation_policy(
+            identity,
+            capabilities,
+            config,
+            NavigationPolicy::default(),
+        )
+    }
+
+    pub fn spawn_with_navigation_policy(
+        identity: IdentityProfile,
+        capabilities: CapabilitySet,
+        config: BrowserWorkerConfig,
+        navigation_policy: NavigationPolicy,
+    ) -> Result<Self, WorkerError> {
         validate_queue_capacity(config.queue_capacity)?;
         validate_command_timeout(config.command_timeout)?;
-        let runtime = RealBrowserRuntime::new(
+        let runtime = RealBrowserRuntime::new_with_navigation_policy(
             identity.clone(),
             config.launch,
             config.stealth,
             config.mobile_layout,
+            navigation_policy.clone(),
         )?;
-        Self::spawn_with_runtime_and_timeout(
+        Self::spawn_with_runtime_and_timeout_and_navigation_policy(
             identity,
             capabilities,
             config.queue_capacity,
             config.command_timeout,
+            navigation_policy,
             runtime,
         )
     }
@@ -102,6 +120,27 @@ impl BrowserWorker {
     where
         R: BrowserRuntime,
     {
+        Self::spawn_with_runtime_and_timeout_and_navigation_policy(
+            identity,
+            capabilities,
+            queue_capacity,
+            command_timeout,
+            NavigationPolicy::default(),
+            runtime,
+        )
+    }
+
+    pub fn spawn_with_runtime_and_timeout_and_navigation_policy<R>(
+        identity: IdentityProfile,
+        capabilities: CapabilitySet,
+        queue_capacity: usize,
+        command_timeout: Duration,
+        navigation_policy: NavigationPolicy,
+        runtime: R,
+    ) -> Result<Self, WorkerError>
+    where
+        R: BrowserRuntime,
+    {
         validate_queue_capacity(queue_capacity)?;
         validate_command_timeout(command_timeout)?;
         let initial = BrowserSnapshot::starting(identity.id().to_owned());
@@ -121,10 +160,16 @@ impl BrowserWorker {
             commands,
             snapshot,
             stopped,
+            navigation_policy,
         })
     }
 
     pub async fn execute(&self, command: AgentCommand) -> Result<AgentReply, WorkerError> {
+        if let AgentCommand::Navigate { url } = &command {
+            self.navigation_policy
+                .validate(url)
+                .map_err(|_| WorkerError::InvalidInput)?;
+        }
         let (reply_tx, reply_rx) = oneshot::channel();
         self.commands
             .send(Envelope {
@@ -270,6 +315,15 @@ async fn handle_command(
         return Err(WorkerError::Unavailable);
     }
 
+    if !matches!(&command, AgentCommand::Restart | AgentCommand::Shutdown)
+        && !runtime.navigation_policy_healthy()
+    {
+        let error = RuntimeError::new(RuntimeFailureKind::Protocol);
+        mark_degraded(snapshot, error);
+        snapshots.send_replace(snapshot.clone());
+        return Err(WorkerError::Runtime(error));
+    }
+
     // Rotate before the next navigation, never after it. Restarting after a
     // successful navigation would discard the page before capture/extraction.
     if matches!(&command, AgentCommand::Navigate { .. }) && runtime.needs_restart() {
@@ -397,6 +451,13 @@ async fn handle_command(
         }
     };
 
+    if !runtime.navigation_policy_healthy() {
+        let error = RuntimeError::new(RuntimeFailureKind::Protocol);
+        mark_degraded(snapshot, error);
+        snapshots.send_replace(snapshot.clone());
+        return Err(WorkerError::Runtime(error));
+    }
+
     snapshot.lifecycle = WorkerLifecycle::Ready;
     snapshot.last_failure = None;
     snapshots.send_replace(snapshot.clone());
@@ -475,12 +536,9 @@ fn validate_element_epoch(element: &ElementRef, current_epoch: u64) -> Result<()
 }
 
 fn validate_navigation_url(value: &str) -> Result<(), WorkerError> {
-    let url = url::Url::parse(value).map_err(|_| WorkerError::InvalidInput)?;
-    if matches!(url.scheme(), "http" | "https") && url.host_str().is_some() {
-        Ok(())
-    } else {
-        Err(WorkerError::InvalidInput)
-    }
+    NavigationPolicy::default()
+        .validate(value)
+        .map_err(|_| WorkerError::InvalidInput)
 }
 
 fn sanitized_origin(state: &DocumentState) -> Option<String> {

@@ -3,7 +3,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use dig2browser::agentic::{
-    BrowserWorker, BrowserWorkerConfig, CapabilitySet, WorkerError,
+    BrowserWorker, BrowserWorkerConfig, CapabilitySet, NavigationPolicy,
+    WorkerError,
 };
 use dig2browser::detect::{
     BrowserPreference, detect_browser, version::browser_version,
@@ -23,6 +24,10 @@ use dig2browser_runtime_lightweight::{
 pub trait RuntimeFactory: Send + Sync {
     fn descriptor(&self) -> &RuntimeDescriptor;
 
+    fn supports_exact_page_request_policy(&self) -> bool {
+        false
+    }
+
     /// Probe current host readiness without creating a profile or process.
     fn probe_version(&self) -> Result<Option<String>, RuntimeRegistryError>;
 
@@ -32,6 +37,19 @@ pub trait RuntimeFactory: Send + Sync {
         capabilities: CapabilitySet,
         config: BrowserWorkerConfig,
     ) -> Result<BrowserWorker, WorkerError>;
+
+    fn spawn_with_navigation_policy(
+        &self,
+        identity: IdentityProfile,
+        capabilities: CapabilitySet,
+        policy: NavigationPolicy,
+        config: BrowserWorkerConfig,
+    ) -> Result<BrowserWorker, WorkerError> {
+        if policy.is_exact() {
+            return Err(WorkerError::InvalidInput);
+        }
+        self.spawn(identity, capabilities, config)
+    }
 }
 
 /// Station-owned catalog of concrete runtime adapters.
@@ -179,13 +197,19 @@ impl PreparedRuntime {
         &self.resolved
     }
 
+    pub(crate) fn supports_exact_page_request_policy(&self) -> bool {
+        self.factory.supports_exact_page_request_policy()
+    }
+
     pub(crate) fn spawn(
         &self,
         identity: IdentityProfile,
         capabilities: CapabilitySet,
+        policy: NavigationPolicy,
         config: BrowserWorkerConfig,
     ) -> Result<BrowserWorker, WorkerError> {
-        self.factory.spawn(identity, capabilities, config)
+        self.factory
+            .spawn_with_navigation_policy(identity, capabilities, policy, config)
     }
 }
 
@@ -258,6 +282,10 @@ impl RuntimeFactory for ChromiumRuntimeFactory {
         &self.descriptor
     }
 
+    fn supports_exact_page_request_policy(&self) -> bool {
+        true
+    }
+
     fn probe_version(&self) -> Result<Option<String>, RuntimeRegistryError> {
         let binary = detect_browser(self.preference)
             .map_err(|_| RuntimeRegistryError::Unavailable(self.descriptor.kind()))?;
@@ -268,13 +296,33 @@ impl RuntimeFactory for ChromiumRuntimeFactory {
         &self,
         identity: IdentityProfile,
         capabilities: CapabilitySet,
+        config: BrowserWorkerConfig,
+    ) -> Result<BrowserWorker, WorkerError> {
+        self.spawn_with_navigation_policy(
+            identity,
+            capabilities,
+            NavigationPolicy::default(),
+            config,
+        )
+    }
+
+    fn spawn_with_navigation_policy(
+        &self,
+        identity: IdentityProfile,
+        capabilities: CapabilitySet,
+        policy: NavigationPolicy,
         mut config: BrowserWorkerConfig,
     ) -> Result<BrowserWorker, WorkerError> {
         config.launch.browser_pref = self.preference;
         // The default is a Chrome UA. An explicit runtime must derive its UA
         // and client-hint brand from the browser actually selected above.
         config.stealth.user_agent.clear();
-        BrowserWorker::spawn(identity, capabilities, config)
+        BrowserWorker::spawn_with_navigation_policy(
+            identity,
+            capabilities,
+            config,
+            policy,
+        )
     }
 }
 
@@ -295,6 +343,10 @@ impl RuntimeFactory for LightweightRuntimeFactory {
         &self.descriptor
     }
 
+    fn supports_exact_page_request_policy(&self) -> bool {
+        true
+    }
+
     fn probe_version(&self) -> Result<Option<String>, RuntimeRegistryError> {
         Ok(Some(RUNTIME_VERSION.to_owned()))
     }
@@ -305,15 +357,32 @@ impl RuntimeFactory for LightweightRuntimeFactory {
         capabilities: CapabilitySet,
         config: BrowserWorkerConfig,
     ) -> Result<BrowserWorker, WorkerError> {
-        let runtime = LightweightRuntime::new(
+        self.spawn_with_navigation_policy(
+            identity,
+            capabilities,
+            NavigationPolicy::default(),
+            config,
+        )
+    }
+
+    fn spawn_with_navigation_policy(
+        &self,
+        identity: IdentityProfile,
+        capabilities: CapabilitySet,
+        navigation_policy: NavigationPolicy,
+        config: BrowserWorkerConfig,
+    ) -> Result<BrowserWorker, WorkerError> {
+        let runtime = LightweightRuntime::new_with_navigation_policy(
             identity.clone(),
             LightweightRuntimeConfig::default(),
+            navigation_policy.clone(),
         )?;
-        BrowserWorker::spawn_with_runtime_and_timeout(
+        BrowserWorker::spawn_with_runtime_and_timeout_and_navigation_policy(
             identity,
             capabilities,
             config.queue_capacity,
             config.command_timeout,
+            navigation_policy,
             runtime,
         )
     }

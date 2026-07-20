@@ -13,6 +13,10 @@ pub(crate) struct OwnedProcessTree {
 }
 
 impl OwnedProcessTree {
+    pub(crate) fn supports_immediate_termination(&self) -> bool {
+        cfg!(windows)
+    }
+
     pub(crate) fn new() -> io::Result<Self> {
         #[cfg(windows)]
         {
@@ -72,6 +76,17 @@ impl OwnedProcessTree {
         Ok(())
     }
 
+    pub(crate) fn terminate_now(&self) -> io::Result<()> {
+        #[cfg(windows)]
+        {
+            use windows::Win32::System::JobObjects::TerminateJobObject;
+
+            // SAFETY: `self.job` is a valid owned Job Object handle.
+            unsafe { TerminateJobObject(self.job, 1) }.map_err(windows_error)?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn terminate_and_wait(
         &self,
         timeout: std::time::Duration,
@@ -80,11 +95,10 @@ impl OwnedProcessTree {
         {
             use windows::Win32::System::JobObjects::{
                 JobObjectBasicAccountingInformation, QueryInformationJobObject,
-                TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+                JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
             };
 
-            // SAFETY: `self.job` is a valid owned Job Object handle.
-            unsafe { TerminateJobObject(self.job, 1) }.map_err(windows_error)?;
+            self.terminate_now()?;
             let deadline = tokio::time::Instant::now() + timeout;
             loop {
                 let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();

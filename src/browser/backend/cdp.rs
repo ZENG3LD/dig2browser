@@ -3,17 +3,22 @@
 //! Spawns a Chrome/Edge process, connects via WebSocket, and provides
 //! BrowserBackend + PageBackend implementations using dig2browser-cdp.
 
+use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
 };
 
 use base64::Engine;
 use futures::future::BoxFuture;
+use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::{oneshot, Mutex};
+use tokio::task::JoinHandle;
 use tracing::debug;
 
-use crate::cdp::{CdpClient, CdpSession};
+use crate::agentic::NavigationPolicy;
+use crate::cdp::{CdpClient, CdpError, CdpSession};
 use crate::cookies::Cookie;
 use crate::detect::args::BrowserProfile;
 use crate::detect::version::browser_version;
@@ -35,11 +40,13 @@ pub(crate) struct CdpBrowserBackend {
     launch: LaunchConfig,
     stealth: StealthConfig,
     page_count: AtomicU32,
+    exact_policy_claimed: Arc<AtomicBool>,
+    browser_closing: Arc<AtomicBool>,
     /// Child process — `Some` when we launched the browser ourselves, `None`
     /// in attach mode (we must not kill a browser the user opened manually).
     _child: Option<tokio::process::Child>,
     /// Kernel-owned containment for the complete launched Chromium tree.
-    _process_tree: Option<OwnedProcessTree>,
+    _process_tree: Option<Arc<OwnedProcessTree>>,
     /// Profile dir path, deleted on drop if ephemeral.
     profile_dir: std::path::PathBuf,
     profile_ephemeral: bool,
@@ -70,6 +77,9 @@ impl Drop for CdpBrowserBackend {
             // behaviour might not fire (e.g. if Child was somehow replaced).
             // start_kill() is non-blocking — it sends the signal without waiting.
             let _ = child.start_kill();
+        }
+        if let Some(process_tree) = self._process_tree.as_ref() {
+            let _ = process_tree.terminate_now();
         }
         if self.profile_ephemeral {
             let _ = std::fs::remove_dir_all(&self.profile_dir);
@@ -104,8 +114,10 @@ impl CdpBrowserBackend {
             port
         );
 
-        let process_tree = OwnedProcessTree::new()
-            .map_err(|error| BrowserError::Launch(error.to_string()))?;
+        let process_tree = Arc::new(
+            OwnedProcessTree::new()
+                .map_err(|error| BrowserError::Launch(error.to_string()))?,
+        );
         let mut child = tokio::process::Command::new(&binary.path)
             .args(&args)
             .stderr(std::process::Stdio::piped())
@@ -155,6 +167,8 @@ impl CdpBrowserBackend {
             launch: launch.clone(),
             stealth: resolved_stealth,
             page_count: AtomicU32::new(0),
+            exact_policy_claimed: Arc::new(AtomicBool::new(false)),
+            browser_closing: Arc::new(AtomicBool::new(false)),
             _child: Some(child),
             _process_tree: Some(process_tree),
             profile_dir,
@@ -183,6 +197,8 @@ impl CdpBrowserBackend {
             launch,
             stealth,
             page_count: AtomicU32::new(0),
+            exact_policy_claimed: Arc::new(AtomicBool::new(false)),
+            browser_closing: Arc::new(AtomicBool::new(false)),
             _child: None, // not our child — do not kill on drop
             _process_tree: None,
             profile_dir: std::path::PathBuf::new(),
@@ -235,10 +251,13 @@ impl CdpBrowserBackend {
 
         self.page_count.fetch_add(1, Ordering::Relaxed);
 
-        Ok(CdpPageBackend {
+        Ok(CdpPageBackend::new(
             session,
-            target_id: target_id.to_owned(),
-        })
+            target_id.to_owned(),
+            Arc::clone(&self.exact_policy_claimed),
+            Arc::clone(&self.browser_closing),
+            None,
+        ))
     }
 
     /// Poll the owned browser's loopback DevTools endpoint while retaining
@@ -444,10 +463,13 @@ impl CdpBrowserBackend {
 
         self.page_count.fetch_add(1, Ordering::Relaxed);
 
-        Ok(CdpPageBackend {
+        Ok(CdpPageBackend::new(
             session,
             target_id,
-        })
+            Arc::clone(&self.exact_policy_claimed),
+            Arc::clone(&self.browser_closing),
+            self._process_tree.as_ref().map(Arc::clone),
+        ))
     }
 }
 
@@ -490,12 +512,23 @@ impl BrowserBackend for CdpBrowserBackend {
 
     fn close<'a>(mut self: Box<Self>) -> BoxFuture<'a, Result<(), BrowserError>> {
         Box::pin(async move {
+            self.browser_closing.store(true, Ordering::Release);
             // Ask the browser to close gracefully via CDP.
-            let _ = tokio::time::timeout(
+            let graceful_close = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 self.root.call("Browser.close", None),
             )
             .await;
+            let graceful_close_confirmed = matches!(graceful_close, Ok(Ok(_)));
+            if self.exact_policy_claimed.load(Ordering::Acquire)
+                && !graceful_close_confirmed
+            {
+                if let Some(process_tree) = self._process_tree.as_ref() {
+                    process_tree
+                        .terminate_and_wait(std::time::Duration::from_secs(3))
+                        .await?;
+                }
+            }
             // Let Chromium drain its process tree before forcing the owned root
             // process down. This avoids leaving profile files open on Windows.
             if let Some(ref mut child) = self._child {
@@ -506,7 +539,7 @@ impl BrowserBackend for CdpBrowserBackend {
                     let _ = child.kill().await;
                 }
             }
-            if let Some(process_tree) = self._process_tree.take() {
+            if let Some(process_tree) = self._process_tree.as_ref() {
                 if !process_tree
                     .wait_until_empty(std::time::Duration::from_secs(2))
                     .await?
@@ -516,6 +549,7 @@ impl BrowserBackend for CdpBrowserBackend {
                         .await?;
                 }
             }
+            let _ = self.client.close_transport().await;
             if self.profile_ephemeral {
                 remove_profile_dir_with_retry(&self.profile_dir).await?;
                 self.profile_ephemeral = false;
@@ -541,6 +575,117 @@ pub(crate) struct CdpPageBackend {
     session: CdpSession,
     /// Kept so callers can close the target explicitly if needed.
     target_id: String,
+    request_policy: Mutex<Option<CdpPageRequestPolicy>>,
+    request_policy_healthy: Arc<AtomicBool>,
+    exact_policy_claimed: Arc<AtomicBool>,
+    browser_closing: Arc<AtomicBool>,
+    owned_process_tree: Option<Arc<OwnedProcessTree>>,
+}
+
+impl CdpPageBackend {
+    fn new(
+        session: CdpSession,
+        target_id: String,
+        exact_policy_claimed: Arc<AtomicBool>,
+        browser_closing: Arc<AtomicBool>,
+        owned_process_tree: Option<Arc<OwnedProcessTree>>,
+    ) -> Self {
+        Self {
+            session,
+            target_id,
+            request_policy: Mutex::new(None),
+            request_policy_healthy: Arc::new(AtomicBool::new(true)),
+            exact_policy_claimed,
+            browser_closing,
+            owned_process_tree,
+        }
+    }
+}
+
+struct CdpPageRequestPolicy {
+    shutdown: Option<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
+}
+
+const MAX_GUARDED_TARGET_SESSIONS: usize = 256;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TargetAttachedToTarget {
+    session_id: String,
+    target_info: GuardedTargetInfo,
+    waiting_for_debugger: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GuardedTargetInfo {
+    target_id: String,
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TargetDetachedFromTarget {
+    session_id: String,
+}
+
+async fn enable_fetch_request_policy(session: &CdpSession) -> Result<(), CdpError> {
+    session
+        .enable_fetch(vec![crate::cdp::domains::fetch::RequestPattern {
+            url_pattern: Some("*".to_owned()),
+            resource_type: None,
+            request_stage: Some("Request".to_owned()),
+        }])
+        .await
+}
+
+async fn enable_target_tree_auto_attach(session: &CdpSession) -> Result<(), CdpError> {
+    session
+        .call(
+            "Target.setAutoAttach",
+            Some(serde_json::json!({
+                "autoAttach": true,
+                "waitForDebuggerOnStart": true,
+                "flatten": true,
+            })),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn arm_guarded_target(
+    session: &CdpSession,
+    target_kind: &str,
+    waiting_for_debugger: bool,
+) -> Result<(), CdpError> {
+    match target_kind {
+        // A tab is a supervisory target. Its page children are armed separately.
+        "tab" => enable_target_tree_auto_attach(session).await?,
+        // Dedicated workers do not expose the Fetch or Target domains. Their
+        // requests are intercepted by the already-armed parent page session.
+        "worker" => {}
+        _ => {
+            enable_fetch_request_policy(session).await?;
+            enable_target_tree_auto_attach(session).await?;
+        }
+    }
+    if waiting_for_debugger {
+        session
+            .call("Runtime.runIfWaitingForDebugger", None)
+            .await?;
+    }
+    Ok(())
+}
+
+impl Drop for CdpPageRequestPolicy {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        self.task.abort();
+    }
 }
 
 impl PageBackend for CdpPageBackend {
@@ -1200,6 +1345,232 @@ impl PageBackend for CdpPageBackend {
         })
     }
 
+    fn install_page_request_policy<'a>(
+        &'a self,
+        policy: NavigationPolicy,
+    ) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move {
+            if !policy.is_exact() {
+                return Ok(());
+            }
+            let owned_process_tree = self
+                .owned_process_tree
+                .as_ref()
+                .filter(|process_tree| process_tree.supports_immediate_termination())
+                .map(Arc::clone)
+                .ok_or_else(|| {
+                    BrowserError::Other(
+                        "exact page request policy requires an owned browser process tree"
+                            .into(),
+                    )
+                })?;
+            let browser_closing = Arc::clone(&self.browser_closing);
+            let mut active = self.request_policy.lock().await;
+            if active.is_some() {
+                return Err(BrowserError::Other(
+                    "page request policy is already installed".into(),
+                ));
+            }
+            if self
+                .exact_policy_claimed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(BrowserError::Other(
+                    "exact page request policy is already claimed for this browser lifetime"
+                        .into(),
+                ));
+            }
+            self.request_policy_healthy.store(false, Ordering::Release);
+
+            let client = Arc::clone(self.session.client());
+            let mut events = client.subscribe();
+            let mut connection_terminal = client.subscribe_terminal();
+            let page_session_id = self
+                .session
+                .session_id()
+                .ok_or_else(|| {
+                    BrowserError::Other(
+                        "exact page request policy requires an attached target session".into(),
+                    )
+                })?
+                .to_owned();
+            let page_target_id = self.target_id.clone();
+            enable_fetch_request_policy(&self.session)
+                .await
+                .map_err(|error| BrowserError::Other(error.to_string()))?;
+            enable_target_tree_auto_attach(&self.session)
+                .await
+                .map_err(|error| BrowserError::Other(error.to_string()))?;
+            enable_target_tree_auto_attach(&client.root_session())
+                .await
+                .map_err(|error| BrowserError::Other(error.to_string()))?;
+            if client.is_terminal() {
+                return Err(BrowserError::Other(
+                    "CDP transport closed while installing exact page request policy".into(),
+                ));
+            }
+
+            self.request_policy_healthy.store(true, Ordering::Release);
+            let healthy = Arc::clone(&self.request_policy_healthy);
+            let (shutdown, mut shutdown_rx) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                let mut guarded_sessions = HashMap::new();
+                guarded_sessions.insert(page_session_id, page_target_id);
+                let must_terminate = loop {
+                    let event = tokio::select! {
+                        biased;
+                        terminal = connection_terminal.changed() => {
+                            if terminal.is_err() || *connection_terminal.borrow() {
+                                break true;
+                            }
+                            continue;
+                        }
+                        _ = &mut shutdown_rx => break false,
+                        event = events.recv() => event,
+                    };
+                    let event = match event {
+                        Ok(event) => event,
+                        Err(_) => break true,
+                    };
+                    if event.method == "Target.detachedFromTarget" {
+                        let Some(params) = event.params else {
+                            break true;
+                        };
+                        let detached = match serde_json::from_value::<
+                            TargetDetachedFromTarget,
+                        >(params) {
+                            Ok(detached) => detached,
+                            Err(_) => break true,
+                        };
+                        guarded_sessions.remove(&detached.session_id);
+                        continue;
+                    }
+                    let parent_is_guarded = event
+                        .session_id
+                        .as_ref()
+                        .is_none_or(|session_id| guarded_sessions.contains_key(session_id));
+                    if event.method == "Target.attachedToTarget" {
+                        if !parent_is_guarded {
+                            continue;
+                        }
+                        let Some(params) = event.params else {
+                            break true;
+                        };
+                        let attached = match serde_json::from_value::<
+                            TargetAttachedToTarget,
+                        >(params) {
+                            Ok(attached) => attached,
+                            Err(_) => break true,
+                        };
+                        if guarded_sessions.contains_key(&attached.session_id) {
+                            continue;
+                        }
+                        if guarded_sessions.len() >= MAX_GUARDED_TARGET_SESSIONS {
+                            break true;
+                        }
+                        guarded_sessions.insert(
+                            attached.session_id.clone(),
+                            attached.target_info.target_id,
+                        );
+                        let child = CdpSession::with_session_id(
+                            attached.session_id,
+                            Arc::clone(&client),
+                        );
+                        if arm_guarded_target(
+                            &child,
+                            &attached.target_info.kind,
+                            attached.waiting_for_debugger,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break true;
+                        }
+                        continue;
+                    }
+                    if event.method != "Fetch.requestPaused" {
+                        continue;
+                    }
+                    let Some(event_session_id) = event.session_id.as_ref() else {
+                        break true;
+                    };
+                    if !guarded_sessions.contains_key(event_session_id) {
+                        continue;
+                    }
+                    let Some(params) = event.params else {
+                        break true;
+                    };
+                    let paused = match serde_json::from_value::<
+                        crate::cdp::events::FetchRequestPaused,
+                    >(params) {
+                        Ok(paused) => paused,
+                        Err(_) => break true,
+                    };
+                    let event_session = CdpSession::with_session_id(
+                        event_session_id.clone(),
+                        Arc::clone(&client),
+                    );
+                    let result = if policy.allows(&paused.request.url) {
+                        event_session.continue_request(&paused.request_id).await
+                    } else {
+                        event_session
+                            .fail_request(&paused.request_id, "BlockedByClient")
+                            .await
+                    };
+                    if result.is_err() {
+                        break true;
+                    }
+                };
+                if must_terminate {
+                    healthy.store(false, Ordering::Release);
+                    if !browser_closing.load(Ordering::Acquire) {
+                        let _ = owned_process_tree
+                            .terminate_and_wait(std::time::Duration::from_secs(3))
+                            .await;
+                    }
+                }
+            });
+            *active = Some(CdpPageRequestPolicy {
+                shutdown: Some(shutdown),
+                task,
+            });
+            Ok(())
+        })
+    }
+
+    fn clear_page_request_policy<'a>(
+        &'a self,
+    ) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move {
+            let mut active = self.request_policy.lock().await;
+            let Some(mut policy) = active.take() else {
+                return Ok(());
+            };
+            if let Some(shutdown) = policy.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            if tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                &mut policy.task,
+            )
+            .await
+            .is_err()
+            {
+                policy.task.abort();
+            }
+            // Leave Fetch and recursive auto-attach armed until Browser.close.
+            // With no handler, any late request remains paused rather than
+            // creating a shutdown-time egress window.
+            self.request_policy_healthy.store(false, Ordering::Release);
+            Ok(())
+        })
+    }
+
+    fn page_request_policy_healthy(&self) -> bool {
+        self.request_policy_healthy.load(Ordering::Acquire)
+    }
+
     // ── Raw CDP escape hatch ──────────────────────────────────────────────
 
     fn cdp_call<'a>(
@@ -1379,3 +1750,6 @@ impl Drop for CdpPageBackend {
         // The browser will GC detached targets automatically.
     }
 }
+
+#[cfg(all(test, windows))]
+mod transport_loss_e2e;

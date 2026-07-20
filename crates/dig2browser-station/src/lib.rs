@@ -14,8 +14,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use dig2browser::agentic::{
     AgentCommand, AgentReply, BrowserSnapshot, BrowserWorker, BrowserWorkerConfig,
     Capability, CapabilitySet, CaptureArtifact, CapturePolicy, ElementRef, L1Capability,
-    L2Capability, L3Capability, MobileLayout, RuntimeFailureKind, WorkerError,
-    WorkerLifecycle,
+    L2Capability, L3Capability, MobileLayout, NavigationPolicy, RuntimeFailureKind,
+    WorkerError, WorkerLifecycle,
 };
 use dig2browser::identity::{
     validate_profile_id, BrowserBackend, DevicePersona, IdentityClass,
@@ -102,6 +102,7 @@ pub struct StationConfig {
     runtime_selector: RuntimeSelector,
     runtime_registry: RuntimeRegistry,
     route_registry: RouteRegistry,
+    navigation_policy: NavigationPolicy,
 }
 
 impl StationConfig {
@@ -129,6 +130,7 @@ impl StationConfig {
             runtime_selector: RuntimeSelector::Auto,
             runtime_registry: RuntimeRegistry::default(),
             route_registry: RouteRegistry::default(),
+            navigation_policy: NavigationPolicy::default(),
         })
     }
 
@@ -152,6 +154,11 @@ impl StationConfig {
         self
     }
 
+    pub fn with_navigation_policy(mut self, policy: NavigationPolicy) -> Self {
+        self.navigation_policy = policy;
+        self
+    }
+
     pub fn with_worker_capabilities(
         mut self,
         capabilities: CapabilitySet,
@@ -165,6 +172,10 @@ impl StationConfig {
 
     pub fn profiles_root(&self) -> &Path {
         &self.profiles_root
+    }
+
+    pub fn navigation_policy(&self) -> &NavigationPolicy {
+        &self.navigation_policy
     }
 }
 
@@ -942,6 +953,23 @@ impl BrowserStation {
         &self.inner.config.profiles_root
     }
 
+    pub fn validate_navigation_target(&self, url: &str) -> Result<(), StationError> {
+        self.inner
+            .config
+            .navigation_policy
+            .validate(url)
+            .map_err(|_| StationError::Worker(WorkerError::InvalidInput))
+    }
+
+    pub fn validate_task_targets(&self, task: &BrowserTask) -> Result<(), StationError> {
+        for step in task.steps() {
+            if let BrowserTaskStep::Navigate { url } = step {
+                self.validate_navigation_target(url)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Acquire a capability-bounded lease. A persistent identity is never
     /// exposed as a raw worker handle, so station admission cannot be bypassed.
     pub async fn lease(
@@ -989,6 +1017,7 @@ impl BrowserStation {
         requested_selector: RuntimeSelector,
         client_requirements: Option<&RuntimeRequirements>,
     ) -> Result<BrowserLease, StationError> {
+        self.validate_task_targets(task)?;
         let task_requirements = task_runtime_requirements(task)?;
         let persona_requirements = persona_runtime_requirements(identity.persona())?;
         let identity_requirements =
@@ -1036,6 +1065,11 @@ impl BrowserStation {
             .config
             .runtime_registry
             .prepare_all(selector, requirement_sets)?;
+        if self.inner.config.navigation_policy.is_exact()
+            && !runtime.supports_exact_page_request_policy()
+        {
+            return Err(StationError::Worker(WorkerError::InvalidInput));
+        }
         validate_persona_runtime(identity.persona(), runtime.resolved())?;
         let identity = identity.bind_runtime_backend(runtime.resolved().kind())?;
 
@@ -1132,6 +1166,7 @@ impl BrowserStation {
         let worker = runtime.spawn(
             profile,
             self.inner.config.worker_capabilities.clone(),
+            self.inner.config.navigation_policy.clone(),
             worker_config,
         )?;
         let snapshot = worker.wait_until_settled().await?;
@@ -1244,6 +1279,7 @@ impl BrowserStation {
         identity: IdentityRequest,
         url: String,
     ) -> Result<(), StationError> {
+        self.validate_navigation_target(&url)?;
         if identity.class != IdentityClass::Authenticated {
             return Err(StationError::AuthenticatedProfileRequired);
         }
@@ -1266,6 +1302,11 @@ impl BrowserStation {
             selector,
             &requirements,
         )?;
+        if self.inner.config.navigation_policy.is_exact()
+            && !runtime.supports_exact_page_request_policy()
+        {
+            return Err(StationError::Worker(WorkerError::InvalidInput));
+        }
         validate_persona_runtime(identity.persona(), runtime.resolved())?;
         let _operation = self.inner.operation_gate.read().await;
 
@@ -1356,6 +1397,7 @@ impl BrowserStation {
         let worker = match runtime.spawn(
             profile,
             worker_capabilities,
+            self.inner.config.navigation_policy.clone(),
             worker_config,
         ) {
             Ok(worker) => worker,
@@ -1475,6 +1517,7 @@ impl BrowserStation {
             BrowserTaskStep::Evaluate { script },
         ])
         .map_err(|_| StationError::InvalidSessionState)?;
+        self.validate_task_targets(&task)?;
         let lease = self
             .lease(identity.clone(), CapabilitySet::scripted_monitoring())
             .await?;
@@ -1673,7 +1716,18 @@ impl BrowserLease {
         &self.resolved_runtime
     }
 
+    fn validate_navigation(&self, url: &str) -> Result<(), StationError> {
+        self.station.validate_navigation_target(url)
+    }
+
+    fn validate_task_navigation(&self, task: &BrowserTask) -> Result<(), StationError> {
+        self.station.validate_task_targets(task)
+    }
+
     pub async fn execute(&self, command: AgentCommand) -> Result<AgentReply, StationError> {
+        if let AgentCommand::Navigate { url } = &command {
+            self.validate_navigation(url)?;
+        }
         if matches!(command, AgentCommand::Shutdown) {
             return Err(StationError::DirectShutdownDenied);
         }
@@ -1706,7 +1760,9 @@ impl BrowserLease {
         url: impl Into<String>,
         policy: CapturePolicy,
     ) -> Result<CaptureArtifact, StationError> {
-        let navigate = AgentCommand::Navigate { url: url.into() };
+        let url = url.into();
+        self.validate_navigation(&url)?;
+        let navigate = AgentCommand::Navigate { url };
         let capture = AgentCommand::Capture { policy };
         if !self.capabilities.contains(navigate.required_capability())
             || !self.capabilities.contains(capture.required_capability())
@@ -1757,6 +1813,7 @@ impl BrowserLease {
         task: &BrowserTask,
         cancelled: Option<&AtomicBool>,
     ) -> Result<BrowserTaskResult, StationError> {
+        self.validate_task_navigation(task)?;
         self.validate_task_capabilities(task)?;
         let _operation = self.station.inner.operation_gate.read().await;
         if self.station.inner.shutting_down.load(Ordering::Acquire) {
