@@ -13,7 +13,7 @@ pub use contract::{
 };
 pub use mobile::{MobileLayout, MobileLayoutError};
 pub use navigation::{
-    NavigationPolicy, NavigationPolicyError, MAX_ALLOWED_ORIGINS,
+    NavigationPolicy, NavigationPolicyError, NavigationTarget, MAX_ALLOWED_ORIGINS,
 };
 pub use runtime::{BrowserRuntime, RealBrowserRuntime, RuntimeError, RuntimeResult};
 pub use worker::{BrowserWorker, BrowserWorkerConfig, WorkerError};

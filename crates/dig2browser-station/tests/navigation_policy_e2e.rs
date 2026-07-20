@@ -29,7 +29,7 @@ struct ControlledOrigin {
 
 impl ControlledOrigin {
     fn blocked() -> Self {
-        Self::start(Arc::new(|_| {
+        Self::start_on("127.0.0.1", Arc::new(|_| {
             (
                 "200 OK",
                 Vec::new(),
@@ -38,8 +38,18 @@ impl ControlledOrigin {
         }))
     }
 
+    fn peer_denied() -> Self {
+        Self::start_on("127.0.0.2", Arc::new(|_| {
+            (
+                "200 OK",
+                Vec::new(),
+                "<!doctype html><title>peer denied</title>".to_owned(),
+            )
+        }))
+    }
+
     fn allowed(blocked_origin: String) -> Self {
-        Self::start(Arc::new(move |path| match path {
+        Self::start_on("127.0.0.1", Arc::new(move |path| match path {
             "/document" => (
                 "200 OK",
                 Vec::new(),
@@ -85,8 +95,8 @@ impl ControlledOrigin {
         }))
     }
 
-    fn start(response: Responder) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
+    fn start_on(bind_ip: &str, response: Responder) -> Self {
+        let listener = TcpListener::bind((bind_ip, 0))
             .expect("bind navigation-policy controlled origin");
         let address = listener.local_addr().expect("read controlled origin address");
         listener
@@ -125,7 +135,7 @@ impl ControlledOrigin {
     }
 
     fn origin(&self) -> String {
-        format!("http://127.0.0.1:{}", self.address.port())
+        format!("http://{}", self.address)
     }
 
     fn url(&self, path: &str) -> String {
@@ -210,6 +220,7 @@ fn serve_request(
 async fn stationd_enforces_exact_origin_url_policy_across_runtime_targets_e2e() {
     let _serial = e2e_serial_guard().await;
     let blocked = ControlledOrigin::blocked();
+    let peer_denied = ControlledOrigin::peer_denied();
     let allowed = ControlledOrigin::allowed(blocked.origin());
 
     for (runtime_name, runtime_kind) in [
@@ -226,12 +237,14 @@ async fn stationd_enforces_exact_origin_url_policy_across_runtime_targets_e2e() 
         ));
         std::fs::create_dir_all(&profiles).expect("create policy E2E profiles");
         std::fs::create_dir_all(&traces).expect("create policy E2E trace root");
+        let allowed_origin = allowed.origin();
+        let peer_denied_origin = peer_denied.origin();
         let mut daemon = spawn_stationd(
             &pipe_name,
             &profiles,
             &traces,
             runtime_name,
-            &allowed.origin(),
+            &[&allowed_origin, &peer_denied_origin],
         );
         let client = connect(&pipe_name).await;
         let profile_id = format!("policy-{runtime_name}");
@@ -341,6 +354,25 @@ async fn stationd_enforces_exact_origin_url_policy_across_runtime_targets_e2e() 
             blocked.request_count(),
             0,
             "{runtime_name} contacted the blocked subresource origin"
+        );
+
+        let peer_denied_before = peer_denied.request_count();
+        let peer_error = client
+            .run_task(
+                &profile_id,
+                navigation_task(runtime_kind, peer_denied.url("/peer-policy")),
+            )
+            .await
+            .expect_err("station proxy must reject an origin-allowed peer");
+        assert_remote(
+            peer_error,
+            ResponseStatus::CaptureFailed,
+            "task failed at step 0",
+        );
+        assert_eq!(
+            peer_denied.request_count(),
+            peer_denied_before,
+            "{runtime_name} bypassed the station proxy for a denied loopback peer"
         );
 
         if runtime_kind == RuntimeKind::Chrome {
@@ -495,7 +527,7 @@ fn spawn_stationd(
     profiles: &Path,
     traces: &Path,
     runtime: &str,
-    allowed_origin: &str,
+    allowed_origins: &[&str],
 ) -> tokio::process::Child {
     let mut command = tokio::process::Command::new(
         env!("CARGO_BIN_EXE_dig2browser-stationd"),
@@ -509,8 +541,6 @@ fn spawn_stationd(
         traces.to_str().expect("trace path is UTF-8"),
         "--runtime",
         runtime,
-        "--allow-origin",
-        allowed_origin,
         "--max-resident",
         "1",
         "--max-in-flight",
@@ -527,7 +557,15 @@ fn spawn_stationd(
         "--allow-durable-read",
         "--allow-durable-write",
     ]);
+    for origin in allowed_origins {
+        command.args(["--allow-origin", origin]);
+    }
+    command.args(["--allow-private-peer", "127.0.0.1"]);
     command
+        .env("HTTP_PROXY", "http://127.0.0.1:1")
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("ALL_PROXY", "http://127.0.0.1:1")
+        .env("NO_PROXY", "*")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -558,6 +596,20 @@ async fn assert_clean_exit(daemon: &mut tokio::process::Child) {
     let (stdout, stderr) = read_child_output(daemon).await;
     assert!(stderr.is_empty(), "policy station wrote stderr: {stderr}");
     assert!(stdout.contains("\"outcome\":\"clean\""));
+    let report: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("parse policy station exit report");
+    assert!(
+        report["egress_completed_connections"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "policy station did not report a completed egress connection: {stdout}"
+    );
+    assert!(
+        report["egress_denied_connections"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "policy station did not report a denied egress connection: {stdout}"
+    );
 }
 
 async fn read_child_output(child: &mut tokio::process::Child) -> (String, String) {

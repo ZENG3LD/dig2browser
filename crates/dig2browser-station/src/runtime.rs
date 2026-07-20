@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use dig2browser::agentic::{
@@ -28,6 +29,10 @@ pub trait RuntimeFactory: Send + Sync {
         false
     }
 
+    fn supports_station_egress(&self) -> bool {
+        false
+    }
+
     /// Probe current host readiness without creating a profile or process.
     fn probe_version(&self) -> Result<Option<String>, RuntimeRegistryError>;
 
@@ -49,6 +54,20 @@ pub trait RuntimeFactory: Send + Sync {
             return Err(WorkerError::InvalidInput);
         }
         self.spawn(identity, capabilities, config)
+    }
+
+    fn spawn_with_station_egress(
+        &self,
+        identity: IdentityProfile,
+        capabilities: CapabilitySet,
+        policy: NavigationPolicy,
+        egress_proxy: Option<SocketAddr>,
+        config: BrowserWorkerConfig,
+    ) -> Result<BrowserWorker, WorkerError> {
+        if egress_proxy.is_some() {
+            return Err(WorkerError::InvalidInput);
+        }
+        self.spawn_with_navigation_policy(identity, capabilities, policy, config)
     }
 }
 
@@ -201,15 +220,25 @@ impl PreparedRuntime {
         self.factory.supports_exact_page_request_policy()
     }
 
+    pub(crate) fn supports_station_egress(&self) -> bool {
+        self.factory.supports_station_egress()
+    }
+
     pub(crate) fn spawn(
         &self,
         identity: IdentityProfile,
         capabilities: CapabilitySet,
         policy: NavigationPolicy,
+        egress_proxy: Option<SocketAddr>,
         config: BrowserWorkerConfig,
     ) -> Result<BrowserWorker, WorkerError> {
-        self.factory
-            .spawn_with_navigation_policy(identity, capabilities, policy, config)
+        self.factory.spawn_with_station_egress(
+            identity,
+            capabilities,
+            policy,
+            egress_proxy,
+            config,
+        )
     }
 }
 
@@ -286,6 +315,10 @@ impl RuntimeFactory for ChromiumRuntimeFactory {
         cfg!(windows)
     }
 
+    fn supports_station_egress(&self) -> bool {
+        cfg!(windows)
+    }
+
     fn probe_version(&self) -> Result<Option<String>, RuntimeRegistryError> {
         let binary = detect_browser(self.preference)
             .map_err(|_| RuntimeRegistryError::Unavailable(self.descriptor.kind()))?;
@@ -324,6 +357,35 @@ impl RuntimeFactory for ChromiumRuntimeFactory {
             policy,
         )
     }
+
+    fn spawn_with_station_egress(
+        &self,
+        identity: IdentityProfile,
+        capabilities: CapabilitySet,
+        policy: NavigationPolicy,
+        egress_proxy: Option<SocketAddr>,
+        mut config: BrowserWorkerConfig,
+    ) -> Result<BrowserWorker, WorkerError> {
+        if let Some(endpoint) = egress_proxy {
+            if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
+                return Err(WorkerError::InvalidInput);
+            }
+            config
+                .launch
+                .extra_args
+                .push(format!("--proxy-server=http://{endpoint}"));
+            config
+                .launch
+                .extra_args
+                .push("--proxy-bypass-list=<-loopback>".to_owned());
+            config.launch.extra_args.push("--disable-quic".to_owned());
+            config.launch.extra_args.push(
+                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"
+                    .to_owned(),
+            );
+        }
+        self.spawn_with_navigation_policy(identity, capabilities, policy, config)
+    }
 }
 
 struct LightweightRuntimeFactory {
@@ -344,6 +406,10 @@ impl RuntimeFactory for LightweightRuntimeFactory {
     }
 
     fn supports_exact_page_request_policy(&self) -> bool {
+        true
+    }
+
+    fn supports_station_egress(&self) -> bool {
         true
     }
 
@@ -376,6 +442,30 @@ impl RuntimeFactory for LightweightRuntimeFactory {
             identity.clone(),
             LightweightRuntimeConfig::default(),
             navigation_policy.clone(),
+        )?;
+        BrowserWorker::spawn_with_runtime_and_timeout_and_navigation_policy(
+            identity,
+            capabilities,
+            config.queue_capacity,
+            config.command_timeout,
+            navigation_policy,
+            runtime,
+        )
+    }
+
+    fn spawn_with_station_egress(
+        &self,
+        identity: IdentityProfile,
+        capabilities: CapabilitySet,
+        navigation_policy: NavigationPolicy,
+        egress_proxy: Option<SocketAddr>,
+        config: BrowserWorkerConfig,
+    ) -> Result<BrowserWorker, WorkerError> {
+        let runtime = LightweightRuntime::new_with_navigation_policy_and_proxy(
+            identity.clone(),
+            LightweightRuntimeConfig::default(),
+            navigation_policy.clone(),
+            egress_proxy,
         )?;
         BrowserWorker::spawn_with_runtime_and_timeout_and_navigation_policy(
             identity,
@@ -493,5 +583,32 @@ mod tests {
             .expect("resolve explicit lightweight runtime");
         assert_eq!(exact.kind(), RuntimeKind::Lightweight);
         assert!(!registry.auto_order.contains(&RuntimeKind::Lightweight));
+    }
+
+    #[test]
+    fn station_egress_support_is_declared_statically() {
+        let custom = ProbeCountingFactory {
+            descriptor: lightweight_runtime_descriptor(),
+            probes: Arc::new(AtomicUsize::new(0)),
+        };
+        let requirements = RuntimeRequirements::new(
+            vec![RuntimeFeature::Navigate],
+            false,
+        )
+        .expect("valid runtime requirements");
+        let prepared = RuntimeRegistry::builtin_defaults()
+            .prepare(
+                RuntimeSelector::Exact(RuntimeKind::Lightweight),
+                &requirements,
+            )
+            .expect("prepare lightweight runtime");
+
+        assert!(!custom.supports_station_egress());
+        assert!(LightweightRuntimeFactory::new().supports_station_egress());
+        assert!(prepared.supports_station_egress());
+        assert_eq!(
+            ChromiumRuntimeFactory::chrome().supports_station_egress(),
+            cfg!(windows),
+        );
     }
 }

@@ -1,10 +1,90 @@
 //! Station-owned policy for explicit web navigation targets.
 
-use std::fmt;
+use std::{fmt, net::IpAddr};
 
-use url::Url;
+use url::{Host, Url};
 
 pub const MAX_ALLOWED_ORIGINS: usize = 256;
+
+/// Canonical HTTP(S) target accepted by a [`NavigationPolicy`].
+///
+/// This exposes the URL components needed by station-owned egress without
+/// leaking the parser dependency through the public API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NavigationTarget {
+    scheme: String,
+    host: String,
+    effective_port: u16,
+    authority: String,
+    origin_form: String,
+    ip_addr: Option<IpAddr>,
+}
+
+impl NavigationTarget {
+    pub fn scheme(&self) -> &str {
+        &self.scheme
+    }
+
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub fn effective_port(&self) -> u16 {
+        self.effective_port
+    }
+
+    pub fn authority(&self) -> &str {
+        &self.authority
+    }
+
+    pub fn origin_form(&self) -> &str {
+        &self.origin_form
+    }
+
+    pub fn ip_addr(&self) -> Option<IpAddr> {
+        self.ip_addr
+    }
+
+    fn from_url(url: &Url) -> Self {
+        let (host, ip_addr) = match url.host().expect("validated URL has a host") {
+            Host::Domain(domain) => (domain.to_owned(), None),
+            Host::Ipv4(address) => (address.to_string(), Some(IpAddr::V4(address))),
+            Host::Ipv6(address) => (address.to_string(), Some(IpAddr::V6(address))),
+        };
+        let effective_port = url
+            .port_or_known_default()
+            .expect("validated HTTP(S) URL has a known port");
+        let default_port = match url.scheme() {
+            "http" => 80,
+            "https" => 443,
+            _ => unreachable!("validated URL has an HTTP(S) scheme"),
+        };
+        let authority_host = if matches!(ip_addr, Some(IpAddr::V6(_))) {
+            format!("[{host}]")
+        } else {
+            host.clone()
+        };
+        let authority = if effective_port == default_port {
+            authority_host
+        } else {
+            format!("{authority_host}:{effective_port}")
+        };
+        let mut origin_form = url.path().to_owned();
+        if let Some(query) = url.query() {
+            origin_form.push('?');
+            origin_form.push_str(query);
+        }
+
+        Self {
+            scheme: url.scheme().to_owned(),
+            host,
+            effective_port,
+            authority,
+            origin_form,
+            ip_addr,
+        }
+    }
+}
 
 /// Immutable policy applied to every explicit browser navigation.
 ///
@@ -54,8 +134,18 @@ impl NavigationPolicy {
 }
 
 impl NavigationPolicy {
+    pub fn parse_target(&self, value: &str) -> Result<NavigationTarget, NavigationPolicyError> {
+        let url = parse_navigation_url(value)?;
+        self.validate_parsed_url(&url)?;
+        Ok(NavigationTarget::from_url(&url))
+    }
+
     pub fn validate(&self, value: &str) -> Result<(), NavigationPolicyError> {
         let url = parse_navigation_url(value)?;
+        self.validate_parsed_url(&url)
+    }
+
+    fn validate_parsed_url(&self, url: &Url) -> Result<(), NavigationPolicyError> {
         match &self.mode {
             NavigationPolicyMode::OpenWeb => Ok(()),
             NavigationPolicyMode::ExactOrigins(origins) => {
@@ -160,6 +250,61 @@ mod tests {
         assert_eq!(
             NavigationPolicy::exact_origins(["https://example.com/path"]),
             Err(NavigationPolicyError::InvalidOrigin)
+        );
+    }
+
+    #[test]
+    fn parsed_target_exposes_canonical_domain_components() {
+        let target = NavigationPolicy::open_web()
+            .parse_target("HTTPS://EXAMPLE.com:443/a%20b?x=1&empty=#fragment")
+            .expect("valid target");
+
+        assert_eq!(target.scheme(), "https");
+        assert_eq!(target.host(), "example.com");
+        assert_eq!(target.effective_port(), 443);
+        assert_eq!(target.authority(), "example.com");
+        assert_eq!(target.origin_form(), "/a%20b?x=1&empty=");
+        assert_eq!(target.ip_addr(), None);
+    }
+
+    #[test]
+    fn parsed_target_handles_ip_literals_and_non_default_ports() {
+        let policy = NavigationPolicy::exact_origins([
+            "http://192.0.2.1:8080/",
+            "https://[2001:db8::1]:8443/",
+        ])
+        .expect("valid exact origins");
+
+        let ipv4 = policy
+            .parse_target("http://192.0.2.1:8080/path")
+            .expect("allowed IPv4 target");
+        assert_eq!(ipv4.host(), "192.0.2.1");
+        assert_eq!(ipv4.effective_port(), 8080);
+        assert_eq!(ipv4.authority(), "192.0.2.1:8080");
+        assert_eq!(ipv4.ip_addr(), Some("192.0.2.1".parse().unwrap()));
+
+        let ipv6 = policy
+            .parse_target("https://[2001:0DB8:0:0::1]:8443/?")
+            .expect("allowed IPv6 target");
+        assert_eq!(ipv6.host(), "2001:db8::1");
+        assert_eq!(ipv6.effective_port(), 8443);
+        assert_eq!(ipv6.authority(), "[2001:db8::1]:8443");
+        assert_eq!(ipv6.origin_form(), "/?");
+        assert_eq!(ipv6.ip_addr(), Some("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn parsed_target_preserves_policy_rejections() {
+        let policy = NavigationPolicy::exact_origins(["https://example.com/"])
+            .expect("valid exact origin");
+
+        assert_eq!(
+            policy.parse_target("https://example.net/"),
+            Err(NavigationPolicyError::OriginDenied)
+        );
+        assert_eq!(
+            policy.parse_target("https://user@example.com/"),
+            Err(NavigationPolicyError::CredentialsForbidden)
         );
     }
 }

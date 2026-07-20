@@ -35,6 +35,7 @@ use tokio::sync::{Mutex, RwLock, Semaphore};
 use route::PreparedRoute;
 
 mod collection;
+mod egress;
 pub mod ipc;
 mod route;
 pub mod runtime;
@@ -43,8 +44,13 @@ pub use dig2browser_core::{
     ResolvedRuntime, RuntimeKind, RuntimeRequirements, RuntimeSelector,
 };
 pub use collection::CollectionError;
+pub use egress::{
+    EgressError, EgressPeerPolicy, EgressPeerPolicyError, EgressProxy,
+    EgressReport,
+};
 pub use route::{
-    RouteDescriptor, RouteRegistry, RouteRegistryError, RouteTransport,
+    EgressRouteError, RouteDescriptor, RouteRegistry, RouteRegistryError,
+    RouteTransport,
 };
 pub use runtime::{RuntimeFactory, RuntimeRegistry, RuntimeRegistryError};
 
@@ -539,10 +545,16 @@ fn prepare_persona_route(
     config: &StationConfig,
     persona: &BrowserPersona,
 ) -> Result<Option<PreparedRoute>, StationError> {
-    persona
-        .route_ref()
-        .map(|reference| config.route_registry.prepare(reference, &config.worker))
-        .transpose()
+    let default_reference = RouteRef::host_direct();
+    let reference = match persona.route_ref() {
+        Some(reference) => reference,
+        None if config.navigation_policy.is_exact() => &default_reference,
+        None => return Ok(None),
+    };
+    config
+        .route_registry
+        .prepare(reference, &config.worker)
+        .map(Some)
         .map_err(StationError::from)
 }
 
@@ -1066,7 +1078,12 @@ impl BrowserStation {
             .runtime_registry
             .prepare_all(selector, requirement_sets)?;
         if self.inner.config.navigation_policy.is_exact()
-            && !runtime.supports_exact_page_request_policy()
+            && (!runtime.supports_exact_page_request_policy()
+                || !runtime.supports_station_egress()
+                || prepared_route
+                    .as_ref()
+                    .and_then(PreparedRoute::egress_proxy)
+                    .is_none())
         {
             return Err(StationError::Worker(WorkerError::InvalidInput));
         }
@@ -1167,6 +1184,9 @@ impl BrowserStation {
             profile,
             self.inner.config.worker_capabilities.clone(),
             self.inner.config.navigation_policy.clone(),
+            prepared_route
+                .as_ref()
+                .and_then(PreparedRoute::egress_proxy),
             worker_config,
         )?;
         let snapshot = worker.wait_until_settled().await?;
@@ -1303,7 +1323,12 @@ impl BrowserStation {
             &requirements,
         )?;
         if self.inner.config.navigation_policy.is_exact()
-            && !runtime.supports_exact_page_request_policy()
+            && (!runtime.supports_exact_page_request_policy()
+                || !runtime.supports_station_egress()
+                || prepared_route
+                    .as_ref()
+                    .and_then(PreparedRoute::egress_proxy)
+                    .is_none())
         {
             return Err(StationError::Worker(WorkerError::InvalidInput));
         }
@@ -1398,6 +1423,9 @@ impl BrowserStation {
             profile,
             worker_capabilities,
             self.inner.config.navigation_policy.clone(),
+            prepared_route
+                .as_ref()
+                .and_then(PreparedRoute::egress_proxy),
             worker_config,
         ) {
             Ok(worker) => worker,
@@ -2249,6 +2277,75 @@ mod tests {
         FeatureSupport, NegotiationError, RuntimeDescriptor, SupportLevel,
     };
 
+    struct ExactPreflightRuntimeFactory {
+        descriptor: RuntimeDescriptor,
+        station_egress: bool,
+    }
+
+    impl ExactPreflightRuntimeFactory {
+        fn new() -> Self {
+            Self::with_station_egress(true)
+        }
+
+        fn without_station_egress() -> Self {
+            Self::with_station_egress(false)
+        }
+
+        fn with_station_egress(station_egress: bool) -> Self {
+            let features = [
+                RuntimeFeature::DomInspect,
+                RuntimeFeature::Navigate,
+                RuntimeFeature::CaptureState,
+                RuntimeFeature::CaptureHtml,
+                RuntimeFeature::CaptureViewportPng,
+                RuntimeFeature::Lifecycle,
+                RuntimeFeature::PersistentProfile,
+                RuntimeFeature::HeadfulAuthentication,
+                RuntimeFeature::DesktopWeb,
+            ]
+            .into_iter()
+            .map(|feature| FeatureSupport::new(feature, SupportLevel::Native, Vec::new()))
+            .collect();
+            Self {
+                descriptor: RuntimeDescriptor::new(
+                    RuntimeKind::Chrome,
+                    EngineFamily::Chromium,
+                    ControlTransport::Cdp,
+                    features,
+                )
+                .expect("valid exact preflight descriptor"),
+                station_egress,
+            }
+        }
+    }
+
+    impl RuntimeFactory for ExactPreflightRuntimeFactory {
+        fn descriptor(&self) -> &RuntimeDescriptor {
+            &self.descriptor
+        }
+
+        fn supports_exact_page_request_policy(&self) -> bool {
+            true
+        }
+
+        fn supports_station_egress(&self) -> bool {
+            self.station_egress
+        }
+
+        fn probe_version(&self) -> Result<Option<String>, RuntimeRegistryError> {
+            Ok(Some("preflight-test".to_owned()))
+        }
+
+        fn spawn(
+            &self,
+            _identity: IdentityProfile,
+            _capabilities: CapabilitySet,
+            _config: BrowserWorkerConfig,
+        ) -> Result<BrowserWorker, WorkerError> {
+            panic!("unguarded exact route must fail before runtime spawn")
+        }
+    }
+
     fn capture_task_requirements(policy: CapturePolicy) -> RuntimeRequirements {
         let task = BrowserTask::new(vec![BrowserTaskStep::Capture { policy }])
             .expect("valid capture task");
@@ -2425,6 +2522,129 @@ mod tests {
             requirements.features(),
             &[RuntimeFeature::PersistentProfile]
         );
+    }
+
+    #[test]
+    fn open_web_legacy_persona_skips_route_resolution_and_arguments() {
+        let config = StationConfig::new(std::env::temp_dir(), 1, 1)
+            .expect("valid station config")
+            .with_route_registry(RouteRegistry::empty());
+        let persona = BrowserPersona::desktop_default();
+        let mut worker = config.worker.clone();
+        let original_arguments = worker.launch.extra_args.clone();
+
+        let prepared = prepare_persona_route(&config, &persona)
+            .expect("OpenWeb does not resolve a missing route reference");
+        if let Some(route) = &prepared {
+            route.apply(&mut worker);
+        }
+
+        assert!(prepared.is_none());
+        assert_eq!(worker.launch.extra_args, original_arguments);
+    }
+
+    #[tokio::test]
+    async fn exact_policy_rejects_unguarded_route_before_profile_write() {
+        let root = std::env::temp_dir().join(format!(
+            "dig2browser-station-exact-preflight-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let policy = NavigationPolicy::exact_origins(["https://example.test"])
+            .expect("valid exact policy");
+        let mut runtimes = RuntimeRegistry::empty();
+        runtimes
+            .register(ExactPreflightRuntimeFactory::new(), false)
+            .expect("register exact preflight runtime");
+        let config = StationConfig::new(&root, 1, 1)
+            .expect("valid station config")
+            .with_runtime_selector(RuntimeSelector::Exact(RuntimeKind::Chrome))
+            .with_runtime_registry(runtimes)
+            .with_navigation_policy(policy);
+        let station = BrowserStation::new(config);
+
+        assert!(matches!(
+            station
+                .lease(
+                    IdentityRequest::public_desktop("exact-preflight"),
+                    CapabilitySet::monitoring(),
+                )
+                .await,
+            Err(StationError::Worker(WorkerError::InvalidInput))
+        ));
+        assert!(!root.exists());
+    }
+
+    #[tokio::test]
+    async fn exact_policy_rejects_runtime_without_station_egress_before_profile_write() {
+        let root = std::env::temp_dir().join(format!(
+            "dig2browser-station-runtime-egress-preflight-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let policy = NavigationPolicy::exact_origins(["https://example.test"])
+            .expect("valid exact policy");
+        let endpoint = "127.0.0.1:18080".parse().expect("loopback endpoint");
+        let mut routes = RouteRegistry::empty();
+        routes
+            .register(
+                RouteDescriptor::guarded_host_direct(RouteRef::host_direct(), endpoint)
+                    .expect("valid guarded route"),
+            )
+            .expect("register guarded route");
+        let mut runtimes = RuntimeRegistry::empty();
+        runtimes
+            .register(ExactPreflightRuntimeFactory::without_station_egress(), false)
+            .expect("register non-egress runtime");
+        let config = StationConfig::new(&root, 1, 1)
+            .expect("valid station config")
+            .with_runtime_selector(RuntimeSelector::Exact(RuntimeKind::Chrome))
+            .with_runtime_registry(runtimes)
+            .with_route_registry(routes)
+            .with_navigation_policy(policy);
+        let station = BrowserStation::new(config);
+
+        assert!(matches!(
+            station
+                .lease(
+                    IdentityRequest::public_desktop("runtime-egress-preflight"),
+                    CapabilitySet::monitoring(),
+                )
+                .await,
+            Err(StationError::Worker(WorkerError::InvalidInput))
+        ));
+        assert!(!root.exists());
+    }
+
+    #[tokio::test]
+    async fn exact_policy_rejects_unguarded_auth_before_reservation_or_profile_write() {
+        let root = std::env::temp_dir().join(format!(
+            "dig2browser-station-auth-egress-preflight-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let policy = NavigationPolicy::exact_origins(["https://example.test"])
+            .expect("valid exact policy");
+        let mut runtimes = RuntimeRegistry::empty();
+        runtimes
+            .register(ExactPreflightRuntimeFactory::new(), true)
+            .expect("register exact preflight runtime");
+        let config = StationConfig::new(&root, 1, 1)
+            .expect("valid station config")
+            .with_runtime_selector(RuntimeSelector::Exact(RuntimeKind::Chrome))
+            .with_runtime_registry(runtimes)
+            .with_navigation_policy(policy);
+        let station = BrowserStation::new(config);
+        let identity = IdentityRequest::authenticated_persona(
+            "auth-egress-preflight",
+            BrowserPersona::desktop_default(),
+        );
+
+        assert!(matches!(
+            station
+                .begin_auth_session(identity, "https://example.test/login".to_owned())
+                .await,
+            Err(StationError::Worker(WorkerError::InvalidInput))
+        ));
+        assert_eq!(station.snapshot().await.resident, 0);
+        assert!(!root.exists());
     }
 
     #[test]

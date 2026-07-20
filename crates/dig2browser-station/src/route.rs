@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 
 use dig2browser::agentic::BrowserWorkerConfig;
 use dig2browser_core::RouteRef;
@@ -18,6 +19,7 @@ pub enum RouteTransport {
 pub struct RouteDescriptor {
     reference: RouteRef,
     transport: RouteTransport,
+    egress_proxy: Option<SocketAddr>,
 }
 
 impl RouteDescriptor {
@@ -25,7 +27,22 @@ impl RouteDescriptor {
         Self {
             reference,
             transport: RouteTransport::HostDirect,
+            egress_proxy: None,
         }
+    }
+
+    pub fn guarded_host_direct(
+        reference: RouteRef,
+        egress_proxy: SocketAddr,
+    ) -> Result<Self, EgressRouteError> {
+        if !egress_proxy.ip().is_loopback() || egress_proxy.port() == 0 {
+            return Err(EgressRouteError::InvalidEgressProxy);
+        }
+        Ok(Self {
+            reference,
+            transport: RouteTransport::HostDirect,
+            egress_proxy: Some(egress_proxy),
+        })
     }
 
     pub fn reference(&self) -> &RouteRef {
@@ -34,6 +51,10 @@ impl RouteDescriptor {
 
     pub fn transport(&self) -> RouteTransport {
         self.transport
+    }
+
+    pub fn is_egress_guarded(&self) -> bool {
+        self.egress_proxy.is_some()
     }
 }
 
@@ -114,9 +135,15 @@ impl PreparedRoute {
     pub(crate) fn apply(&self, worker: &mut BrowserWorkerConfig) {
         match self.descriptor.transport {
             RouteTransport::HostDirect => {
-                worker.launch.extra_args.push("--no-proxy-server".to_owned());
+                if self.descriptor.egress_proxy.is_none() {
+                    worker.launch.extra_args.push("--no-proxy-server".to_owned());
+                }
             }
         }
+    }
+
+    pub(crate) fn egress_proxy(&self) -> Option<SocketAddr> {
+        self.descriptor.egress_proxy
     }
 }
 
@@ -134,6 +161,9 @@ fn route_owned_argument(argument: &str) -> bool {
             | "--no-proxy-server"
             | "--host-resolver-rules"
             | "--host-rules"
+            | "--enable-quic"
+            | "--disable-quic"
+            | "--force-webrtc-ip-handling-policy"
     )
 }
 
@@ -145,6 +175,12 @@ pub enum RouteRegistryError {
     UnknownRoute,
     #[error("worker launch arguments conflict with station-owned route policy")]
     ConflictingLaunchArgument,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum EgressRouteError {
+    #[error("station egress proxy must be a bound loopback endpoint")]
+    InvalidEgressProxy,
 }
 
 #[cfg(test)]
@@ -166,6 +202,40 @@ mod tests {
             .extra_args
             .iter()
             .any(|argument| argument == "--no-proxy-server"));
+    }
+
+    #[test]
+    fn guarded_host_direct_reserves_proxy_ownership_for_runtime() {
+        let endpoint: SocketAddr = "127.0.0.1:18080".parse().expect("proxy endpoint");
+        let mut registry = RouteRegistry::empty();
+        registry
+            .register(
+                RouteDescriptor::guarded_host_direct(RouteRef::host_direct(), endpoint)
+                    .expect("guarded route"),
+            )
+            .expect("register guarded route");
+        let mut worker = BrowserWorkerConfig::default();
+        let route = registry
+            .prepare(&RouteRef::host_direct(), &worker)
+            .expect("prepare guarded route");
+
+        route.apply(&mut worker);
+
+        assert_eq!(route.egress_proxy(), Some(endpoint));
+        assert!(!worker
+            .launch
+            .extra_args
+            .iter()
+            .any(|argument| argument == "--no-proxy-server"));
+    }
+
+    #[test]
+    fn guarded_host_direct_rejects_non_loopback_proxy() {
+        let endpoint: SocketAddr = "192.0.2.1:18080".parse().expect("proxy endpoint");
+        assert_eq!(
+            RouteDescriptor::guarded_host_direct(RouteRef::host_direct(), endpoint),
+            Err(EgressRouteError::InvalidEgressProxy)
+        );
     }
 
     #[test]

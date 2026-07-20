@@ -1,10 +1,11 @@
-//! Bounded static-document runtime for host-direct monitoring and research.
+//! Bounded static-document runtime for station-routed monitoring and research.
 //!
 //! This runtime fetches one HTML document and exposes a read-only parsed DOM.
 //! It deliberately has no script engine, subresource loader, layout, visual
 //! rendering, cookies, browser storage, or interactive DOM.
 
 use std::fmt;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use dig2browser::agentic::{
@@ -146,6 +147,20 @@ impl LightweightRuntime {
         config: LightweightRuntimeConfig,
         navigation_policy: NavigationPolicy,
     ) -> RuntimeResult<Self> {
+        Self::new_with_navigation_policy_and_proxy(
+            identity,
+            config,
+            navigation_policy,
+            None,
+        )
+    }
+
+    pub fn new_with_navigation_policy_and_proxy(
+        identity: IdentityProfile,
+        config: LightweightRuntimeConfig,
+        navigation_policy: NavigationPolicy,
+        egress_proxy: Option<SocketAddr>,
+    ) -> RuntimeResult<Self> {
         config
             .validate()
             .map_err(|_| RuntimeError::new(RuntimeFailureKind::Protocol))?;
@@ -157,7 +172,7 @@ impl LightweightRuntime {
 
         let redirect_limit = config.redirect_limit;
         let redirect_navigation_policy = navigation_policy.clone();
-        let client = reqwest::Client::builder()
+        let mut client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::custom(move |attempt| {
                 if attempt.previous().len() > redirect_limit {
@@ -170,7 +185,16 @@ impl LightweightRuntime {
             }))
             .timeout(config.request_timeout)
             .connect_timeout(config.connect_timeout)
-            .user_agent(format!("dig2browser-lightweight/{RUNTIME_VERSION}"))
+            .user_agent(format!("dig2browser-lightweight/{RUNTIME_VERSION}"));
+        if let Some(endpoint) = egress_proxy {
+            if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
+                return Err(RuntimeError::new(RuntimeFailureKind::Launch));
+            }
+            let proxy = reqwest::Proxy::all(format!("http://{endpoint}"))
+                .map_err(|_| RuntimeError::new(RuntimeFailureKind::Launch))?;
+            client = client.proxy(proxy);
+        }
+        let client = client
             .build()
             .map_err(|_| RuntimeError::new(RuntimeFailureKind::Launch))?;
 
