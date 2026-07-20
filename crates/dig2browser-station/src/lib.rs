@@ -27,18 +27,25 @@ use dig2browser_protocol::{
     SessionHealthProbe, SessionPhase, SessionStateUpdate,
 };
 use dig2browser_core::{
-    ControlTransport, EngineFamily, RuntimeFeature, RuntimeRequirementsError,
+    ControlTransport, EngineFamily, PersonaPreset, RouteRef, RuntimeFeature,
+    RuntimeRequirementsError,
 };
 use tokio::sync::{Mutex, RwLock, Semaphore};
 
+use route::PreparedRoute;
+
 mod collection;
 pub mod ipc;
+mod route;
 pub mod runtime;
 
 pub use dig2browser_core::{
     ResolvedRuntime, RuntimeKind, RuntimeRequirements, RuntimeSelector,
 };
 pub use collection::CollectionError;
+pub use route::{
+    RouteDescriptor, RouteRegistry, RouteRegistryError, RouteTransport,
+};
 pub use runtime::{RuntimeFactory, RuntimeRegistry, RuntimeRegistryError};
 
 const MAX_RESIDENT: usize = 256;
@@ -94,6 +101,7 @@ pub struct StationConfig {
     worker_capabilities: CapabilitySet,
     runtime_selector: RuntimeSelector,
     runtime_registry: RuntimeRegistry,
+    route_registry: RouteRegistry,
 }
 
 impl StationConfig {
@@ -120,6 +128,7 @@ impl StationConfig {
             worker_capabilities: CapabilitySet::all(),
             runtime_selector: RuntimeSelector::Auto,
             runtime_registry: RuntimeRegistry::default(),
+            route_registry: RouteRegistry::default(),
         })
     }
 
@@ -135,6 +144,11 @@ impl StationConfig {
 
     pub fn with_runtime_registry(mut self, registry: RuntimeRegistry) -> Self {
         self.runtime_registry = registry;
+        self
+    }
+
+    pub fn with_route_registry(mut self, registry: RouteRegistry) -> Self {
+        self.route_registry = registry;
         self
     }
 
@@ -309,6 +323,7 @@ pub struct BrowserTaskStepMetrics {
 
 const PERSONA_MANIFEST: &str = ".dig2browser-persona-v1";
 const PROFILE_CLASS_MANIFEST: &str = ".dig2browser-profile-class-v1";
+const PROFILE_BINDING_MANIFEST: &str = ".dig2browser-profile-binding-v2";
 const SESSION_STATE_JOURNAL: &str = ".dig2browser-session-state-v1";
 
 fn apply_persona(
@@ -418,22 +433,58 @@ fn constrained_runtime_selector(
     }
 }
 
+fn persona_constrained_runtime_selector(
+    configured: RuntimeSelector,
+    requested: RuntimeSelector,
+    persona: &BrowserPersona,
+) -> Result<RuntimeSelector, StationError> {
+    let selected = constrained_runtime_selector(configured, requested)?;
+    match persona
+        .preset()
+        .and_then(|preset| preset.required_runtime())
+    {
+        Some(kind) => constrained_runtime_selector(selected, RuntimeSelector::Exact(kind)),
+        None => Ok(selected),
+    }
+}
+
+fn prepare_persona_route(
+    config: &StationConfig,
+    persona: &BrowserPersona,
+) -> Result<Option<PreparedRoute>, StationError> {
+    persona
+        .route_ref()
+        .map(|reference| config.route_registry.prepare(reference, &config.worker))
+        .transpose()
+        .map_err(StationError::from)
+}
+
+fn validate_persona_runtime(
+    persona: &BrowserPersona,
+    runtime: &ResolvedRuntime,
+) -> Result<(), StationError> {
+    if persona
+        .preset()
+        .is_some_and(|preset| !preset.supports_runtime(runtime.kind()))
+    {
+        return Err(StationError::PersonaRuntimeMismatch);
+    }
+    Ok(())
+}
+
 fn bind_identity_contract(
     profile: &IdentityProfile,
     persona: &BrowserPersona,
+    runtime: &ResolvedRuntime,
 ) -> Result<(), StationError> {
     std::fs::create_dir_all(profile.profile_dir()).map_err(StationError::PersonaIo)?;
     let _owner = ProfileOwnershipGuard::acquire(profile.profile_dir())?;
-    let manifest = profile.profile_dir().join(PERSONA_MANIFEST);
-    let expected = persona_contract(persona);
-    let persona_existed = match std::fs::read_to_string(&manifest) {
-        Ok(current) if current == expected => true,
-        Ok(_) => return Err(StationError::PersonaMismatch),
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-            return Err(StationError::PersonaIo(error))
-        }
-        Err(_) => false,
-    };
+    let persona_manifest = profile.profile_dir().join(PERSONA_MANIFEST);
+    let class_manifest = profile.profile_dir().join(PROFILE_CLASS_MANIFEST);
+    let binding_manifest = profile.profile_dir().join(PROFILE_BINDING_MANIFEST);
+    let persona_current = read_optional_manifest(&persona_manifest)?;
+    let class_current = read_optional_manifest(&class_manifest)?;
+    let binding_current = read_optional_manifest(&binding_manifest)?;
     let has_existing_state = std::fs::read_dir(profile.profile_dir())
         .map_err(StationError::PersonaIo)?
         .filter_map(Result::ok)
@@ -441,18 +492,43 @@ fn bind_identity_contract(
             let name = entry.file_name();
             name != PERSONA_MANIFEST
                 && name != PROFILE_CLASS_MANIFEST
+                && name != PROFILE_BINDING_MANIFEST
                 && name != SESSION_STATE_JOURNAL
                 && name != ".dig2browser-profile.lock"
         });
-    let class_manifest = profile.profile_dir().join(PROFILE_CLASS_MANIFEST);
-    let expected_class = identity_class_contract(profile.class());
-    match std::fs::read_to_string(&class_manifest) {
-        Ok(current) if current == expected_class => Ok(()),
-        Ok(_) => Err(StationError::IdentityClassMismatch),
-        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-            Err(StationError::PersonaIo(error))
+
+    match (persona.preset(), persona.route_ref()) {
+        (Some(_), Some(_)) => {
+            validate_persona_runtime(persona, runtime)?;
+            let expected_binding = profile_binding_contract(profile, persona, runtime)?;
+            match binding_current.as_deref() {
+                Some(current) if current == expected_binding => {}
+                Some(_) => return Err(StationError::ProfileBindingMismatch),
+                None if persona_current.is_some()
+                    || class_current.is_some()
+                    || has_existing_state =>
+                {
+                    return Err(StationError::ProfileBindingRequired)
+                }
+                None => write_once_manifest(&binding_manifest, &expected_binding)?,
+            }
         }
-        Err(_) => {
+        (None, None) if binding_current.is_none() => {}
+        (None, None) => return Err(StationError::ProfileBindingMismatch),
+        _ => return Err(StationError::InvalidPersona),
+    }
+
+    let expected_persona = persona_contract(persona);
+    let persona_existed = match persona_current {
+        Some(current) if current == expected_persona => true,
+        Some(_) => return Err(StationError::PersonaMismatch),
+        None => false,
+    };
+    let expected_class = identity_class_contract(profile.class());
+    match class_current {
+        Some(current) if current == expected_class => Ok(()),
+        Some(_) => Err(StationError::IdentityClassMismatch),
+        None => {
             if (persona_existed || has_existing_state)
                 && profile.class() != IdentityClass::Public
             {
@@ -466,9 +542,17 @@ fn bind_identity_contract(
         if has_existing_state && persona != &BrowserPersona::desktop_default() {
             return Err(StationError::PersonaBindingRequired);
         }
-        write_once_manifest(&manifest, &expected)?;
+        write_once_manifest(&persona_manifest, &expected_persona)?;
     }
     Ok(())
+}
+
+fn read_optional_manifest(path: &Path) -> Result<Option<String>, StationError> {
+    match std::fs::read_to_string(path) {
+        Ok(current) => Ok(Some(current)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(StationError::PersonaIo(error)),
+    }
 }
 
 fn write_once_manifest(path: &Path, expected: &str) -> Result<(), StationError> {
@@ -500,8 +584,8 @@ fn identity_class_contract(class: IdentityClass) -> &'static str {
 
 fn persona_contract(persona: &BrowserPersona) -> String {
     let timezone = persona.timezone().unwrap_or_default();
-    format!(
-        "v1|kind={:?}|viewport={}x{}|dpr={}|touch={}|locale={}:{}|timezone={}:{}|platform={}:{}|model={}:{}",
+    let surface = format!(
+        "kind={:?}|viewport={}x{}|dpr={}|touch={}|locale={}:{}|timezone={}:{}|platform={}:{}|model={}:{}",
         persona.kind(),
         persona.width(),
         persona.height(),
@@ -515,7 +599,77 @@ fn persona_contract(persona: &BrowserPersona) -> String {
         persona.platform_version(),
         persona.model().len(),
         persona.model(),
-    )
+    );
+    match (persona.preset(), persona.route_ref()) {
+        (Some(preset), Some(route)) => format!(
+            "v2|preset={}|route={}:{}|{surface}",
+            preset.as_str(),
+            route.as_str().len(),
+            route.as_str(),
+        ),
+        _ => format!("v1|{surface}"),
+    }
+}
+
+fn profile_binding_contract(
+    profile: &IdentityProfile,
+    persona: &BrowserPersona,
+    runtime: &ResolvedRuntime,
+) -> Result<String, StationError> {
+    let preset = persona.preset().ok_or(StationError::InvalidPersona)?;
+    let route = persona.route_ref().ok_or(StationError::InvalidPersona)?;
+    let persona = persona_contract(persona);
+    Ok(format!(
+        "v2|preset={}|runtime={:?}|class={}|route={}:{}|persona={}:{}",
+        preset.as_str(),
+        runtime.kind(),
+        identity_class_contract(profile.class()),
+        route.as_str().len(),
+        route.as_str(),
+        persona.len(),
+        persona,
+    ))
+}
+
+fn compiled_persona_metadata(contract: &str) -> Option<(PersonaPreset, &str)> {
+    let contract = contract.strip_prefix("v2|preset=")?;
+    let (preset_name, contract) = contract.split_once("|route=")?;
+    let preset = PersonaPreset::ALL
+        .into_iter()
+        .find(|candidate| candidate.as_str() == preset_name)?;
+    let (route_field, surface) = contract.split_once("|kind=")?;
+    let (route_length, route) = route_field.split_once(':')?;
+    let route_length = route_length.parse::<usize>().ok()?;
+    if route.len() != route_length || RouteRef::new(route).is_err() || surface.is_empty() {
+        return None;
+    }
+    Some((preset, route_field))
+}
+
+fn compiled_binding_matches(
+    binding: &str,
+    persona: &str,
+    class: ProfileClass,
+) -> bool {
+    let Some((preset, route_field)) = compiled_persona_metadata(persona) else {
+        return false;
+    };
+    [RuntimeKind::Chrome, RuntimeKind::Edge]
+        .into_iter()
+        .filter(|runtime| preset.supports_runtime(*runtime))
+        .any(|runtime| {
+            binding
+                == format!(
+                    "v2|preset={}|runtime={runtime:?}|class={}|route={route_field}|persona={}:{}",
+                    preset.as_str(),
+                    match class {
+                        ProfileClass::Public => "Public",
+                        ProfileClass::Authenticated => "Authenticated",
+                    },
+                    persona.len(),
+                    persona,
+                )
+        })
 }
 
 fn read_identity_session_status(
@@ -532,12 +686,18 @@ fn read_identity_session_status(
         return Ok(IdentitySessionStatus::unknown());
     }
 
-    let persona_bound = match std::fs::read_to_string(profile_dir.join(PERSONA_MANIFEST)) {
-        Ok(contract) if contract.starts_with("v1|kind=") => true,
+    let persona_contract = match std::fs::read_to_string(profile_dir.join(PERSONA_MANIFEST)) {
+        Ok(contract)
+            if contract.starts_with("v1|kind=")
+                || compiled_persona_metadata(&contract).is_some() => Some(contract),
         Ok(_) => return Err(StationError::SessionStateCorrupt),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(StationError::SessionIo(error)),
     };
+    let persona_bound = persona_contract.is_some();
+    let compiled_persona = persona_contract
+        .as_deref()
+        .is_some_and(|contract| contract.starts_with("v2|preset="));
     let profile_class = match std::fs::read_to_string(
         profile_dir.join(PROFILE_CLASS_MANIFEST),
     ) {
@@ -546,12 +706,31 @@ fn read_identity_session_status(
             Some(ProfileClass::Authenticated)
         }
         Ok(_) => return Err(StationError::SessionStateCorrupt),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && persona_bound => {
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && persona_bound
+                && !compiled_persona => {
             Some(ProfileClass::Public)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(StationError::SessionIo(error)),
     };
+    let binding = match std::fs::read_to_string(profile_dir.join(PROFILE_BINDING_MANIFEST)) {
+        Ok(binding) => Some(binding),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(StationError::SessionIo(error)),
+    };
+    match (
+        compiled_persona,
+        persona_contract.as_deref(),
+        profile_class,
+        binding.as_deref(),
+    ) {
+        (true, Some(persona), Some(class), Some(binding))
+            if compiled_binding_matches(binding, persona, class) => {}
+        (false, Some(_), _, None) | (false, None, None, None) => {}
+        _ => return Err(StationError::SessionStateCorrupt),
+    }
     let baseline = IdentitySessionStatus {
         profile_exists: true,
         persona_bound,
@@ -721,10 +900,12 @@ impl BrowserStation {
         {
             return Err(StationError::CapabilityDenied);
         }
-        let selector = constrained_runtime_selector(
+        let selector = persona_constrained_runtime_selector(
             self.inner.config.runtime_selector,
             requested_selector,
+            identity.persona(),
         )?;
+        let prepared_route = prepare_persona_route(&self.inner.config, identity.persona())?;
         let requirements = runtime_requirements(&capabilities, identity.persona(), false)?;
         let runtime = match additional_requirements {
             Some(additional) => self.inner.config.runtime_registry.prepare_all(
@@ -737,6 +918,7 @@ impl BrowserStation {
                 .runtime_registry
                 .prepare(selector, &requirements)?,
         };
+        validate_persona_runtime(identity.persona(), runtime.resolved())?;
 
         let mut state = self.inner.state.lock().await;
         if self.inner.shutting_down.load(Ordering::Acquire) {
@@ -821,10 +1003,13 @@ impl BrowserStation {
             identity.backend,
             identity.device,
         )?;
-        bind_identity_contract(&profile, identity.persona())?;
-        let mut worker_config = self.inner.config.worker.clone();
-        apply_persona(&mut worker_config, identity.persona())?;
         let resolved_runtime = runtime.resolved().clone();
+        bind_identity_contract(&profile, identity.persona(), &resolved_runtime)?;
+        let mut worker_config = self.inner.config.worker.clone();
+        if let Some(route) = &prepared_route {
+            route.apply(&mut worker_config);
+        }
+        apply_persona(&mut worker_config, identity.persona())?;
         let worker = runtime.spawn(
             profile,
             self.inner.config.worker_capabilities.clone(),
@@ -946,6 +1131,12 @@ impl BrowserStation {
         if self.inner.shutting_down.load(Ordering::Acquire) {
             return Err(StationError::ShuttingDown);
         }
+        let selector = persona_constrained_runtime_selector(
+            self.inner.config.runtime_selector,
+            RuntimeSelector::Auto,
+            identity.persona(),
+        )?;
+        let prepared_route = prepare_persona_route(&self.inner.config, identity.persona())?;
         let worker_capabilities = CapabilitySet::monitoring();
         let requirements = runtime_requirements(
             &worker_capabilities,
@@ -953,9 +1144,10 @@ impl BrowserStation {
             true,
         )?;
         let runtime = self.inner.config.runtime_registry.prepare(
-            self.inner.config.runtime_selector,
+            selector,
             &requirements,
         )?;
+        validate_persona_runtime(identity.persona(), runtime.resolved())?;
         let _operation = self.inner.operation_gate.read().await;
 
         let evicted = {
@@ -1025,12 +1217,19 @@ impl BrowserStation {
                 return Err(error.into());
             }
         };
-        if let Err(error) = bind_identity_contract(&profile, identity.persona()) {
+        if let Err(error) = bind_identity_contract(
+            &profile,
+            identity.persona(),
+            runtime.resolved(),
+        ) {
             self.remove_auth_reservation(&identity).await;
             return Err(error);
         }
         let mut worker_config = self.inner.config.worker.clone();
         worker_config.launch.headless = false;
+        if let Some(route) = &prepared_route {
+            route.apply(&mut worker_config);
+        }
         if let Err(error) = apply_persona(&mut worker_config, identity.persona()) {
             self.remove_auth_reservation(&identity).await;
             return Err(error);
@@ -1812,6 +2011,12 @@ pub enum StationError {
     RuntimeSelectionBusy,
     #[error("browser profile is bound to a different persona")]
     PersonaMismatch,
+    #[error("browser profile is bound to a different compiled persona, runtime, or route")]
+    ProfileBindingMismatch,
+    #[error("existing profile requires an explicit compiled-binding migration")]
+    ProfileBindingRequired,
+    #[error("compiled persona is incompatible with the selected runtime")]
+    PersonaRuntimeMismatch,
     #[error("browser profile is bound to a different identity class")]
     IdentityClassMismatch,
     #[error("existing profile must be bound as desktop before persona migration")]
@@ -1822,6 +2027,8 @@ pub enum StationError {
     InvalidPersona,
     #[error("browser persona manifest I/O failed")]
     PersonaIo(#[source] std::io::Error),
+    #[error("browser route contract is unavailable")]
+    Route(#[from] RouteRegistryError),
     #[error("an authenticated profile is required")]
     AuthenticatedProfileRequired,
     #[error("browser authentication session is busy")]

@@ -28,9 +28,11 @@ pub use trace::{
     MAX_ARTIFACT_CHUNK_BYTES, MAX_TRACE_EVENTS, MAX_TRACE_STEP_SUMMARIES,
 };
 pub use dig2browser_core::{
-    ControlTransport, EngineFamily, FeatureSupport, ResolvedRuntime,
-    RuntimeFeature, RuntimeKind, RuntimeLimitation, RuntimeRequirements,
-    RuntimeRequirementsError, RuntimeSelector, SupportLevel,
+    CompiledPersona, ControlTransport, EngineFamily, FeatureSupport,
+    PersonaCompiler, PersonaDeviceClass, PersonaMode, PersonaPreset,
+    ResolvedRuntime, RouteRef, RouteRefError, RuntimeFeature, RuntimeKind,
+    RuntimeLimitation, RuntimeRequirements, RuntimeRequirementsError,
+    RuntimeSelector, SupportLevel, HOST_DIRECT,
 };
 
 pub const PROTOCOL_VERSION: u16 = 1;

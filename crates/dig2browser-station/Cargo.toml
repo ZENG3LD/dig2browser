@@ -22,5 +22,6 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-threa
 
 [dev-dependencies]
 dig2browser-client = { path = "../dig2browser-client" }
+dig2browser-probe = { path = "../dig2browser-probe" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 uuid = { version = "1", features = ["v4"] }

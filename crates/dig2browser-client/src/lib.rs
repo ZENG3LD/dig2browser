@@ -13,15 +13,16 @@ pub use dig2browser_protocol::{
     ArtifactChunk, ArtifactCommitted, ArtifactMediaType, ArtifactRef,
     ArtifactRole, BrowserPersona, CaptureCompleteness, CollectionId,
     CollectionRequest, CollectionResponse, CollectionTask, CollectionTaskResult,
-    ControlTransport, EngineFamily, EvidenceCapture, FailureClass,
+    CompiledPersona, ControlTransport, EngineFamily, EvidenceCapture, FailureClass,
     IdentitySessionStatus, InterruptedReason, MobilePersonaConfig, PersonaKind,
-    ProfileClass, ResolvedRuntimeRecord, ResponseStatus, RuntimeFeature,
+    PersonaCompiler, PersonaDeviceClass, PersonaMode, PersonaPreset, ProfileClass,
+    ResolvedRuntimeRecord, ResponseStatus, RouteRef, RouteRefError, RuntimeFeature,
     RuntimeKind, RuntimeLimitation, RuntimeRequirements, RuntimeSelector,
     SessionPhase, SessionHealthProbe, SessionStateUpdate, StartedTrace,
     StationStatus, StepOutcome, StepSummary, SupportLevel, TaskCapturePolicy,
     TaskReply, TaskRuntimeContract, TaskStep, TerminalOutcome, TerminalTrace,
     TraceCursor, TraceEvent, TraceEventKind, TracePage,
-    MAX_ARTIFACT_CHUNK_BYTES, MAX_TRACE_EVENTS, DEFAULT_STATION_PIPE,
+    MAX_ARTIFACT_CHUNK_BYTES, MAX_TRACE_EVENTS, DEFAULT_STATION_PIPE, HOST_DIRECT,
 };
 
 const MIN_TIMEOUT: Duration = Duration::from_millis(100);

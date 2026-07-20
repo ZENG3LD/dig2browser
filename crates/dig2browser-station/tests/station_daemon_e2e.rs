@@ -14,12 +14,13 @@ use dig2browser_client::{
     ArtifactMediaType, ArtifactRef, ArtifactRole, BrowserPersona, ClientConfig,
     ClientError, CollectionId, CollectionTask, FailureClass, ControlTransport,
     EngineFamily, IdentitySessionStatus, InterruptedReason, MobilePersonaConfig,
-    ProfileClass, ResponseStatus, RuntimeFeature, RuntimeKind,
+    PersonaPreset, ProfileClass, ResponseStatus, RouteRef, RuntimeFeature, RuntimeKind,
     RuntimeRequirements, RuntimeSelector, SessionHealthProbe, SessionPhase,
     SessionStateUpdate, StationClient, StationStatus, SupportLevel,
     TaskCapturePolicy, TaskReply, TaskRuntimeContract, TaskStep,
     TerminalOutcome, TraceCursor, TraceEvent, TraceEventKind,
 };
+use dig2browser_probe::ProbeTranscriptV1;
 use tokio::io::AsyncReadExt;
 
 struct FixtureServer {
@@ -120,15 +121,18 @@ fn serve_connection(mut stream: TcpStream) -> std::io::Result<()> {
         return Ok(());
     }
     let script = if requested_marker == "auth-bootstrap" {
-        "<script>localStorage.setItem('dig2browser_auth_e2e','present');document.cookie='dig2browser_auth_e2e=cookie-secret; Path=/; Max-Age=3600'</script>"
+        "<script>localStorage.setItem('dig2browser_auth_e2e','present');document.cookie='dig2browser_auth_e2e=cookie-secret; Path=/; Max-Age=3600'</script>".to_owned()
+    } else if requested_marker == "persona-probe" {
+        persona_probe_script(&request)
     } else {
-        ""
+        String::new()
     };
     let body = format!(
-        "<!doctype html><title>{marker}</title><main data-daemon-e2e=\"{marker}\">{marker}</main>{}{script}",
+        "<!doctype html><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{marker}</title><main data-daemon-e2e=\"{marker}\">{marker}</main>{}{script}",
         match requested_marker {
             "session-ready" => "<section data-session-ready></section>",
             "session-reauth" => "<form data-session-reauth></form>",
+            "persona-probe" => "<pre id=\"persona-probe-output\"></pre>",
             _ => "",
         }
     );
@@ -142,6 +146,108 @@ fn serve_connection(mut stream: TcpStream) -> std::io::Result<()> {
         body.len()
     );
     stream.write_all(response.as_bytes())
+}
+
+fn persona_probe_script(request: &str) -> String {
+    let server_user_agent = json_script_string(&request_header(request, "user-agent"));
+    let accept_language = json_script_string(&request_header(request, "accept-language"));
+    let sec_ch_ua_mobile = json_script_string(&request_header(request, "sec-ch-ua-mobile"));
+    let sec_ch_ua_platform = json_script_string(&request_header(request, "sec-ch-ua-platform"));
+    format!(
+        r#"<script>(() => {{
+const output = document.getElementById('persona-probe-output');
+const uaData = navigator.userAgentData || null;
+const observation = {{
+  browser: {{
+    userAgent: navigator.userAgent,
+    platform: navigator.platform,
+    language: navigator.language,
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    uaMobile: uaData ? uaData.mobile : null,
+    uaPlatform: uaData ? uaData.platform : null,
+    innerWidth: innerWidth,
+    innerHeight: innerHeight,
+    screenWidth: screen.width,
+    screenHeight: screen.height,
+    dprMilli: Math.round(devicePixelRatio * 1000),
+    maxTouchPoints: navigator.maxTouchPoints,
+    coarsePointer: matchMedia('(pointer: coarse)').matches,
+    hover: matchMedia('(hover: hover)').matches,
+    webdriver: navigator.webdriver === true,
+    colorDepth: screen.colorDepth
+  }},
+  server: {{
+    userAgent: {server_user_agent},
+    acceptLanguage: {accept_language},
+    secChUaMobile: {sec_ch_ua_mobile},
+    secChUaPlatform: {sec_ch_ua_platform}
+  }}
+}};
+output.textContent = JSON.stringify(observation);
+output.dataset.ready = 'true';
+}})()</script>"#,
+    )
+}
+
+fn request_header(request: &str, expected_name: &str) -> String {
+    request
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case(expected_name))
+        .map(|(_, value)| value.trim().to_owned())
+        .unwrap_or_default()
+}
+
+fn json_script_string(value: &str) -> String {
+    serde_json::to_string(value).expect("serialize bounded fixture header")
+}
+
+fn persona_probe_task(url: String) -> CollectionTask {
+    let runtime_contract = TaskRuntimeContract::new(
+        RuntimeSelector::Exact(RuntimeKind::Chrome),
+        RuntimeRequirements::new(Vec::new(), false)
+            .expect("valid persona probe runtime requirements"),
+    )
+    .expect("valid persona probe runtime contract");
+    CollectionTask::new_with_runtime(
+        vec![
+            TaskStep::Navigate { url },
+            TaskStep::ReadSelectorText {
+                selector: "#persona-probe-output".to_owned(),
+            },
+        ],
+        runtime_contract,
+    )
+    .expect("valid persona probe task")
+}
+
+async fn collect_persona_probe(
+    client: &StationClient,
+    profile_id: &str,
+    profile_class: ProfileClass,
+    persona: &BrowserPersona,
+    url: String,
+) -> ProbeTranscriptV1 {
+    let result = client
+        .run_task_with_identity(
+            profile_id,
+            profile_class,
+            persona.clone(),
+            persona_probe_task(url),
+        )
+        .await
+        .expect("collect controlled-origin persona probe");
+    let runtime = result
+        .runtime()
+        .expect("persona probe records resolved runtime");
+    assert_eq!(runtime.kind(), RuntimeKind::Chrome);
+    assert_eq!(result.replies().len(), 2);
+    let TaskReply::Text(observation) = &result.replies()[1] else {
+        panic!("persona probe did not return selector text");
+    };
+    ProbeTranscriptV1::from_observation(persona, runtime, observation)
+        .expect("validate controlled-origin persona transcript")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -526,6 +632,233 @@ async fn stationd_explicit_chrome_and_edge_runtime_selection_e2e() {
         assert!(stdout.contains("\"drain_timed_out\":false"));
         remove_tree(&profiles).await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stationd_compiles_personas_binds_routes_and_validates_probe_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-stationd-persona-probe-e2e-{unique}");
+    let profiles = e2e_temp_base().join(format!(
+        "dig2browser-stationd-persona-probe-e2e-{unique}"
+    ));
+    std::fs::create_dir_all(&profiles).expect("create persona probe profiles root");
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+    let client_config = ClientConfig::new(
+        &pipe_name,
+        Duration::from_secs(15),
+        Duration::from_secs(90),
+    )
+    .expect("valid persona probe client config");
+    let direct_route = RouteRef::new("host.direct").expect("valid direct route");
+    let alternate_route =
+        RouteRef::new("host.direct-alt").expect("valid alternate direct route");
+    let desktop = BrowserPersona::compiled(
+        PersonaPreset::ChromeWindowsDesktopV1,
+        direct_route.clone(),
+    )
+    .expect("compile desktop persona");
+    let mobile = BrowserPersona::compiled(
+        PersonaPreset::ChromeAndroidPixel7MobileWebV1,
+        direct_route,
+    )
+    .expect("compile mobile persona");
+
+    let mut daemon = spawn_stationd_for_runtime_with_routes(
+        stationd,
+        &pipe_name,
+        &profiles,
+        "chrome",
+        &["host.direct", "host.direct-alt"],
+        true,
+    );
+    let client = StationClient::connect(client_config.clone())
+        .await
+        .expect("connect persona probe client");
+    let first_desktop = collect_persona_probe(
+        &client,
+        "compiled-desktop-profile",
+        ProfileClass::Authenticated,
+        &desktop,
+        fixture.url("/persona-probe"),
+    )
+    .await;
+    let first_desktop_hash = first_desktop.sha256();
+    assert_ne!(first_desktop_hash, [0_u8; 32]);
+    let first_mobile = collect_persona_probe(
+        &client,
+        "compiled-mobile-profile",
+        ProfileClass::Public,
+        &mobile,
+        fixture.url("/persona-probe"),
+    )
+    .await;
+    assert_ne!(first_mobile.sha256(), [0_u8; 32]);
+    assert!(first_mobile.observation().browser.ua_mobile);
+
+    let ready_expiry = unix_time_ms().saturating_add(60_000);
+    client
+        .update_identity_state(
+            "compiled-desktop-profile",
+            SessionStateUpdate {
+                phase: SessionPhase::Ready,
+                expires_at_unix_ms: Some(ready_expiry),
+            },
+        )
+        .await
+        .expect("mark compiled authenticated profile ready");
+    client.shutdown().await.expect("shutdown first persona probe station");
+    let first_exit = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("first persona probe daemon exit timeout")
+        .expect("wait for first persona probe daemon");
+    assert!(first_exit.success(), "first persona probe daemon failed: {first_exit}");
+    let (_, first_stderr) = read_child_output(&mut daemon).await;
+    assert!(first_stderr.is_empty(), "persona probe daemon wrote stderr: {first_stderr}");
+
+    let desktop_profile = profiles.join("compiled-desktop-profile");
+    let binding_path = desktop_profile.join(".dig2browser-profile-binding-v2");
+    let binding = std::fs::read_to_string(&binding_path)
+        .expect("read compiled profile binding");
+    assert!(binding.contains("preset=chrome-windows-desktop-v1"));
+    assert!(binding.contains("runtime=Chrome"));
+    assert!(binding.contains("route=11:host.direct"));
+    assert!(!binding.contains("Mozilla/"));
+    assert!(!binding.contains(&fixture.url("/persona-probe")));
+
+    let mut successor = spawn_stationd_for_runtime_with_routes(
+        stationd,
+        &pipe_name,
+        &profiles,
+        "chrome",
+        &["host.direct", "host.direct-alt"],
+        true,
+    );
+    let successor_client = StationClient::connect(client_config.clone())
+        .await
+        .expect("connect persona probe successor");
+    let alternate_persona = BrowserPersona::compiled(
+        PersonaPreset::ChromeWindowsDesktopV1,
+        alternate_route,
+    )
+    .expect("compile alternate-route persona");
+    let alternate_task = persona_probe_task(fixture.url("/persona-probe"));
+    assert!(matches!(
+        successor_client
+            .run_task_with_identity(
+                "compiled-desktop-profile",
+                ProfileClass::Authenticated,
+                alternate_persona,
+                alternate_task,
+            )
+            .await,
+        Err(ClientError::Remote {
+            status: ResponseStatus::Invalid,
+            ..
+        })
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&binding_path).expect("reread immutable binding"),
+        binding,
+    );
+
+    let edge_persona = BrowserPersona::compiled(
+        PersonaPreset::EdgeWindowsDesktopV1,
+        RouteRef::new("host.direct").expect("valid direct route"),
+    )
+    .expect("compile incompatible Edge persona");
+    assert!(matches!(
+        successor_client
+            .run_task_with_persona(
+                "compiled-edge-rejected-profile",
+                edge_persona,
+                persona_probe_task(fixture.url("/persona-probe")),
+            )
+            .await,
+        Err(ClientError::Remote {
+            status: ResponseStatus::Unsupported,
+            ..
+        })
+    ));
+    assert!(!profiles.join("compiled-edge-rejected-profile").exists());
+
+    let second_desktop = collect_persona_probe(
+        &successor_client,
+        "compiled-desktop-profile",
+        ProfileClass::Authenticated,
+        &desktop,
+        fixture.url("/persona-probe"),
+    )
+    .await;
+    assert_eq!(second_desktop.sha256(), first_desktop_hash);
+    let persisted = successor_client
+        .identity_status("compiled-desktop-profile")
+        .await
+        .expect("read compiled identity state after restart");
+    assert_eq!(persisted.phase, SessionPhase::Ready);
+    assert_eq!(persisted.expires_at_unix_ms, Some(ready_expiry));
+    successor_client
+        .shutdown()
+        .await
+        .expect("shutdown persona probe successor");
+    let successor_exit = tokio::time::timeout(Duration::from_secs(30), successor.wait())
+        .await
+        .expect("persona probe successor exit timeout")
+        .expect("wait for persona probe successor");
+    assert!(successor_exit.success(), "persona probe successor failed: {successor_exit}");
+    let (_, successor_stderr) = read_child_output(&mut successor).await;
+    assert!(
+        successor_stderr.is_empty(),
+        "persona probe successor wrote stderr: {successor_stderr}"
+    );
+
+    std::fs::remove_file(&binding_path).expect("remove binding to exercise fail-closed status");
+    let mut corrupt = spawn_stationd_for_runtime_with_routes(
+        stationd,
+        &pipe_name,
+        &profiles,
+        "chrome",
+        &["host.direct", "host.direct-alt"],
+        true,
+    );
+    let corrupt_client = StationClient::connect(client_config)
+        .await
+        .expect("connect corrupt-binding station");
+    assert!(matches!(
+        corrupt_client.identity_status("compiled-desktop-profile").await,
+        Err(ClientError::Remote {
+            status: ResponseStatus::Protocol,
+            ..
+        })
+    ));
+    assert!(matches!(
+        corrupt_client
+            .update_identity_state(
+                "compiled-desktop-profile",
+                SessionStateUpdate {
+                    phase: SessionPhase::ReauthRequired,
+                    expires_at_unix_ms: None,
+                },
+            )
+            .await,
+        Err(ClientError::Remote {
+            status: ResponseStatus::Protocol,
+            ..
+        })
+    ));
+    corrupt_client
+        .shutdown()
+        .await
+        .expect("shutdown corrupt-binding station");
+    let corrupt_exit = tokio::time::timeout(Duration::from_secs(30), corrupt.wait())
+        .await
+        .expect("corrupt-binding daemon exit timeout")
+        .expect("wait for corrupt-binding daemon");
+    assert!(corrupt_exit.success(), "corrupt-binding daemon failed: {corrupt_exit}");
+    let (_, corrupt_stderr) = read_child_output(&mut corrupt).await;
+    assert!(corrupt_stderr.is_empty(), "corrupt-binding daemon wrote stderr: {corrupt_stderr}");
+    remove_tree(&profiles).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2004,6 +2337,28 @@ fn spawn_stationd_for_runtime(
     )
 }
 
+fn spawn_stationd_for_runtime_with_routes(
+    stationd: &str,
+    pipe_name: &str,
+    profiles: &Path,
+    runtime: &str,
+    direct_route_refs: &[&str],
+    allow_session_state_updates: bool,
+) -> tokio::process::Child {
+    spawn_stationd_with_runtime_routes_permissions(
+        stationd,
+        pipe_name,
+        profiles,
+        StationSpawnOptions {
+            runtime: Some(runtime),
+            direct_route_refs,
+            allow_active_tasks: true,
+            allow_session_state_updates,
+            allow_headful_auth: false,
+        },
+    )
+}
+
 fn spawn_stationd_with_task_permissions(
     stationd: &str,
     pipe_name: &str,
@@ -2056,6 +2411,34 @@ fn spawn_stationd_with_runtime_permissions(
     allow_session_state_updates: bool,
     allow_headful_auth: bool,
 ) -> tokio::process::Child {
+    spawn_stationd_with_runtime_routes_permissions(
+        stationd,
+        pipe_name,
+        profiles,
+        StationSpawnOptions {
+            runtime,
+            direct_route_refs: &[],
+            allow_active_tasks,
+            allow_session_state_updates,
+            allow_headful_auth,
+        },
+    )
+}
+
+struct StationSpawnOptions<'a> {
+    runtime: Option<&'a str>,
+    direct_route_refs: &'a [&'a str],
+    allow_active_tasks: bool,
+    allow_session_state_updates: bool,
+    allow_headful_auth: bool,
+}
+
+fn spawn_stationd_with_runtime_routes_permissions(
+    stationd: &str,
+    pipe_name: &str,
+    profiles: &Path,
+    options: StationSpawnOptions<'_>,
+) -> tokio::process::Child {
     let mut command = tokio::process::Command::new(stationd);
     command.args([
             "--pipe-name",
@@ -2074,19 +2457,22 @@ fn spawn_stationd_with_runtime_permissions(
             "15",
             "--allow-remote-shutdown",
         ]);
-    if let Some(runtime) = runtime {
+    if let Some(runtime) = options.runtime {
         command.args(["--runtime", runtime]);
     }
-    if allow_active_tasks {
+    for direct_route_ref in options.direct_route_refs {
+        command.args(["--direct-route-ref", direct_route_ref]);
+    }
+    if options.allow_active_tasks {
         command.args(["--allow-interactive-tasks", "--allow-scripted-tasks"]);
     }
-    if allow_session_state_updates {
+    if options.allow_session_state_updates {
         command.args([
             "--allow-identity-status",
             "--allow-session-state-updates",
         ]);
     }
-    if allow_headful_auth {
+    if options.allow_headful_auth {
         command.args(["--allow-headful-auth", "--allow-session-health"]);
     }
     command

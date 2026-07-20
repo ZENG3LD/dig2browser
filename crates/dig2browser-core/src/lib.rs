@@ -13,6 +13,267 @@ pub enum RuntimeKind {
     Servo,
 }
 
+/// Stable persona selection mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PersonaMode {
+    PrivacyCohort,
+    NamedCompatibility,
+}
+
+/// Device class described by a compiled browser persona.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PersonaDeviceClass {
+    Desktop,
+    MobileWeb,
+}
+
+/// Versioned persona presets with stable names and runtime compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PersonaPreset {
+    ChromiumDesktopPrivacyCohortV1,
+    ChromeWindowsDesktopV1,
+    EdgeWindowsDesktopV1,
+    ChromeAndroidPixel7MobileWebV1,
+}
+
+impl PersonaPreset {
+    pub const ALL: [Self; 4] = [
+        Self::ChromiumDesktopPrivacyCohortV1,
+        Self::ChromeWindowsDesktopV1,
+        Self::EdgeWindowsDesktopV1,
+        Self::ChromeAndroidPixel7MobileWebV1,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ChromiumDesktopPrivacyCohortV1 => {
+                "chromium-desktop-privacy-cohort-v1"
+            }
+            Self::ChromeWindowsDesktopV1 => "chrome-windows-desktop-v1",
+            Self::EdgeWindowsDesktopV1 => "edge-windows-desktop-v1",
+            Self::ChromeAndroidPixel7MobileWebV1 => {
+                "chrome-android-pixel7-mobile-web-v1"
+            }
+        }
+    }
+
+    pub const fn mode(self) -> PersonaMode {
+        match self {
+            Self::ChromiumDesktopPrivacyCohortV1 => PersonaMode::PrivacyCohort,
+            Self::ChromeWindowsDesktopV1
+            | Self::EdgeWindowsDesktopV1
+            | Self::ChromeAndroidPixel7MobileWebV1 => PersonaMode::NamedCompatibility,
+        }
+    }
+
+    pub const fn device_class(self) -> PersonaDeviceClass {
+        match self {
+            Self::ChromeAndroidPixel7MobileWebV1 => PersonaDeviceClass::MobileWeb,
+            Self::ChromiumDesktopPrivacyCohortV1
+            | Self::ChromeWindowsDesktopV1
+            | Self::EdgeWindowsDesktopV1 => PersonaDeviceClass::Desktop,
+        }
+    }
+
+    pub const fn required_runtime(self) -> Option<RuntimeKind> {
+        match self {
+            Self::ChromiumDesktopPrivacyCohortV1 => None,
+            Self::ChromeWindowsDesktopV1
+            | Self::ChromeAndroidPixel7MobileWebV1 => Some(RuntimeKind::Chrome),
+            Self::EdgeWindowsDesktopV1 => Some(RuntimeKind::Edge),
+        }
+    }
+
+    pub const fn supports_runtime(self, runtime: RuntimeKind) -> bool {
+        match self {
+            Self::ChromiumDesktopPrivacyCohortV1 => {
+                matches!(runtime, RuntimeKind::Chrome | RuntimeKind::Edge)
+            }
+            Self::ChromeWindowsDesktopV1
+            | Self::ChromeAndroidPixel7MobileWebV1 => {
+                matches!(runtime, RuntimeKind::Chrome)
+            }
+            Self::EdgeWindowsDesktopV1 => matches!(runtime, RuntimeKind::Edge),
+        }
+    }
+}
+
+/// Opaque, validated routing identity carried with compiled personas.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RouteRef(String);
+
+pub const HOST_DIRECT: &str = "host.direct";
+
+impl RouteRef {
+    pub fn new(value: impl Into<String>) -> Result<Self, RouteRefError> {
+        let value = value.into();
+        if value.is_empty() || value.len() > 64 {
+            return Err(RouteRefError::InvalidLength);
+        }
+        if !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+        }) {
+            return Err(RouteRefError::InvalidCharacter);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn host_direct() -> Self {
+        Self(HOST_DIRECT.to_owned())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for RouteRef {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for RouteRef {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteRefError {
+    InvalidLength,
+    InvalidCharacter,
+}
+
+impl fmt::Display for RouteRefError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLength => formatter.write_str("route reference must contain 1 to 64 bytes"),
+            Self::InvalidCharacter => formatter.write_str(
+                "route reference contains a character outside ASCII letters, digits, dot, underscore, and hyphen",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RouteRefError {}
+
+/// Fully materialized persona fields produced from a versioned preset.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CompiledPersona {
+    preset: PersonaPreset,
+    route_ref: RouteRef,
+    width: u16,
+    height: u16,
+    device_scale_milli: u16,
+    max_touch_points: u8,
+    locale: &'static str,
+    timezone: Option<&'static str>,
+    platform_version: &'static str,
+    model: &'static str,
+}
+
+impl CompiledPersona {
+    pub fn preset(&self) -> PersonaPreset {
+        self.preset
+    }
+
+    pub fn route_ref(&self) -> &RouteRef {
+        &self.route_ref
+    }
+
+    pub fn device_class(&self) -> PersonaDeviceClass {
+        self.preset.device_class()
+    }
+
+    pub fn width(&self) -> u16 {
+        self.width
+    }
+
+    pub fn height(&self) -> u16 {
+        self.height
+    }
+
+    pub fn device_scale_milli(&self) -> u16 {
+        self.device_scale_milli
+    }
+
+    pub fn device_scale_factor(&self) -> f64 {
+        f64::from(self.device_scale_milli) / 1000.0
+    }
+
+    pub fn max_touch_points(&self) -> u8 {
+        self.max_touch_points
+    }
+
+    pub fn locale(&self) -> &'static str {
+        self.locale
+    }
+
+    pub fn timezone(&self) -> Option<&'static str> {
+        self.timezone
+    }
+
+    pub fn platform(&self) -> &'static str {
+        match self.device_class() {
+            PersonaDeviceClass::Desktop => "Windows",
+            PersonaDeviceClass::MobileWeb => "Android",
+        }
+    }
+
+    pub fn platform_version(&self) -> &'static str {
+        self.platform_version
+    }
+
+    pub fn architecture(&self) -> &'static str {
+        match self.device_class() {
+            PersonaDeviceClass::Desktop => "x86",
+            PersonaDeviceClass::MobileWeb => "",
+        }
+    }
+
+    pub fn model(&self) -> &'static str {
+        self.model
+    }
+
+    pub fn is_mobile(&self) -> bool {
+        self.device_class() == PersonaDeviceClass::MobileWeb
+    }
+}
+
+/// Dependency-free compiler for stable browser persona presets.
+pub struct PersonaCompiler;
+
+impl PersonaCompiler {
+    pub fn compile(preset: PersonaPreset, route_ref: RouteRef) -> CompiledPersona {
+        let (
+            width,
+            height,
+            device_scale_milli,
+            max_touch_points,
+            platform_version,
+            model,
+        ) = match preset.device_class() {
+            PersonaDeviceClass::Desktop => (1920, 1080, 1000, 0, "15.0.0", ""),
+            PersonaDeviceClass::MobileWeb => {
+                (393, 852, 3000, 5, "13.0.0", "Pixel 7")
+            }
+        };
+        CompiledPersona {
+            preset,
+            route_ref,
+            width,
+            height,
+            device_scale_milli,
+            max_touch_points,
+            locale: "en-US",
+            timezone: Some("UTC"),
+            platform_version,
+            model,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuntimeSelector {
     Auto,
@@ -346,6 +607,120 @@ fn duplicate_feature(features: impl IntoIterator<Item = RuntimeFeature>) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn persona_compiler_presets_are_stable_and_runtime_compatible() {
+        let route = RouteRef::host_direct();
+        let cases = [
+            (
+                PersonaPreset::ChromiumDesktopPrivacyCohortV1,
+                "chromium-desktop-privacy-cohort-v1",
+                PersonaMode::PrivacyCohort,
+                PersonaDeviceClass::Desktop,
+                None,
+            ),
+            (
+                PersonaPreset::ChromeWindowsDesktopV1,
+                "chrome-windows-desktop-v1",
+                PersonaMode::NamedCompatibility,
+                PersonaDeviceClass::Desktop,
+                Some(RuntimeKind::Chrome),
+            ),
+            (
+                PersonaPreset::EdgeWindowsDesktopV1,
+                "edge-windows-desktop-v1",
+                PersonaMode::NamedCompatibility,
+                PersonaDeviceClass::Desktop,
+                Some(RuntimeKind::Edge),
+            ),
+            (
+                PersonaPreset::ChromeAndroidPixel7MobileWebV1,
+                "chrome-android-pixel7-mobile-web-v1",
+                PersonaMode::NamedCompatibility,
+                PersonaDeviceClass::MobileWeb,
+                Some(RuntimeKind::Chrome),
+            ),
+        ];
+
+        for (preset, name, mode, device_class, required_runtime) in cases {
+            assert_eq!(preset.as_str(), name);
+            assert_eq!(preset.mode(), mode);
+            assert_eq!(preset.device_class(), device_class);
+            assert_eq!(preset.required_runtime(), required_runtime);
+            let compiled = PersonaCompiler::compile(preset, route.clone());
+            assert_eq!(compiled.preset(), preset);
+            assert_eq!(compiled.route_ref(), &route);
+            assert_eq!(compiled.locale(), "en-US");
+            assert_eq!(compiled.timezone(), Some("UTC"));
+            match device_class {
+                PersonaDeviceClass::Desktop => {
+                    assert_eq!(compiled.width(), 1920);
+                    assert_eq!(compiled.height(), 1080);
+                    assert_eq!(compiled.device_scale_milli(), 1000);
+                    assert_eq!(compiled.device_scale_factor(), 1.0);
+                    assert_eq!(compiled.max_touch_points(), 0);
+                    assert_eq!(compiled.platform(), "Windows");
+                    assert_eq!(compiled.platform_version(), "15.0.0");
+                    assert_eq!(compiled.architecture(), "x86");
+                    assert_eq!(compiled.model(), "");
+                    assert!(!compiled.is_mobile());
+                }
+                PersonaDeviceClass::MobileWeb => {
+                    assert_eq!(compiled.width(), 393);
+                    assert_eq!(compiled.height(), 852);
+                    assert_eq!(compiled.device_scale_milli(), 3000);
+                    assert_eq!(compiled.device_scale_factor(), 3.0);
+                    assert_eq!(compiled.max_touch_points(), 5);
+                    assert_eq!(compiled.platform(), "Android");
+                    assert_eq!(compiled.platform_version(), "13.0.0");
+                    assert_eq!(compiled.architecture(), "");
+                    assert_eq!(compiled.model(), "Pixel 7");
+                    assert!(compiled.is_mobile());
+                }
+            }
+        }
+
+        assert!(PersonaPreset::ChromiumDesktopPrivacyCohortV1
+            .supports_runtime(RuntimeKind::Chrome));
+        assert!(PersonaPreset::ChromiumDesktopPrivacyCohortV1
+            .supports_runtime(RuntimeKind::Edge));
+        assert!(!PersonaPreset::ChromiumDesktopPrivacyCohortV1
+            .supports_runtime(RuntimeKind::Firefox));
+        assert!(PersonaPreset::ChromeWindowsDesktopV1
+            .supports_runtime(RuntimeKind::Chrome));
+        assert!(!PersonaPreset::ChromeWindowsDesktopV1
+            .supports_runtime(RuntimeKind::Edge));
+        assert!(PersonaPreset::EdgeWindowsDesktopV1
+            .supports_runtime(RuntimeKind::Edge));
+        assert!(!PersonaPreset::EdgeWindowsDesktopV1
+            .supports_runtime(RuntimeKind::Chrome));
+        assert!(PersonaPreset::ChromeAndroidPixel7MobileWebV1
+            .supports_runtime(RuntimeKind::Chrome));
+        assert!(!PersonaPreset::ChromeAndroidPixel7MobileWebV1
+            .supports_runtime(RuntimeKind::Android));
+    }
+
+    #[test]
+    fn route_references_reject_url_and_delimiter_injection() {
+        assert_eq!(RouteRef::host_direct().as_str(), HOST_DIRECT);
+        for valid in ["A", "host.direct", "Proxy_01-west"] {
+            assert_eq!(RouteRef::new(valid).expect("valid route").as_str(), valid);
+        }
+        assert!(RouteRef::new("a".repeat(64)).is_ok());
+        for malicious in [
+            "",
+            "https://proxy.test",
+            "proxy:8080",
+            "user@proxy",
+            "path/to/proxy",
+            "proxy route",
+            "line\nbreak",
+            "proxy-ё",
+        ] {
+            assert!(RouteRef::new(malicious).is_err(), "accepted {malicious:?}");
+        }
+        assert!(RouteRef::new("a".repeat(65)).is_err());
+    }
 
     fn support(feature: RuntimeFeature, level: SupportLevel) -> FeatureSupport {
         FeatureSupport::new(feature, level, Vec::new())

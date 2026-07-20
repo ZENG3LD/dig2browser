@@ -788,9 +788,13 @@ fn collection_error_response(
             StationError::Identity(_)
             | StationError::PersonaMismatch
             | StationError::PersonaBindingRequired
+            | StationError::ProfileBindingMismatch
+            | StationError::ProfileBindingRequired
+            | StationError::PersonaRuntimeMismatch
             | StationError::IdentityClassMismatch
             | StationError::IdentityClassBindingRequired
-            | StationError::InvalidPersona,
+            | StationError::InvalidPersona
+            | StationError::Route(_),
         )
         | CollectionError::Ledger(
             LedgerError::CollectionNotFound
@@ -853,9 +857,13 @@ async fn check_auth_session(
         Err(
             StationError::Identity(_)
             | StationError::PersonaMismatch
+            | StationError::ProfileBindingMismatch
+            | StationError::ProfileBindingRequired
+            | StationError::PersonaRuntimeMismatch
             | StationError::IdentityClassMismatch
             | StationError::AuthenticatedProfileRequired
-            | StationError::InvalidSessionState,
+            | StationError::InvalidSessionState
+            | StationError::Route(_),
         ) => WorkerResponse::failure(
             request,
             ResponseStatus::Invalid,
@@ -900,10 +908,14 @@ async fn begin_auth_session(
             StationError::Identity(_)
             | StationError::PersonaMismatch
             | StationError::PersonaBindingRequired
+            | StationError::ProfileBindingMismatch
+            | StationError::ProfileBindingRequired
+            | StationError::PersonaRuntimeMismatch
             | StationError::IdentityClassMismatch
             | StationError::IdentityClassBindingRequired
             | StationError::InvalidPersona
-            | StationError::AuthenticatedProfileRequired,
+            | StationError::AuthenticatedProfileRequired
+            | StationError::Route(_),
         ) => WorkerResponse::failure(
             request,
             ResponseStatus::Invalid,
@@ -967,6 +979,11 @@ async fn identity_status(
             ResponseStatus::Invalid,
             "invalid profile",
         ),
+        Err(StationError::SessionStateCorrupt) => WorkerResponse::failure(
+            request,
+            ResponseStatus::Protocol,
+            "identity status corrupt",
+        ),
         Err(_) => WorkerResponse::failure(
             request,
             ResponseStatus::Unavailable,
@@ -999,6 +1016,11 @@ async fn update_identity_state(
             request,
             ResponseStatus::Invalid,
             "session state rejected",
+        ),
+        Err(StationError::SessionStateCorrupt) => WorkerResponse::failure(
+            request,
+            ResponseStatus::Protocol,
+            "identity status corrupt",
         ),
         Err(_) => WorkerResponse::failure(
             request,
@@ -1086,9 +1108,13 @@ async fn run_task(
         Err(
             error @ (StationError::PersonaMismatch
             | StationError::PersonaBindingRequired
+            | StationError::ProfileBindingMismatch
+            | StationError::ProfileBindingRequired
+            | StationError::PersonaRuntimeMismatch
             | StationError::IdentityClassMismatch
             | StationError::IdentityClassBindingRequired
-            | StationError::InvalidPersona),
+            | StationError::InvalidPersona
+            | StationError::Route(_)),
         ) => {
             observation.failure(station_error_class(&error, FailureClass::Protocol));
             return failure(
@@ -1490,10 +1516,14 @@ fn is_terminal_admission_error(error: &StationError) -> bool {
             | StationError::Identity(_)
             | StationError::PersonaMismatch
             | StationError::PersonaBindingRequired
+            | StationError::ProfileBindingMismatch
+            | StationError::ProfileBindingRequired
+            | StationError::PersonaRuntimeMismatch
             | StationError::IdentityClassMismatch
             | StationError::IdentityClassBindingRequired
             | StationError::InvalidPersona
             | StationError::PersonaIo(_)
+            | StationError::Route(_)
             | StationError::RuntimeSelectionDenied { .. }
             | StationError::RuntimeSelectionBusy
             | StationError::RuntimeRequirements(_)
@@ -1505,6 +1535,7 @@ fn is_runtime_contract_unsupported(error: &StationError) -> bool {
     matches!(
         error,
         StationError::RuntimeSelectionDenied { .. }
+            | StationError::PersonaRuntimeMismatch
             | StationError::RuntimeRegistry(RuntimeRegistryError::Incompatible { .. })
     )
 }

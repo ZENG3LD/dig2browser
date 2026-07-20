@@ -10,6 +10,8 @@ use clap::{Parser, ValueEnum};
 #[cfg(windows)]
 use dig2browser::agentic::BrowserWorkerConfig;
 #[cfg(windows)]
+use dig2browser_core::{RouteRef, RouteRefError};
+#[cfg(windows)]
 use dig2browser_protocol::DEFAULT_STATION_PIPE;
 #[cfg(windows)]
 use dig2browser_station::ipc::{
@@ -19,7 +21,8 @@ use dig2browser_station::ipc::{
 #[cfg(windows)]
 use dig2browser_station::{
     BrowserStation, CollectionError, ConfigError as StationConfigError, ProfilesRootError,
-    ProfilesRootOwnership, RuntimeKind, RuntimeSelector, StationConfig,
+    ProfilesRootOwnership, RouteDescriptor, RouteRegistry, RouteRegistryError, RuntimeKind,
+    RuntimeSelector, StationConfig,
 };
 
 #[cfg(windows)]
@@ -57,6 +60,8 @@ struct Cli {
     max_in_flight: usize,
     #[arg(long, value_enum, default_value_t = RuntimeArg::Auto)]
     runtime: RuntimeArg,
+    #[arg(long = "direct-route-ref", default_value = "host.direct")]
+    direct_route_refs: Vec<String>,
     #[arg(long, default_value_t = 64)]
     max_connections: usize,
     #[arg(long, default_value_t = 90)]
@@ -105,6 +110,7 @@ async fn main() -> ExitCode {
 #[cfg(windows)]
 async fn run(cli: Cli) -> Result<ServerReport, DaemonError> {
     let profiles_owner = ProfilesRootOwnership::acquire(&cli.profiles_root)?;
+    let route_registry = direct_route_registry(&cli.direct_route_refs)?;
     let command_timeout = Duration::from_secs(cli.timeout_seconds);
     let worker = BrowserWorkerConfig {
         command_timeout,
@@ -116,6 +122,7 @@ async fn run(cli: Cli) -> Result<ServerReport, DaemonError> {
         cli.max_in_flight,
     )?
     .with_runtime_selector(cli.runtime.selector())
+    .with_route_registry(route_registry)
     .with_worker_config(worker);
     let mut server_config = ServerConfig::new(
         cli.pipe_name,
@@ -146,6 +153,19 @@ async fn run(cli: Cli) -> Result<ServerReport, DaemonError> {
 }
 
 #[cfg(windows)]
+fn direct_route_registry(references: &[String]) -> Result<RouteRegistry, DaemonError> {
+    if references.is_empty() {
+        return Err(DaemonError::NoDirectRoutes);
+    }
+    let mut registry = RouteRegistry::empty();
+    for reference in references {
+        let reference = RouteRef::new(reference.clone())?;
+        registry.register(RouteDescriptor::host_direct(reference))?;
+    }
+    Ok(registry)
+}
+
+#[cfg(windows)]
 fn print_report(report: ServerReport) {
     let outcome = if report.drain_timed_out {
         "drain_timeout"
@@ -170,6 +190,12 @@ enum DaemonError {
     ProfilesRoot(#[from] ProfilesRootError),
     #[error(transparent)]
     StationConfig(#[from] StationConfigError),
+    #[error("at least one direct route reference must be configured")]
+    NoDirectRoutes,
+    #[error(transparent)]
+    RouteRef(#[from] RouteRefError),
+    #[error(transparent)]
+    RouteRegistry(#[from] RouteRegistryError),
     #[error(transparent)]
     ServerConfig(#[from] ServerConfigError),
     #[error(transparent)]
@@ -182,7 +208,11 @@ impl DaemonError {
         match self {
             Self::ProfilesRoot(ProfilesRootError::AlreadyOwned) => "profiles_root_owned",
             Self::ProfilesRoot(_) => "profiles_root_unavailable",
-            Self::StationConfig(_) | Self::ServerConfig(_) => "invalid_config",
+            Self::StationConfig(_)
+            | Self::NoDirectRoutes
+            | Self::RouteRef(_)
+            | Self::RouteRegistry(_)
+            | Self::ServerConfig(_) => "invalid_config",
             Self::Server(ServerError::UnsupportedPlatform) => "unsupported_platform",
             Self::Server(ServerError::Io(_)) => "station_endpoint_unavailable",
             Self::Server(ServerError::Frame(_)) => "station_protocol_failure",
