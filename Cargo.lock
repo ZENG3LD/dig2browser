@@ -554,6 +554,7 @@ dependencies = [
  "dig2browser-core",
  "dig2browser-protocol",
  "dig2browser-trace",
+ "serde_json",
  "thiserror",
  "tokio",
  "uuid",
