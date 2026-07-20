@@ -99,9 +99,10 @@ impl CollectionManager {
         let lease = self
             .inner
             .station
-            .lease_with_runtime_requirements(
+            .lease_for_task(
                 collection.identity,
                 collection.capabilities,
+                &collection.task,
                 collection.runtime_selector,
                 collection.runtime_requirements.as_ref(),
             )

@@ -14,6 +14,10 @@ use dig2browser_core::{
     ResolvedRuntime, RuntimeDescriptor, RuntimeFeature, RuntimeKind,
     RuntimeLimitation, RuntimeRequirements, RuntimeSelector, SupportLevel,
 };
+use dig2browser_runtime_lightweight::{
+    LightweightRuntime, LightweightRuntimeConfig, RUNTIME_VERSION,
+    runtime_descriptor as lightweight_runtime_descriptor,
+};
 
 /// Launch boundary for one concrete browser runtime.
 pub trait RuntimeFactory: Send + Sync {
@@ -53,6 +57,14 @@ impl RuntimeRegistry {
         registry
             .register(ChromiumRuntimeFactory::edge(), true)
             .expect("built-in Edge runtime kind must be unique");
+        registry
+    }
+
+    pub fn builtin_defaults() -> Self {
+        let mut registry = Self::chromium_defaults();
+        registry
+            .register(LightweightRuntimeFactory::new(), false)
+            .expect("built-in Lightweight runtime kind must be unique");
         registry
     }
 
@@ -141,7 +153,7 @@ impl RuntimeRegistry {
 
 impl Default for RuntimeRegistry {
     fn default() -> Self {
-        Self::chromium_defaults()
+        Self::builtin_defaults()
     }
 }
 
@@ -266,6 +278,47 @@ impl RuntimeFactory for ChromiumRuntimeFactory {
     }
 }
 
+struct LightweightRuntimeFactory {
+    descriptor: RuntimeDescriptor,
+}
+
+impl LightweightRuntimeFactory {
+    fn new() -> Self {
+        Self {
+            descriptor: lightweight_runtime_descriptor(),
+        }
+    }
+}
+
+impl RuntimeFactory for LightweightRuntimeFactory {
+    fn descriptor(&self) -> &RuntimeDescriptor {
+        &self.descriptor
+    }
+
+    fn probe_version(&self) -> Result<Option<String>, RuntimeRegistryError> {
+        Ok(Some(RUNTIME_VERSION.to_owned()))
+    }
+
+    fn spawn(
+        &self,
+        identity: IdentityProfile,
+        capabilities: CapabilitySet,
+        config: BrowserWorkerConfig,
+    ) -> Result<BrowserWorker, WorkerError> {
+        let runtime = LightweightRuntime::new(
+            identity.clone(),
+            LightweightRuntimeConfig::default(),
+        )?;
+        BrowserWorker::spawn_with_runtime_and_timeout(
+            identity,
+            capabilities,
+            config.queue_capacity,
+            config.command_timeout,
+            runtime,
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeRegistryError {
     #[error("runtime {0:?} is already registered")]
@@ -355,5 +408,21 @@ mod tests {
             })
         ));
         assert_eq!(probes.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn lightweight_is_registered_but_never_selected_automatically() {
+        let registry = RuntimeRegistry::builtin_defaults();
+        let requirements = RuntimeRequirements::new(
+            vec![RuntimeFeature::Navigate, RuntimeFeature::DesktopWeb],
+            true,
+        )
+        .expect("valid lightweight requirements");
+
+        let exact = registry
+            .resolve(RuntimeSelector::Exact(RuntimeKind::Lightweight), &requirements)
+            .expect("resolve explicit lightweight runtime");
+        assert_eq!(exact.kind(), RuntimeKind::Lightweight);
+        assert!(!registry.auto_order.contains(&RuntimeKind::Lightweight));
     }
 }

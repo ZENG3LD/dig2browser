@@ -263,6 +263,7 @@ pub enum RuntimeFailureKind {
     Launch,
     Navigation,
     Interaction,
+    ObservationMissing,
     Capture,
     Protocol,
     Timeout,

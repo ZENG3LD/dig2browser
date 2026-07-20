@@ -1090,19 +1090,20 @@ async fn run_task(
         }
     };
     let runtime_contract = task.runtime_contract();
-    let lease = match runtime_contract {
-        Some(contract) => {
-            acquire_runtime_lease(
-                station,
-                identity,
-                capabilities,
-                contract.selector(),
-                contract.requirements(),
-            )
-            .await
-        }
-        None => acquire_lease(station, identity, capabilities).await,
-    };
+    let requested_selector = runtime_contract
+        .map(|contract| contract.selector())
+        .unwrap_or(RuntimeSelector::Auto);
+    let client_requirements = runtime_contract
+        .map(|contract| contract.requirements());
+    let lease = acquire_task_lease(
+        station,
+        identity,
+        capabilities,
+        &station_task,
+        requested_selector,
+        client_requirements,
+    )
+    .await;
     let lease = match lease {
         Ok(lease) => lease,
         Err(
@@ -1482,21 +1483,23 @@ async fn acquire_lease(
     }
 }
 
-async fn acquire_runtime_lease(
+async fn acquire_task_lease(
     station: &BrowserStation,
     identity: IdentityRequest,
     capabilities: CapabilitySet,
+    task: &BrowserTask,
     selector: RuntimeSelector,
-    requirements: &RuntimeRequirements,
+    client_requirements: Option<&RuntimeRequirements>,
 ) -> Result<BrowserLease, StationError> {
     let deadline = tokio::time::Instant::now() + ACQUIRE_RETRY_WINDOW;
     loop {
         match station
-            .lease_with_runtime_requirements(
+            .lease_for_task(
                 identity.clone(),
                 capabilities.clone(),
+                task,
                 selector,
-                Some(requirements),
+                client_requirements,
             )
             .await
         {
@@ -1526,6 +1529,7 @@ fn is_terminal_admission_error(error: &StationError) -> bool {
             | StationError::Route(_)
             | StationError::RuntimeSelectionDenied { .. }
             | StationError::RuntimeSelectionBusy
+            | StationError::RuntimeBackendUnsupported(_)
             | StationError::RuntimeRequirements(_)
             | StationError::RuntimeRegistry(RuntimeRegistryError::Incompatible { .. })
     )
@@ -1536,6 +1540,7 @@ fn is_runtime_contract_unsupported(error: &StationError) -> bool {
         error,
         StationError::RuntimeSelectionDenied { .. }
             | StationError::PersonaRuntimeMismatch
+            | StationError::RuntimeBackendUnsupported(_)
             | StationError::RuntimeRegistry(RuntimeRegistryError::Incompatible { .. })
     )
 }

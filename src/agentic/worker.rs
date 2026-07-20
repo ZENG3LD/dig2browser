@@ -384,6 +384,12 @@ async fn handle_command(
 
     let reply = match result {
         Ok(reply) => reply,
+        Err(error) if error.kind() == RuntimeFailureKind::ObservationMissing => {
+            snapshot.lifecycle = WorkerLifecycle::Ready;
+            snapshot.last_failure = None;
+            snapshots.send_replace(snapshot.clone());
+            return Err(WorkerError::Runtime(error));
+        }
         Err(error) => {
             mark_degraded(snapshot, error);
             snapshots.send_replace(snapshot.clone());
@@ -577,6 +583,7 @@ mod tests {
         fail_navigation: bool,
         restart_needed: bool,
         navigation_delay: Option<Duration>,
+        missing_selector: bool,
     }
 
     struct FakeRuntime {
@@ -648,6 +655,11 @@ mod tests {
             &'a mut self,
             _selector: &'a str,
         ) -> BoxFuture<'a, RuntimeResult<()>> {
+            if self.state.lock().unwrap().missing_selector {
+                return Box::pin(async {
+                    Err(RuntimeError::new(RuntimeFailureKind::ObservationMissing))
+                });
+            }
             Box::pin(async { Ok(()) })
         }
 
@@ -794,6 +806,39 @@ mod tests {
         worker.execute(AgentCommand::Restart).await.unwrap();
         assert_eq!(worker.snapshot().lifecycle, WorkerLifecycle::Ready);
         assert_eq!(state.lock().unwrap().restarts, 1);
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_observation_does_not_degrade_resident_worker() {
+        let state = Arc::new(Mutex::new(FakeState {
+            missing_selector: true,
+            ..FakeState::default()
+        }));
+        let worker = BrowserWorker::spawn_with_runtime(
+            identity(),
+            capabilities(),
+            4,
+            FakeRuntime { state },
+        )
+        .unwrap();
+        worker.wait_until_settled().await.unwrap();
+
+        let error = worker
+            .execute(AgentCommand::ResolveElement {
+                selector: "#missing".into(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            WorkerError::Runtime(error)
+                if error.kind() == RuntimeFailureKind::ObservationMissing
+        ));
+        let snapshot = worker.snapshot();
+        assert_eq!(snapshot.lifecycle, WorkerLifecycle::Ready);
+        assert_eq!(snapshot.last_failure, None);
         worker.shutdown().await.unwrap();
     }
 

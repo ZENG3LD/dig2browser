@@ -249,6 +249,15 @@ impl IdentityRequest {
     pub fn class(&self) -> IdentityClass {
         self.class
     }
+
+    fn bind_runtime_backend(mut self, runtime: RuntimeKind) -> Result<Self, StationError> {
+        self.backend = match runtime {
+            RuntimeKind::Chrome | RuntimeKind::Edge => BrowserBackend::Chromium,
+            RuntimeKind::Lightweight => BrowserBackend::Lightweight,
+            unsupported => return Err(StationError::RuntimeBackendUnsupported(unsupported)),
+        };
+        Ok(self)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -410,6 +419,73 @@ fn runtime_requirements(
         features.push(RuntimeFeature::HeadfulAuthentication);
     }
     RuntimeRequirements::new(features, false)
+}
+
+fn task_runtime_requirements(
+    task: &BrowserTask,
+) -> Result<RuntimeRequirements, RuntimeRequirementsError> {
+    let mut features = vec![RuntimeFeature::Lifecycle];
+    let mut add = |feature| {
+        if !features.contains(&feature) {
+            features.push(feature);
+        }
+    };
+    for step in task.steps() {
+        match step {
+            BrowserTaskStep::Navigate { .. } => add(RuntimeFeature::Navigate),
+            BrowserTaskStep::Wait { .. } => {}
+            BrowserTaskStep::Wheel { .. } => add(RuntimeFeature::ScrollInput),
+            BrowserTaskStep::KeyPress { .. } => add(RuntimeFeature::KeyboardInput),
+            BrowserTaskStep::ClickSelector { .. }
+            | BrowserTaskStep::TypeSelector { .. } => {
+                add(RuntimeFeature::DomInspect);
+                add(RuntimeFeature::DomInteract);
+            }
+            BrowserTaskStep::ReadSelectorText { .. } => {
+                add(RuntimeFeature::DomInspect)
+            }
+            BrowserTaskStep::Evaluate { .. } => add(RuntimeFeature::ScriptEvaluate),
+            BrowserTaskStep::Capture { policy } => {
+                add(RuntimeFeature::CaptureState);
+                match policy {
+                    CapturePolicy::StateOnly => {}
+                    CapturePolicy::HtmlOnly => add(RuntimeFeature::CaptureHtml),
+                    CapturePolicy::EvidenceViewport => {
+                        add(RuntimeFeature::CaptureHtml);
+                        add(RuntimeFeature::CaptureViewportPng);
+                    }
+                }
+            }
+        }
+    }
+    RuntimeRequirements::new(features, false)
+}
+
+fn persona_runtime_requirements(
+    persona: &BrowserPersona,
+) -> Result<RuntimeRequirements, RuntimeRequirementsError> {
+    match persona.kind() {
+        PersonaKind::Desktop => {
+            RuntimeRequirements::new(vec![RuntimeFeature::DesktopWeb], true)
+        }
+        PersonaKind::Mobile => RuntimeRequirements::new(
+            vec![RuntimeFeature::MobileWebEmulation],
+            false,
+        ),
+    }
+}
+
+fn authenticated_identity_runtime_requirements(
+    identity: &IdentityRequest,
+) -> Result<Option<RuntimeRequirements>, RuntimeRequirementsError> {
+    match identity.class() {
+        IdentityClass::Public => Ok(None),
+        IdentityClass::Authenticated => RuntimeRequirements::new(
+            vec![RuntimeFeature::PersistentProfile],
+            false,
+        )
+        .map(Some),
+    }
 }
 
 fn constrained_runtime_selector(
@@ -891,6 +967,55 @@ impl BrowserStation {
         requested_selector: RuntimeSelector,
         additional_requirements: Option<&RuntimeRequirements>,
     ) -> Result<BrowserLease, StationError> {
+        let requirements = runtime_requirements(&capabilities, identity.persona(), false)?;
+        let mut requirement_sets = vec![&requirements];
+        if let Some(additional) = additional_requirements {
+            requirement_sets.push(additional);
+        }
+        self.lease_with_requirement_sets(
+            identity,
+            capabilities,
+            requested_selector,
+            &requirement_sets,
+        )
+        .await
+    }
+
+    pub(crate) async fn lease_for_task(
+        &self,
+        identity: IdentityRequest,
+        capabilities: CapabilitySet,
+        task: &BrowserTask,
+        requested_selector: RuntimeSelector,
+        client_requirements: Option<&RuntimeRequirements>,
+    ) -> Result<BrowserLease, StationError> {
+        let task_requirements = task_runtime_requirements(task)?;
+        let persona_requirements = persona_runtime_requirements(identity.persona())?;
+        let identity_requirements =
+            authenticated_identity_runtime_requirements(&identity)?;
+        let mut requirement_sets = vec![&task_requirements, &persona_requirements];
+        if let Some(identity_requirements) = identity_requirements.as_ref() {
+            requirement_sets.push(identity_requirements);
+        }
+        if let Some(client_requirements) = client_requirements {
+            requirement_sets.push(client_requirements);
+        }
+        self.lease_with_requirement_sets(
+            identity,
+            capabilities,
+            requested_selector,
+            &requirement_sets,
+        )
+        .await
+    }
+
+    async fn lease_with_requirement_sets(
+        &self,
+        identity: IdentityRequest,
+        capabilities: CapabilitySet,
+        requested_selector: RuntimeSelector,
+        requirement_sets: &[&RuntimeRequirements],
+    ) -> Result<BrowserLease, StationError> {
         if self.inner.shutting_down.load(Ordering::Acquire) {
             return Err(StationError::ShuttingDown);
         }
@@ -906,19 +1031,13 @@ impl BrowserStation {
             identity.persona(),
         )?;
         let prepared_route = prepare_persona_route(&self.inner.config, identity.persona())?;
-        let requirements = runtime_requirements(&capabilities, identity.persona(), false)?;
-        let runtime = match additional_requirements {
-            Some(additional) => self.inner.config.runtime_registry.prepare_all(
-                selector,
-                &[&requirements, additional],
-            )?,
-            None => self
-                .inner
-                .config
-                .runtime_registry
-                .prepare(selector, &requirements)?,
-        };
+        let runtime = self
+            .inner
+            .config
+            .runtime_registry
+            .prepare_all(selector, requirement_sets)?;
         validate_persona_runtime(identity.persona(), runtime.resolved())?;
+        let identity = identity.bind_runtime_backend(runtime.resolved().kind())?;
 
         let mut state = self.inner.state.lock().await;
         if self.inner.shutting_down.load(Ordering::Acquire) {
@@ -2007,6 +2126,8 @@ pub enum StationError {
         configured: RuntimeKind,
         requested: RuntimeKind,
     },
+    #[error("selected runtime has no station identity backend")]
+    RuntimeBackendUnsupported(RuntimeKind),
     #[error("the identity is leased by a different runtime instance")]
     RuntimeSelectionBusy,
     #[error("browser profile is bound to a different persona")]
@@ -2067,6 +2188,15 @@ pub enum StationError {
 mod tests {
     use super::*;
     use dig2browser::agentic::{Capability, L3Capability};
+    use dig2browser_core::{
+        FeatureSupport, NegotiationError, RuntimeDescriptor, SupportLevel,
+    };
+
+    fn capture_task_requirements(policy: CapturePolicy) -> RuntimeRequirements {
+        let task = BrowserTask::new(vec![BrowserTaskStep::Capture { policy }])
+            .expect("valid capture task");
+        task_runtime_requirements(&task).expect("valid runtime requirements")
+    }
 
     #[test]
     fn rejects_relative_profile_root_and_zero_limits() {
@@ -2095,6 +2225,149 @@ mod tests {
             config.with_worker_capabilities(capabilities),
             Err(ConfigError::LifecycleCapabilityRequired)
         ));
+    }
+
+    #[test]
+    fn capture_policy_derives_only_required_runtime_features() {
+        assert_eq!(
+            capture_task_requirements(CapturePolicy::StateOnly).features(),
+            &[
+                RuntimeFeature::Lifecycle,
+                RuntimeFeature::CaptureState,
+            ]
+        );
+        assert_eq!(
+            capture_task_requirements(CapturePolicy::HtmlOnly).features(),
+            &[
+                RuntimeFeature::Lifecycle,
+                RuntimeFeature::CaptureState,
+                RuntimeFeature::CaptureHtml,
+            ]
+        );
+        assert_eq!(
+            capture_task_requirements(CapturePolicy::EvidenceViewport).features(),
+            &[
+                RuntimeFeature::Lifecycle,
+                RuntimeFeature::CaptureState,
+                RuntimeFeature::CaptureHtml,
+                RuntimeFeature::CaptureViewportPng,
+            ]
+        );
+    }
+
+    #[test]
+    fn task_runtime_features_are_step_exact_and_deduplicated() {
+        let task = BrowserTask::new(vec![
+            BrowserTaskStep::Navigate { url: "https://example.test".to_owned() },
+            BrowserTaskStep::Wait { duration: Duration::from_millis(1) },
+            BrowserTaskStep::Wheel { x: 0.0, y: 0.0, delta_x: 0.0, delta_y: 1.0 },
+            BrowserTaskStep::KeyPress { key: "Tab".to_owned() },
+            BrowserTaskStep::ClickSelector { selector: "#target".to_owned() },
+            BrowserTaskStep::TypeSelector {
+                selector: "#target".to_owned(),
+                text: "value".to_owned(),
+            },
+            BrowserTaskStep::ReadSelectorText { selector: "#target".to_owned() },
+            BrowserTaskStep::Evaluate { script: "document.title".to_owned() },
+            BrowserTaskStep::Capture { policy: CapturePolicy::HtmlOnly },
+        ])
+        .expect("valid task");
+        let requirements =
+            task_runtime_requirements(&task).expect("valid runtime requirements");
+        assert!(!requirements.allow_partial());
+        assert_eq!(
+            requirements.features(),
+            &[
+                RuntimeFeature::Lifecycle,
+                RuntimeFeature::Navigate,
+                RuntimeFeature::ScrollInput,
+                RuntimeFeature::KeyboardInput,
+                RuntimeFeature::DomInspect,
+                RuntimeFeature::DomInteract,
+                RuntimeFeature::ScriptEvaluate,
+                RuntimeFeature::CaptureState,
+                RuntimeFeature::CaptureHtml,
+            ]
+        );
+    }
+
+    #[test]
+    fn client_partial_policy_cannot_weaken_task_requirements() {
+        let descriptor = RuntimeDescriptor::new(
+            RuntimeKind::Lightweight,
+            EngineFamily::Dig2Lightweight,
+            ControlTransport::Native,
+            vec![
+                FeatureSupport::new(
+                    RuntimeFeature::Lifecycle,
+                    SupportLevel::Native,
+                    Vec::new(),
+                ),
+                FeatureSupport::new(
+                    RuntimeFeature::Navigate,
+                    SupportLevel::Partial,
+                    Vec::new(),
+                ),
+                FeatureSupport::new(
+                    RuntimeFeature::DesktopWeb,
+                    SupportLevel::Partial,
+                    Vec::new(),
+                ),
+            ],
+        )
+        .expect("valid runtime descriptor");
+        let task = BrowserTask::new(vec![BrowserTaskStep::Navigate {
+            url: "https://example.test".to_owned(),
+        }])
+        .expect("valid task");
+        let task_requirements =
+            task_runtime_requirements(&task).expect("valid task requirements");
+        let persona_requirements = persona_runtime_requirements(
+            &BrowserPersona::desktop_default(),
+        )
+        .expect("valid persona requirements");
+        let client_requirements = RuntimeRequirements::new(
+            vec![RuntimeFeature::Navigate],
+            true,
+        )
+        .expect("valid client requirements");
+
+        assert!(matches!(
+            descriptor.negotiate_all(
+                &[
+                    &task_requirements,
+                    &persona_requirements,
+                    &client_requirements,
+                ],
+                None,
+            ),
+            Err(NegotiationError::PartialSupportDenied(
+                RuntimeFeature::Navigate
+            ))
+        ));
+    }
+
+    #[test]
+    fn persistent_profile_is_strictly_authenticated_only() {
+        let public = IdentityRequest::public_desktop("public");
+        assert!(
+            authenticated_identity_runtime_requirements(&public)
+                .expect("valid public requirements")
+                .is_none()
+        );
+
+        let authenticated = IdentityRequest::authenticated_persona(
+            "authenticated",
+            BrowserPersona::desktop_default(),
+        );
+        let requirements = authenticated_identity_runtime_requirements(&authenticated)
+            .expect("valid authenticated requirements")
+            .expect("authenticated requirement set");
+        assert!(!requirements.allow_partial());
+        assert_eq!(
+            requirements.features(),
+            &[RuntimeFeature::PersistentProfile]
+        );
     }
 
     #[test]

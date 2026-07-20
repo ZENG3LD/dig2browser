@@ -22,7 +22,7 @@ const RUNTIME_RECORD_SCHEMA_VERSION: u16 = 1;
 const TASK_SCHEMA_VERSION_V1: u16 = 1;
 const TASK_SCHEMA_VERSION_V2: u16 = 2;
 const MAX_RUNTIME_FEATURES: usize = 16;
-const MAX_RUNTIME_LIMITATIONS: usize = 3;
+const MAX_RUNTIME_LIMITATIONS: usize = 8;
 const MAX_RUNTIME_VERSION_BYTES: usize = 128;
 const MAX_SELECTOR_BYTES: usize = 4_096;
 const MAX_KEY_BYTES: usize = 64;
@@ -909,6 +909,13 @@ fn runtime_limitation_to_wire(limitation: RuntimeLimitation) -> u8 {
         RuntimeLimitation::NoNativeMobileApis => 1,
         RuntimeLimitation::NoCarrierState => 2,
         RuntimeLimitation::NoHardwareAttestation => 3,
+        RuntimeLimitation::NoScriptExecution => 4,
+        RuntimeLimitation::NoVisualRendering => 5,
+        RuntimeLimitation::NoInteractiveDom => 6,
+        RuntimeLimitation::NoSubresourceLoading => 7,
+        RuntimeLimitation::NoPersonaEmulation => 8,
+        RuntimeLimitation::Utf8HtmlOnly => 9,
+        RuntimeLimitation::NoBrowserSessionState => 10,
     }
 }
 
@@ -917,6 +924,13 @@ fn runtime_limitation_from_wire(value: u8) -> Result<RuntimeLimitation, Protocol
         1 => Ok(RuntimeLimitation::NoNativeMobileApis),
         2 => Ok(RuntimeLimitation::NoCarrierState),
         3 => Ok(RuntimeLimitation::NoHardwareAttestation),
+        4 => Ok(RuntimeLimitation::NoScriptExecution),
+        5 => Ok(RuntimeLimitation::NoVisualRendering),
+        6 => Ok(RuntimeLimitation::NoInteractiveDom),
+        7 => Ok(RuntimeLimitation::NoSubresourceLoading),
+        8 => Ok(RuntimeLimitation::NoPersonaEmulation),
+        9 => Ok(RuntimeLimitation::Utf8HtmlOnly),
+        10 => Ok(RuntimeLimitation::NoBrowserSessionState),
         _ => Err(ProtocolError::InvalidTaskResult),
     }
 }
@@ -1281,6 +1295,48 @@ mod tests {
         let decoded_runtime = decoded.runtime().expect("runtime record");
         assert_eq!(decoded_runtime.version(), Some("127.0.6533.72"));
         assert_eq!(decoded_runtime.granted(), resolved.granted());
+    }
+
+    #[test]
+    fn lightweight_runtime_limitations_round_trip() {
+        let limitations = vec![
+            RuntimeLimitation::NoScriptExecution,
+            RuntimeLimitation::NoVisualRendering,
+            RuntimeLimitation::NoInteractiveDom,
+            RuntimeLimitation::NoSubresourceLoading,
+            RuntimeLimitation::NoPersonaEmulation,
+            RuntimeLimitation::Utf8HtmlOnly,
+            RuntimeLimitation::NoBrowserSessionState,
+        ];
+        let descriptor = RuntimeDescriptor::new(
+            RuntimeKind::Lightweight,
+            EngineFamily::Dig2Lightweight,
+            ControlTransport::Native,
+            vec![FeatureSupport::new(
+                RuntimeFeature::DesktopWeb,
+                SupportLevel::Partial,
+                limitations.clone(),
+            )],
+        )
+        .expect("valid lightweight descriptor");
+        let requirements = RuntimeRequirements::new(
+            vec![RuntimeFeature::DesktopWeb],
+            true,
+        )
+        .expect("valid lightweight requirements");
+        let resolved = descriptor
+            .negotiate(&requirements, Some("0.1.0".to_owned()))
+            .expect("resolve lightweight runtime");
+        let runtime = ResolvedRuntimeRecord::from_resolved(&resolved)
+            .expect("valid lightweight runtime record");
+
+        let encoded = encode_runtime_record(&runtime).expect("encode runtime record");
+        let decoded = decode_runtime_record(&encoded).expect("decode runtime record");
+
+        assert_eq!(decoded.kind(), RuntimeKind::Lightweight);
+        assert_eq!(decoded.engine(), EngineFamily::Dig2Lightweight);
+        assert_eq!(decoded.control(), ControlTransport::Native);
+        assert_eq!(decoded.granted()[0].limitations(), limitations);
     }
 
     #[test]

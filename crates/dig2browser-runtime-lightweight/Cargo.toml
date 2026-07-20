@@ -1,0 +1,21 @@
+[package]
+name = "dig2browser-runtime-lightweight"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Bounded static-document runtime for dig2browser"
+
+[lib]
+name = "dig2browser_runtime_lightweight"
+path = "src/lib.rs"
+
+[dependencies]
+dig2browser = { path = "../.." }
+dig2browser-core = { path = "../dig2browser-core" }
+futures = "0.3"
+reqwest = "=0.12.28"
+scraper = { version = "=0.27.0", default-features = false, features = ["atomic"] }
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

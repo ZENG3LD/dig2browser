@@ -312,6 +312,7 @@ pub enum RuntimeFeature {
     CaptureHtml,
     CaptureViewportPng,
     Lifecycle,
+    /// Runtime-owned web session state survives worker recreation.
     PersistentProfile,
     HeadfulAuthentication,
     DesktopWeb,
@@ -332,6 +333,13 @@ pub enum RuntimeLimitation {
     NoNativeMobileApis,
     NoCarrierState,
     NoHardwareAttestation,
+    NoScriptExecution,
+    NoVisualRendering,
+    NoInteractiveDom,
+    NoSubresourceLoading,
+    NoPersonaEmulation,
+    Utf8HtmlOnly,
+    NoBrowserSessionState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

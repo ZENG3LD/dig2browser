@@ -31,6 +31,7 @@ enum RuntimeArg {
     Auto,
     Chrome,
     Edge,
+    Lightweight,
 }
 
 #[cfg(windows)]
@@ -40,6 +41,7 @@ impl RuntimeArg {
             Self::Auto => RuntimeSelector::Auto,
             Self::Chrome => RuntimeSelector::Exact(RuntimeKind::Chrome),
             Self::Edge => RuntimeSelector::Exact(RuntimeKind::Edge),
+            Self::Lightweight => RuntimeSelector::Exact(RuntimeKind::Lightweight),
         }
     }
 }
