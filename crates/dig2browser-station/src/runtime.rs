@@ -283,7 +283,7 @@ impl RuntimeFactory for ChromiumRuntimeFactory {
     }
 
     fn supports_exact_page_request_policy(&self) -> bool {
-        true
+        cfg!(windows)
     }
 
     fn probe_version(&self) -> Result<Option<String>, RuntimeRegistryError> {
