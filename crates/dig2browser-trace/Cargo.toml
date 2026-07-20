@@ -1,0 +1,17 @@
+[package]
+name = "dig2browser-trace"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Crash-safe trace and artifact ledger for dig2browser collections"
+
+[lib]
+name = "dig2browser_trace"
+path = "src/lib.rs"
+
+[dependencies]
+dig2browser-protocol = { path = "../dig2browser-protocol" }
+sha2 = "0.10"
+
+[dev-dependencies]
+dig2browser-core = { path = "../dig2browser-core" }

@@ -529,6 +529,7 @@ dependencies = [
  "dig2browser-protocol",
  "thiserror",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -537,7 +538,7 @@ version = "0.1.0"
 
 [[package]]
 name = "dig2browser-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dig2browser-core",
  "tokio",
@@ -552,9 +553,19 @@ dependencies = [
  "dig2browser-client",
  "dig2browser-core",
  "dig2browser-protocol",
+ "dig2browser-trace",
  "thiserror",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "dig2browser-trace"
+version = "0.1.0"
+dependencies = [
+ "dig2browser-core",
+ "dig2browser-protocol",
+ "sha2",
 ]
 
 [[package]]

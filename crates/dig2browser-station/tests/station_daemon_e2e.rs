@@ -11,12 +11,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dig2browser::identity::ProfileOwnershipGuard;
 use dig2browser_client::{
-    BrowserPersona, ClientConfig, ClientError, CollectionTask, FailureClass,
-    ControlTransport, EngineFamily, IdentitySessionStatus, MobilePersonaConfig,
+    ArtifactMediaType, ArtifactRef, ArtifactRole, BrowserPersona, ClientConfig,
+    ClientError, CollectionId, CollectionTask, FailureClass, ControlTransport,
+    EngineFamily, IdentitySessionStatus, InterruptedReason, MobilePersonaConfig,
     ProfileClass, ResponseStatus, RuntimeFeature, RuntimeKind,
     RuntimeRequirements, RuntimeSelector, SessionHealthProbe, SessionPhase,
     SessionStateUpdate, StationClient, StationStatus, SupportLevel,
     TaskCapturePolicy, TaskReply, TaskRuntimeContract, TaskStep,
+    TerminalOutcome, TraceCursor, TraceEvent, TraceEventKind,
 };
 use tokio::io::AsyncReadExt;
 
@@ -1297,6 +1299,411 @@ fn assert_mobile_fingerprint(fingerprint: &str, marker_expected: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stationd_resumes_trace_and_reconciles_hard_kill_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-stationd-trace-e2e-{unique}");
+    let profiles = e2e_temp_base().join(format!(
+        "dig2browser-stationd-trace-profiles-e2e-{unique}"
+    ));
+    let traces = e2e_temp_base().join(format!(
+        "dig2browser-stationd-trace-ledger-e2e-{unique}"
+    ));
+    std::fs::create_dir_all(&profiles).expect("create trace E2E profiles root");
+    std::fs::create_dir_all(&traces).expect("create trace E2E ledger root");
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+    let mut daemon = spawn_stationd_with_trace(
+        stationd,
+        &pipe_name,
+        &profiles,
+        &traces,
+    );
+    let client_config = ClientConfig::new(
+        &pipe_name,
+        Duration::from_secs(15),
+        Duration::from_secs(90),
+    )
+    .expect("valid trace E2E client config");
+    let client = StationClient::connect(client_config)
+        .await
+        .expect("connect trace E2E client");
+
+    let denied_profile = "authenticated-trace-denied";
+    let denied_id = CollectionId::new(*uuid::Uuid::new_v4().as_bytes())
+        .expect("nonzero denied collection ID");
+    let denied = client
+        .begin_collection_with_identity(
+            denied_profile,
+            denied_id,
+            ProfileClass::Authenticated,
+            BrowserPersona::desktop_default(),
+            CollectionTask::new(vec![TaskStep::Navigate {
+                url: fixture.url("/authenticated-trace-denied"),
+            }])
+            .expect("valid denied authenticated task"),
+        )
+        .await;
+    assert!(matches!(
+        denied,
+        Err(ClientError::Remote {
+            status: ResponseStatus::Unsupported,
+            ..
+        })
+    ));
+    assert!(
+        !profiles.join(denied_profile).exists(),
+        "authenticated durable denial created a profile"
+    );
+
+    let collection_id = CollectionId::new(*uuid::Uuid::new_v4().as_bytes())
+        .expect("nonzero collection ID");
+    let secret_query = "trace-query-secret";
+    let secret_profile = "trace-profile-secret";
+    let secret_script = "trace-script-secret";
+    let secret_selector = "main[data-daemon-e2e=\"durable-trace\"]";
+    let runtime_contract = TaskRuntimeContract::new(
+        RuntimeSelector::Exact(RuntimeKind::Chrome),
+        RuntimeRequirements::new(Vec::new(), false)
+            .expect("valid trace runtime requirements"),
+    )
+    .expect("valid trace runtime contract");
+    let task = CollectionTask::new_with_runtime(
+        vec![
+            TaskStep::Navigate {
+                url: format!("{}?token={secret_query}", fixture.url("/durable-trace")),
+            },
+            TaskStep::Evaluate {
+                script: format!("({{marker: '{secret_script}'}})"),
+            },
+            TaskStep::ReadSelectorText {
+                selector: secret_selector.to_owned(),
+            },
+            TaskStep::Capture {
+                policy: TaskCapturePolicy::EvidenceViewport,
+            },
+        ],
+        runtime_contract,
+    )
+    .expect("valid durable trace task");
+    let retry_task = task.clone();
+    let handle = client
+        .begin_collection_with_id(secret_profile, collection_id, task)
+        .await
+        .expect("begin durable trace collection");
+    assert_eq!(handle.collection_id(), collection_id);
+    assert_eq!(handle.cursor(), TraceCursor::new(1));
+    assert_eq!(handle.runtime().kind(), RuntimeKind::Chrome);
+
+    client.disconnect().await;
+    let events = wait_for_complete_trace(&client, collection_id).await;
+    assert_eq!(events.first().map(TraceEvent::cursor), Some(TraceCursor::new(1)));
+    for (index, event) in events.iter().enumerate() {
+        assert_eq!(event.cursor().value(), u32::try_from(index + 1).unwrap());
+    }
+    let mut artifacts = Vec::new();
+    let mut terminal = None;
+    for event in &events {
+        match event.kind() {
+            TraceEventKind::ArtifactCommitted(committed) => {
+                artifacts.push((committed.role(), committed.artifact().clone()));
+            }
+            TraceEventKind::Terminal(trace) => terminal = Some(trace.outcome()),
+            _ => {}
+        }
+    }
+    assert_eq!(terminal, Some(TerminalOutcome::Succeeded));
+    assert_eq!(artifacts.len(), 2);
+    for (role, artifact) in artifacts {
+        let bytes = read_complete_artifact(&client, collection_id, &artifact).await;
+        assert_eq!(u64::try_from(bytes.len()).unwrap(), artifact.len());
+        assert_eq!(
+            dig2browser::digest::sha256_bytes(&bytes),
+            *artifact.sha256()
+        );
+        match role {
+            ArtifactRole::Html => {
+                assert_eq!(artifact.media_type(), ArtifactMediaType::TextHtmlUtf8);
+                assert!(String::from_utf8_lossy(&bytes)
+                    .contains("data-daemon-e2e=\"durable-trace\""));
+            }
+            ArtifactRole::ViewportPng => {
+                assert_eq!(artifact.media_type(), ArtifactMediaType::ImagePng);
+                assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+            }
+        }
+    }
+    let retry = client
+        .begin_collection_with_id(secret_profile, collection_id, retry_task)
+        .await
+        .expect("retry durable collection idempotently");
+    assert_eq!(retry.collection_id(), collection_id);
+    let retried_events = wait_for_complete_trace(&client, collection_id).await;
+    assert_eq!(retried_events, events);
+    let durable_events = read_trace_event_bytes(&traces);
+    let durable_text = String::from_utf8_lossy(&durable_events);
+    for secret in [secret_query, secret_profile, secret_script, secret_selector] {
+        assert!(
+            !durable_text.contains(secret),
+            "trace event files leaked task input: {secret}"
+        );
+    }
+
+    let cancelled_id = CollectionId::new(*uuid::Uuid::new_v4().as_bytes())
+        .expect("nonzero cancelled collection ID");
+    let cancelled_task = CollectionTask::new(vec![
+        TaskStep::Navigate {
+            url: fixture.url("/durable-cancelled"),
+        },
+        TaskStep::Wait {
+            duration: Duration::from_secs(60),
+        },
+    ])
+    .expect("valid cancellable collection task");
+    client
+        .begin_collection_with_id(
+            "trace-cancel-profile",
+            cancelled_id,
+            cancelled_task,
+        )
+        .await
+        .expect("begin cancellable collection");
+    client
+        .cancel_collection(cancelled_id)
+        .await
+        .expect("request collection cancellation");
+    let cancelled = wait_for_complete_trace(&client, cancelled_id).await;
+    assert!(matches!(
+        cancelled.last().map(TraceEvent::kind),
+        Some(TraceEventKind::Terminal(trace))
+            if trace.outcome() == TerminalOutcome::Cancelled
+    ));
+
+    let interrupted_id = CollectionId::new(*uuid::Uuid::new_v4().as_bytes())
+        .expect("nonzero interrupted collection ID");
+    let interrupted_task = CollectionTask::new_with_runtime(
+        vec![
+            TaskStep::Navigate {
+                url: fixture.url("/durable-interrupted"),
+            },
+            TaskStep::Wait {
+                duration: Duration::from_secs(60),
+            },
+            TaskStep::Capture {
+                policy: TaskCapturePolicy::HtmlOnly,
+            },
+        ],
+        TaskRuntimeContract::new(
+            RuntimeSelector::Exact(RuntimeKind::Chrome),
+            RuntimeRequirements::new(Vec::new(), false)
+                .expect("valid interrupted runtime requirements"),
+        )
+        .expect("valid interrupted runtime contract"),
+    )
+    .expect("valid interrupted collection task");
+    client
+        .begin_collection_with_id(
+            "trace-crash-profile",
+            interrupted_id,
+            interrupted_task,
+        )
+        .await
+        .expect("persist interrupted collection start");
+
+    daemon.kill().await.expect("hard-kill trace station daemon");
+    daemon.wait().await.expect("reap killed trace station daemon");
+    let _ = read_child_output(&mut daemon).await;
+    let mut successor = spawn_stationd_with_trace(
+        stationd,
+        &pipe_name,
+        &profiles,
+        &traces,
+    );
+    assert!(
+        client.health().await.is_err(),
+        "stale trace transport unexpectedly survived hard kill"
+    );
+    client
+        .health()
+        .await
+        .expect("trace client reconnects to successor");
+    let interrupted = wait_for_complete_trace(&client, interrupted_id).await;
+    assert_eq!(interrupted.len(), 2);
+    assert!(matches!(
+        interrupted[0].kind(),
+        TraceEventKind::Started(_)
+    ));
+    assert!(matches!(
+        interrupted[1].kind(),
+        TraceEventKind::Interrupted(InterruptedReason::SuccessorReconciliation)
+    ));
+
+    let legacy = client
+        .run_task(
+            "trace-crash-profile",
+            CollectionTask::new(vec![
+                TaskStep::Navigate {
+                    url: fixture.url("/after-trace-reconciliation"),
+                },
+                TaskStep::Capture {
+                    policy: TaskCapturePolicy::HtmlOnly,
+                },
+            ])
+            .expect("valid legacy task after trace reconciliation"),
+        )
+        .await
+        .expect("successor reuses profile after trace reconciliation");
+    assert!(legacy.runtime().is_none());
+    let TaskReply::Capture(capture) = &legacy.replies()[1] else {
+        panic!("legacy task omitted capture after reconciliation");
+    };
+    assert!(String::from_utf8_lossy(&capture.html)
+        .contains("data-daemon-e2e=\"after-trace-reconciliation\""));
+
+    client.shutdown().await.expect("shutdown trace successor");
+    let status = tokio::time::timeout(Duration::from_secs(30), successor.wait())
+        .await
+        .expect("trace successor exit timeout")
+        .expect("wait for trace successor");
+    assert!(status.success(), "trace successor failed: {status}");
+    let (stdout, stderr) = read_child_output(&mut successor).await;
+    assert!(stderr.is_empty(), "clean trace successor wrote stderr: {stderr}");
+    assert!(stdout.contains("\"outcome\":\"clean\""));
+    assert!(stdout.contains("\"drain_timed_out\":false"));
+    remove_tree(&profiles).await;
+    remove_tree(&traces).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stationd_surfaces_terminal_persistence_failure_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-stationd-trace-fault-e2e-{unique}");
+    let profiles = e2e_temp_base().join(format!(
+        "dig2browser-stationd-trace-fault-profiles-e2e-{unique}"
+    ));
+    let traces = e2e_temp_base().join(format!(
+        "dig2browser-stationd-trace-fault-ledger-e2e-{unique}"
+    ));
+    std::fs::create_dir_all(&profiles).expect("create trace-fault profiles root");
+    std::fs::create_dir_all(&traces).expect("create trace-fault ledger root");
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+    let mut daemon = spawn_stationd_with_trace(
+        stationd,
+        &pipe_name,
+        &profiles,
+        &traces,
+    );
+    let client_config = ClientConfig::new(
+        &pipe_name,
+        Duration::from_secs(15),
+        Duration::from_secs(90),
+    )
+    .expect("valid trace-fault client config");
+    let client = StationClient::connect(client_config.clone())
+        .await
+        .expect("connect trace-fault client");
+    let collection_id = CollectionId::new(*uuid::Uuid::new_v4().as_bytes())
+        .expect("nonzero trace-fault collection ID");
+    let task = CollectionTask::new(vec![
+        TaskStep::Navigate {
+            url: fixture.url("/terminal-persistence-fault"),
+        },
+        TaskStep::Wait {
+            duration: Duration::from_secs(60),
+        },
+    ])
+    .expect("valid trace-fault task");
+    client
+        .begin_collection_with_id("trace-fault-profile", collection_id, task.clone())
+        .await
+        .expect("persist trace-fault start");
+
+    let blocked_terminal = trace_collection_dir(&traces, collection_id)
+        .join("00000002.event");
+    std::fs::create_dir(&blocked_terminal).expect("inject terminal append fault");
+    client
+        .cancel_collection(collection_id)
+        .await
+        .expect("request trace-fault cancellation");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match client
+            .read_trace(collection_id, TraceCursor::START, 64)
+            .await
+        {
+            Err(ClientError::Remote {
+                status: ResponseStatus::Unavailable,
+                ..
+            }) => break,
+            Err(ClientError::Remote {
+                status: ResponseStatus::Protocol,
+                ..
+            }) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Ok(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            other => panic!("terminal persistence fault was not surfaced: {other:?}"),
+        }
+    }
+    assert!(matches!(
+        client
+            .begin_collection_with_id("trace-fault-profile", collection_id, task)
+            .await,
+        Err(ClientError::Remote {
+            status: ResponseStatus::Unavailable,
+            ..
+        })
+    ));
+
+    client
+        .shutdown()
+        .await
+        .expect("request trace-fault daemon shutdown");
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("trace-fault daemon exit timeout")
+        .expect("wait for trace-fault daemon");
+    assert!(!status.success(), "trace-fault daemon reported clean exit");
+    let (_, stderr) = read_child_output(&mut daemon).await;
+    assert!(stderr.contains("\"error_class\":\"trace_root_unavailable\""));
+
+    std::fs::remove_dir(&blocked_terminal).expect("remove terminal append fault");
+    let mut successor = spawn_stationd_with_trace(
+        stationd,
+        &pipe_name,
+        &profiles,
+        &traces,
+    );
+    let successor_client = StationClient::connect(client_config)
+        .await
+        .expect("connect trace-fault successor");
+    let recovered = wait_for_complete_trace(&successor_client, collection_id).await;
+    assert_eq!(recovered.len(), 2);
+    assert!(matches!(
+        recovered[1].kind(),
+        TraceEventKind::Interrupted(InterruptedReason::SuccessorReconciliation)
+    ));
+    successor_client
+        .shutdown()
+        .await
+        .expect("shutdown trace-fault successor");
+    let successor_status = tokio::time::timeout(Duration::from_secs(30), successor.wait())
+        .await
+        .expect("trace-fault successor exit timeout")
+        .expect("wait for trace-fault successor");
+    assert!(successor_status.success());
+    let (stdout, successor_stderr) = read_child_output(&mut successor).await;
+    assert!(successor_stderr.is_empty());
+    assert!(stdout.contains("\"outcome\":\"clean\""));
+    remove_tree(&profiles).await;
+    remove_tree(&traces).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stationd_hard_kill_releases_profile_and_client_reconnects_e2e() {
     let _serial = e2e_serial_guard().await;
     let fixture = FixtureServer::start();
@@ -1387,6 +1794,93 @@ async fn stationd_hard_kill_releases_profile_and_client_reconnects_e2e() {
     remove_tree(&profiles).await;
 }
 
+async fn wait_for_complete_trace(
+    client: &StationClient,
+    collection_id: CollectionId,
+) -> Vec<TraceEvent> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let mut cursor = TraceCursor::START;
+    let mut events = Vec::new();
+    loop {
+        let page = client
+            .read_trace(collection_id, cursor, 64)
+            .await
+            .expect("poll durable trace");
+        events.extend_from_slice(page.events());
+        cursor = page.next_cursor();
+        if page.is_complete() {
+            return events;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "durable trace did not reach a terminal event"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn read_complete_artifact(
+    client: &StationClient,
+    collection_id: CollectionId,
+    artifact: &ArtifactRef,
+) -> Vec<u8> {
+    let mut offset = 0_u64;
+    let mut bytes = Vec::new();
+    loop {
+        let chunk = client
+            .read_artifact_chunk(
+                collection_id,
+                *artifact.sha256(),
+                offset,
+                1024,
+            )
+            .await
+            .expect("read durable artifact chunk");
+        assert_eq!(chunk.total_len(), artifact.len());
+        bytes.extend_from_slice(chunk.bytes());
+        offset = offset
+            .checked_add(u64::try_from(chunk.bytes().len()).unwrap())
+            .expect("artifact offset remains bounded");
+        if chunk.is_eof() {
+            return bytes;
+        }
+    }
+}
+
+fn read_trace_event_bytes(trace_root: &Path) -> Vec<u8> {
+    let mut output = Vec::new();
+    let collections = trace_root.join("collections");
+    for collection in std::fs::read_dir(collections).expect("read trace collections") {
+        let collection = collection.expect("read trace collection entry");
+        if !collection.file_type().expect("trace collection type").is_dir() {
+            continue;
+        }
+        for event in std::fs::read_dir(collection.path()).expect("read trace events") {
+            let event = event.expect("read trace event entry");
+            if event
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "event")
+            {
+                output.extend_from_slice(
+                    &std::fs::read(event.path()).expect("read trace event file"),
+                );
+            }
+        }
+    }
+    output
+}
+
+fn trace_collection_dir(trace_root: &Path, collection_id: CollectionId) -> PathBuf {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut name = String::with_capacity(32);
+    for byte in collection_id.as_bytes() {
+        name.push(HEX[usize::from(byte >> 4)] as char);
+        name.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    trace_root.join("collections").join(name)
+}
+
 async fn wait_for_status(
     client: &StationClient,
     predicate: impl Fn(&StationStatus) -> bool,
@@ -1450,6 +1944,47 @@ async fn run_auth_cli(
 
 fn spawn_stationd(stationd: &str, pipe_name: &str, profiles: &Path) -> tokio::process::Child {
     spawn_stationd_with_permissions(stationd, pipe_name, profiles, true, true, false)
+}
+
+fn spawn_stationd_with_trace(
+    stationd: &str,
+    pipe_name: &str,
+    profiles: &Path,
+    traces: &Path,
+) -> tokio::process::Child {
+    let mut command = tokio::process::Command::new(stationd);
+    command.args([
+        "--pipe-name",
+        pipe_name,
+        "--profiles-root",
+        profiles.to_str().expect("profiles path is UTF-8"),
+        "--trace-root",
+        traces.to_str().expect("trace path is UTF-8"),
+        "--runtime",
+        "chrome",
+        "--max-resident",
+        "2",
+        "--max-in-flight",
+        "4",
+        "--max-connections",
+        "8",
+        "--timeout-seconds",
+        "90",
+        "--drain-seconds",
+        "15",
+        "--allow-remote-shutdown",
+        "--allow-interactive-tasks",
+        "--allow-scripted-tasks",
+        "--allow-durable-read",
+        "--allow-durable-write",
+    ]);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn trace station daemon")
 }
 
 fn spawn_stationd_for_runtime(

@@ -16,6 +16,7 @@ members = [
     "crates/dig2browser-core",
     "crates/dig2browser-protocol",
     "crates/dig2browser-station",
+    "crates/dig2browser-trace",
 ]
 resolver = "2"
 

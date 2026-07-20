@@ -7,6 +7,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 mod identity;
 mod session;
 mod task;
+mod trace;
 
 pub use identity::{BrowserPersona, MobilePersonaConfig, PersonaKind};
 pub use session::{
@@ -18,6 +19,13 @@ pub use task::{
     CaptureCompleteness, CollectionTask, CollectionTaskResult, EvidenceCapture,
     ResolvedRuntimeRecord, TaskCapturePolicy, TaskReply, TaskRuntimeContract,
     TaskStep, MAX_TASK_RESULT_BYTES, MAX_TASK_STEPS, MAX_TASK_WAIT,
+};
+pub use trace::{
+    ArtifactChunk, ArtifactCommitted, ArtifactMediaType, ArtifactRef,
+    ArtifactRole, CollectionId, CollectionRequest, CollectionResponse,
+    InterruptedReason, StartedTrace, StepOutcome, StepSummary, TerminalOutcome,
+    TerminalTrace, TraceCursor, TraceEvent, TraceEventKind, TracePage,
+    MAX_ARTIFACT_CHUNK_BYTES, MAX_TRACE_EVENTS, MAX_TRACE_STEP_SUMMARIES,
 };
 pub use dig2browser_core::{
     ControlTransport, EngineFamily, FeatureSupport, ResolvedRuntime,
@@ -51,6 +59,7 @@ const HEALTH_IDENTITY_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum RequestKind {
     Capture = 1,
     Health = 2,
@@ -62,6 +71,7 @@ pub enum RequestKind {
     BeginAuthSession = 8,
     FinishAuthSession = 9,
     CheckAuthSession = 10,
+    Collection = 11,
 }
 
 impl RequestKind {
@@ -77,6 +87,7 @@ impl RequestKind {
             8 => Ok(Self::BeginAuthSession),
             9 => Ok(Self::FinishAuthSession),
             10 => Ok(Self::CheckAuthSession),
+            11 => Ok(Self::Collection),
             _ => Err(ProtocolError::InvalidRequest),
         }
     }
@@ -93,6 +104,7 @@ pub struct WorkerRequest {
     pub profile_class: Option<ProfileClass>,
     pub session_update: Option<SessionStateUpdate>,
     pub session_probe: Option<SessionHealthProbe>,
+    pub collection: Option<CollectionRequest>,
 }
 
 impl WorkerRequest {
@@ -107,6 +119,7 @@ impl WorkerRequest {
             profile_class: None,
             session_update: None,
             session_probe: None,
+            collection: None,
         }
     }
 
@@ -155,6 +168,7 @@ impl WorkerRequest {
             profile_class: Some(profile_class),
             session_update: None,
             session_probe: None,
+            collection: None,
         }
     }
 
@@ -169,6 +183,7 @@ impl WorkerRequest {
             profile_class: None,
             session_update: None,
             session_probe: None,
+            collection: None,
         }
     }
 
@@ -187,6 +202,7 @@ impl WorkerRequest {
             profile_class: None,
             session_update: Some(update),
             session_probe: None,
+            collection: None,
         }
     }
 
@@ -206,6 +222,7 @@ impl WorkerRequest {
             profile_class: Some(ProfileClass::Authenticated),
             session_update: None,
             session_probe: None,
+            collection: None,
         }
     }
 
@@ -220,6 +237,7 @@ impl WorkerRequest {
             profile_class: None,
             session_update: None,
             session_probe: None,
+            collection: None,
         }
     }
 
@@ -239,7 +257,55 @@ impl WorkerRequest {
             profile_class: Some(ProfileClass::Authenticated),
             session_update: None,
             session_probe: Some(probe),
+            collection: None,
         }
+    }
+
+    pub fn begin_collection(
+        request_id: u64,
+        profile_id: impl Into<String>,
+        collection: CollectionRequest,
+    ) -> Result<Self, ProtocolError> {
+        if !collection.is_begin() {
+            return Err(ProtocolError::InvalidCollectionPayload);
+        }
+        let request = Self {
+            kind: RequestKind::Collection,
+            request_id,
+            profile_id: profile_id.into(),
+            url: String::new(),
+            task: None,
+            persona: None,
+            profile_class: None,
+            session_update: None,
+            session_probe: None,
+            collection: Some(collection),
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn collection(
+        request_id: u64,
+        collection: CollectionRequest,
+    ) -> Result<Self, ProtocolError> {
+        if collection.is_begin() {
+            return Err(ProtocolError::InvalidCollectionPayload);
+        }
+        let request = Self {
+            kind: RequestKind::Collection,
+            request_id,
+            profile_id: String::new(),
+            url: String::new(),
+            task: None,
+            persona: None,
+            profile_class: None,
+            session_update: None,
+            session_probe: None,
+            collection: Some(collection),
+        };
+        request.validate()?;
+        Ok(request)
     }
 
     pub fn health(request_id: u64) -> Self {
@@ -265,6 +331,7 @@ impl WorkerRequest {
             profile_class: None,
             session_update: None,
             session_probe: None,
+            collection: None,
         }
     }
 
@@ -322,11 +389,22 @@ impl WorkerRequest {
         } else {
             None
         };
+        let collection_payload = if self.kind == RequestKind::Collection {
+            Some(
+                self.collection
+                    .as_ref()
+                    .ok_or(ProtocolError::InvalidRequest)?
+                    .encode()?,
+            )
+        } else {
+            None
+        };
         let body = task_payload
             .as_deref()
             .or(session_payload.as_deref())
             .or(auth_payload.as_deref())
             .or(probe_payload.as_deref())
+            .or(collection_payload.as_deref())
             .unwrap_or(self.url.as_bytes());
         let url_len = u32::try_from(body.len()).map_err(|_| ProtocolError::InvalidRequest)?;
         let total = REQUEST_HEADER_BYTES
@@ -350,6 +428,9 @@ impl WorkerRequest {
     }
 
     pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.kind != RequestKind::Collection && self.collection.is_some() {
+            return Err(ProtocolError::InvalidRequest);
+        }
         match self.kind {
             RequestKind::Capture => {
                 validate_profile_id(&self.profile_id)?;
@@ -462,6 +543,29 @@ impl WorkerRequest {
                     .ok_or(ProtocolError::InvalidRequest)?
                     .validate()?;
                 if self.profile_class == Some(ProfileClass::Authenticated) {
+                    Ok(())
+                } else {
+                    Err(ProtocolError::InvalidRequest)
+                }
+            }
+            RequestKind::Collection => {
+                if !self.url.is_empty()
+                    || self.task.is_some()
+                    || self.persona.is_some()
+                    || self.profile_class.is_some()
+                    || self.session_update.is_some()
+                    || self.session_probe.is_some()
+                {
+                    return Err(ProtocolError::InvalidRequest);
+                }
+                let collection = self
+                    .collection
+                    .as_ref()
+                    .ok_or(ProtocolError::InvalidRequest)?;
+                collection.validate()?;
+                if collection.is_begin() {
+                    validate_profile_id(&self.profile_id)
+                } else if self.profile_id.is_empty() {
                     Ok(())
                 } else {
                     Err(ProtocolError::InvalidRequest)
@@ -710,6 +814,30 @@ impl WorkerResponse {
         Ok(response)
     }
 
+    pub fn collection_response(
+        request: &WorkerRequest,
+        result: &CollectionResponse,
+    ) -> Result<Self, ProtocolError> {
+        let mut response = Self::empty(request, ResponseStatus::Ok);
+        response.html = result.encode()?;
+        response.validate()?;
+        Ok(response)
+    }
+
+    pub fn decode_collection_response(&self) -> Result<CollectionResponse, ProtocolError> {
+        if self.kind != RequestKind::Collection
+            || self.status != ResponseStatus::Ok
+            || self.http_status.is_some()
+            || !self.final_url.is_empty()
+            || !self.title.is_empty()
+            || !self.error.is_empty()
+            || !self.png.is_empty()
+        {
+            return Err(ProtocolError::InvalidCollectionPayload);
+        }
+        CollectionResponse::decode(&self.html)
+    }
+
     pub fn decode_task_result(&self) -> Result<CollectionTaskResult, ProtocolError> {
         if self.kind != RequestKind::Task
             || self.status != ResponseStatus::Ok
@@ -788,6 +916,9 @@ impl WorkerResponse {
         }
         if self.kind == RequestKind::Task && self.status == ResponseStatus::Ok {
             self.decode_task_result()?;
+        }
+        if self.kind == RequestKind::Collection && self.status == ResponseStatus::Ok {
+            self.decode_collection_response()?;
         }
         if matches!(
             self.kind,
@@ -1027,6 +1158,22 @@ where
         .map_err(|_| FrameError::Protocol(ProtocolError::InvalidRequest))?
         .to_owned();
     let body = &payload[profile_len..];
+    if kind == RequestKind::Collection {
+        let request = WorkerRequest {
+            kind,
+            request_id,
+            profile_id,
+            url: String::new(),
+            task: None,
+            persona: None,
+            profile_class: None,
+            session_update: None,
+            session_probe: None,
+            collection: Some(CollectionRequest::decode(body)?),
+        };
+        request.validate()?;
+        return Ok(Some(request));
+    }
     let (url, task, persona, profile_class, session_update) = if kind == RequestKind::Task {
         let (profile_class, persona, task) = decode_task_identity_payload(body)?;
         (
@@ -1052,6 +1199,7 @@ where
             profile_class: Some(profile_class),
             session_update: None,
             session_probe: Some(session_probe),
+            collection: None,
         };
         request.validate()?;
         return Ok(Some(request));
@@ -1084,6 +1232,7 @@ where
         profile_class,
         session_update,
         session_probe: None,
+        collection: None,
     };
     request.validate()?;
     Ok(Some(request))
@@ -1255,6 +1404,7 @@ pub enum ProtocolError {
     InvalidTaskResult,
     InvalidIdentityPayload,
     InvalidSessionPayload,
+    InvalidCollectionPayload,
 }
 
 impl std::fmt::Display for ProtocolError {
@@ -1270,6 +1420,9 @@ impl std::fmt::Display for ProtocolError {
             }
             Self::InvalidSessionPayload => {
                 write!(formatter, "browser session payload is invalid")
+            }
+            Self::InvalidCollectionPayload => {
+                write!(formatter, "collection payload is invalid")
             }
         }
     }
@@ -1321,11 +1474,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn request_kind_wire_codes_are_stable_and_collection_is_append_only() {
+        assert_eq!(RequestKind::Capture as u8, 1);
+        assert_eq!(RequestKind::Health as u8, 2);
+        assert_eq!(RequestKind::Shutdown as u8, 3);
+        assert_eq!(RequestKind::Status as u8, 4);
+        assert_eq!(RequestKind::Task as u8, 5);
+        assert_eq!(RequestKind::IdentityStatus as u8, 6);
+        assert_eq!(RequestKind::UpdateIdentityState as u8, 7);
+        assert_eq!(RequestKind::BeginAuthSession as u8, 8);
+        assert_eq!(RequestKind::FinishAuthSession as u8, 9);
+        assert_eq!(RequestKind::CheckAuthSession as u8, 10);
+        assert_eq!(RequestKind::Collection as u8, 11);
+    }
+
     #[tokio::test]
     async fn request_and_response_round_trip_fixed_v1_layout() {
         let request = WorkerRequest::capture(42, "review.example", "https://example.test/path");
         let request_bytes = request.encode().expect("request");
-        assert_eq!(&request_bytes[..4], b"D2BQ");
+        let mut expected_request = Vec::from(*b"D2BQ");
+        expected_request.extend_from_slice(&1_u16.to_le_bytes());
+        expected_request.extend_from_slice(&[1, 0]);
+        expected_request.extend_from_slice(&42_u64.to_le_bytes());
+        expected_request.extend_from_slice(&14_u16.to_le_bytes());
+        expected_request.extend_from_slice(&25_u32.to_le_bytes());
+        expected_request.extend_from_slice(b"review.example");
+        expected_request.extend_from_slice(b"https://example.test/path");
+        assert_eq!(request_bytes, expected_request);
         let mut request_reader = &request_bytes[..];
         assert_eq!(
             read_worker_request(&mut request_reader)
@@ -1356,6 +1532,42 @@ mod tests {
                 .expect("decode"),
             response
         );
+    }
+
+
+    #[tokio::test]
+    async fn collection_outer_request_and_typed_response_round_trip() {
+        let collection_id = CollectionId::new([9; 16]).unwrap();
+        let task = CollectionTask::new(vec![TaskStep::Navigate {
+            url: "https://example.test/collection".to_owned(),
+        }])
+        .unwrap();
+        let collection = CollectionRequest::begin(
+            collection_id,
+            ProfileClass::Public,
+            BrowserPersona::desktop_default(),
+            task,
+        )
+        .unwrap();
+        let request = WorkerRequest::begin_collection(
+            91,
+            "collection-profile",
+            collection,
+        )
+        .unwrap();
+        let encoded = request.encode().unwrap();
+        assert_eq!(&encoded[..4], b"D2BQ");
+        assert_eq!(encoded[6], 11);
+        let mut reader = encoded.as_slice();
+        assert_eq!(read_worker_request(&mut reader).await.unwrap().unwrap(), request);
+
+        let result = CollectionResponse::Accepted { collection_id };
+        let response = WorkerResponse::collection_response(&request, &result).unwrap();
+        assert_eq!(response.decode_collection_response().unwrap(), result);
+        assert!(response.final_url.is_empty());
+        assert!(response.title.is_empty());
+        assert!(response.error.is_empty());
+        assert!(response.png.is_empty());
     }
 
     #[tokio::test]

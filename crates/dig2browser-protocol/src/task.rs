@@ -17,6 +17,8 @@ pub const MAX_TASK_RESULT_BYTES: usize = MAX_HTML_BYTES;
 
 const TASK_MAGIC: [u8; 4] = *b"D2TK";
 const TASK_RESULT_MAGIC: [u8; 4] = *b"D2TR";
+const RUNTIME_RECORD_MAGIC: [u8; 4] = *b"D2RR";
+const RUNTIME_RECORD_SCHEMA_VERSION: u16 = 1;
 const TASK_SCHEMA_VERSION_V1: u16 = 1;
 const TASK_SCHEMA_VERSION_V2: u16 = 2;
 const MAX_RUNTIME_FEATURES: usize = 16;
@@ -771,6 +773,34 @@ fn encode_resolved_runtime(
     Ok(())
 }
 
+pub(crate) fn encode_runtime_record(
+    runtime: &ResolvedRuntimeRecord,
+) -> Result<Vec<u8>, ProtocolError> {
+    let mut output = Vec::new();
+    output.extend_from_slice(&RUNTIME_RECORD_MAGIC);
+    output.extend_from_slice(&RUNTIME_RECORD_SCHEMA_VERSION.to_le_bytes());
+    encode_resolved_runtime(&mut output, runtime)?;
+    Ok(output)
+}
+
+pub(crate) fn decode_runtime_record(
+    payload: &[u8],
+) -> Result<ResolvedRuntimeRecord, ProtocolError> {
+    let mut input = Input::new(payload);
+    if input.bytes(4).map_err(|_| ProtocolError::InvalidTaskResult)?
+        != RUNTIME_RECORD_MAGIC
+        || input.u16().map_err(|_| ProtocolError::InvalidTaskResult)?
+            != RUNTIME_RECORD_SCHEMA_VERSION
+    {
+        return Err(ProtocolError::InvalidTaskResult);
+    }
+    let runtime = decode_resolved_runtime(&mut input)?;
+    if !input.is_empty() {
+        return Err(ProtocolError::InvalidTaskResult);
+    }
+    Ok(runtime)
+}
+
 fn decode_resolved_runtime(input: &mut Input<'_>) -> Result<ResolvedRuntimeRecord, ProtocolError> {
     let kind = runtime_kind_from_wire(input.u8()?)
         .map_err(|_| ProtocolError::InvalidTaskResult)?;
@@ -1316,6 +1346,40 @@ mod tests {
         let decoded = CollectionTaskResult::decode(&encoded).expect("decode result");
         assert_eq!(decoded.runtime(), None);
         assert_eq!(decoded, result);
+    }
+
+    #[test]
+    fn standalone_runtime_record_round_trips_and_rejects_malformed_payload() {
+        let descriptor = RuntimeDescriptor::new(
+            RuntimeKind::Chrome,
+            EngineFamily::Chromium,
+            ControlTransport::Cdp,
+            vec![FeatureSupport::new(
+                RuntimeFeature::Navigate,
+                SupportLevel::Native,
+                Vec::new(),
+            )],
+        )
+        .expect("valid descriptor");
+        let requirements = RuntimeRequirements::new(
+            vec![RuntimeFeature::Navigate],
+            false,
+        )
+        .expect("valid requirements");
+        let resolved = descriptor
+            .negotiate(&requirements, Some("runtime-v1".to_owned()))
+            .expect("resolved runtime");
+        let record = ResolvedRuntimeRecord::from_resolved(&resolved)
+            .expect("runtime record");
+        let encoded = encode_runtime_record(&record).expect("encode runtime record");
+        assert_eq!(decode_runtime_record(&encoded).unwrap(), record);
+
+        let mut unknown_version = encoded.clone();
+        unknown_version[4..6].copy_from_slice(&2_u16.to_le_bytes());
+        assert!(decode_runtime_record(&unknown_version).is_err());
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert!(decode_runtime_record(&trailing).is_err());
     }
 
     #[test]

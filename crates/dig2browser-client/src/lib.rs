@@ -10,14 +10,18 @@ use dig2browser_protocol::{
 use tokio::sync::Mutex;
 
 pub use dig2browser_protocol::{
-    BrowserPersona, CaptureCompleteness, CollectionTask, CollectionTaskResult,
+    ArtifactChunk, ArtifactCommitted, ArtifactMediaType, ArtifactRef,
+    ArtifactRole, BrowserPersona, CaptureCompleteness, CollectionId,
+    CollectionRequest, CollectionResponse, CollectionTask, CollectionTaskResult,
     ControlTransport, EngineFamily, EvidenceCapture, FailureClass,
-    IdentitySessionStatus, MobilePersonaConfig, PersonaKind, ProfileClass,
-    ResolvedRuntimeRecord, ResponseStatus, RuntimeFeature, RuntimeKind,
-    RuntimeLimitation, RuntimeRequirements, RuntimeSelector, SessionPhase,
-    SessionHealthProbe, SessionStateUpdate, StationStatus, SupportLevel,
-    TaskCapturePolicy, TaskReply, TaskRuntimeContract, TaskStep,
-    DEFAULT_STATION_PIPE,
+    IdentitySessionStatus, InterruptedReason, MobilePersonaConfig, PersonaKind,
+    ProfileClass, ResolvedRuntimeRecord, ResponseStatus, RuntimeFeature,
+    RuntimeKind, RuntimeLimitation, RuntimeRequirements, RuntimeSelector,
+    SessionPhase, SessionHealthProbe, SessionStateUpdate, StartedTrace,
+    StationStatus, StepOutcome, StepSummary, SupportLevel, TaskCapturePolicy,
+    TaskReply, TaskRuntimeContract, TaskStep, TerminalOutcome, TerminalTrace,
+    TraceCursor, TraceEvent, TraceEventKind, TracePage,
+    MAX_ARTIFACT_CHUNK_BYTES, MAX_TRACE_EVENTS, DEFAULT_STATION_PIPE,
 };
 
 const MIN_TIMEOUT: Duration = Duration::from_millis(100);
@@ -177,6 +181,155 @@ impl StationClient {
         );
         let response = self.call(request).await?;
         require_task_result(&response, runtime_contract.as_ref())
+    }
+
+    pub async fn begin_collection(
+        &self,
+        profile_id: impl Into<String>,
+        task: CollectionTask,
+    ) -> Result<CollectionHandle, ClientError> {
+        let collection_id = CollectionId::new(*uuid::Uuid::new_v4().as_bytes())
+            .map_err(|_| ClientError::InvalidCollectionRequest)?;
+        self.begin_collection_with_id(profile_id, collection_id, task)
+            .await
+    }
+
+    pub async fn begin_collection_with_id(
+        &self,
+        profile_id: impl Into<String>,
+        collection_id: CollectionId,
+        task: CollectionTask,
+    ) -> Result<CollectionHandle, ClientError> {
+        self.begin_collection_with_identity(
+            profile_id,
+            collection_id,
+            ProfileClass::Public,
+            BrowserPersona::desktop_default(),
+            task,
+        )
+        .await
+    }
+
+    pub async fn begin_collection_with_identity(
+        &self,
+        profile_id: impl Into<String>,
+        collection_id: CollectionId,
+        profile_class: ProfileClass,
+        persona: BrowserPersona,
+        task: CollectionTask,
+    ) -> Result<CollectionHandle, ClientError> {
+        let runtime_contract = task.runtime_contract().cloned();
+        let collection = CollectionRequest::begin(
+            collection_id,
+            profile_class,
+            persona,
+            task,
+        )
+        .map_err(|_| ClientError::InvalidCollectionRequest)?;
+        let request = WorkerRequest::begin_collection(
+            self.take_request_id(),
+            profile_id,
+            collection,
+        )
+        .map_err(|_| ClientError::InvalidCollectionRequest)?;
+        let response = self.call(request).await?;
+        let response = require_collection_response(&response)?;
+        let CollectionResponse::Accepted {
+            collection_id: accepted,
+        } = response
+        else {
+            return Err(ClientError::InvalidResponse);
+        };
+        if accepted != collection_id {
+            return Err(ClientError::InvalidResponse);
+        }
+        let page = self
+            .read_trace(collection_id, TraceCursor::START, 1)
+            .await?;
+        let [event] = page.events() else {
+            return Err(ClientError::InvalidResponse);
+        };
+        let TraceEventKind::Started(started) = event.kind() else {
+            return Err(ClientError::InvalidResponse);
+        };
+        if event.cursor() != TraceCursor::new(1)
+            || runtime_contract.as_ref().is_some_and(|contract| {
+                !runtime_satisfies_contract(started.runtime(), contract)
+            })
+        {
+            return Err(ClientError::InvalidResponse);
+        }
+        Ok(CollectionHandle {
+            collection_id,
+            cursor: event.cursor(),
+            runtime: started.runtime().clone(),
+        })
+    }
+
+    pub async fn read_trace(
+        &self,
+        collection_id: CollectionId,
+        cursor: TraceCursor,
+        limit: u8,
+    ) -> Result<TracePage, ClientError> {
+        let collection = CollectionRequest::read_trace(collection_id, cursor, limit)
+            .map_err(|_| ClientError::InvalidCollectionRequest)?;
+        let request = WorkerRequest::collection(self.take_request_id(), collection)
+            .map_err(|_| ClientError::InvalidCollectionRequest)?;
+        let response = require_collection_response(&self.call(request).await?)?;
+        let CollectionResponse::TracePage(page) = response else {
+            return Err(ClientError::InvalidResponse);
+        };
+        if page.collection_id() != collection_id {
+            return Err(ClientError::InvalidResponse);
+        }
+        Ok(page)
+    }
+
+    pub async fn read_artifact_chunk(
+        &self,
+        collection_id: CollectionId,
+        sha256: [u8; 32],
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<ArtifactChunk, ClientError> {
+        let collection = CollectionRequest::read_artifact(
+            collection_id,
+            sha256,
+            offset,
+            max_bytes,
+        )
+        .map_err(|_| ClientError::InvalidCollectionRequest)?;
+        let request = WorkerRequest::collection(self.take_request_id(), collection)
+            .map_err(|_| ClientError::InvalidCollectionRequest)?;
+        let response = require_collection_response(&self.call(request).await?)?;
+        let CollectionResponse::ArtifactChunk(chunk) = response else {
+            return Err(ClientError::InvalidResponse);
+        };
+        if chunk.collection_id() != collection_id
+            || chunk.sha256() != &sha256
+            || chunk.offset() != offset
+        {
+            return Err(ClientError::InvalidResponse);
+        }
+        Ok(chunk)
+    }
+
+    pub async fn cancel_collection(
+        &self,
+        collection_id: CollectionId,
+    ) -> Result<(), ClientError> {
+        let collection = CollectionRequest::cancel(collection_id)
+            .map_err(|_| ClientError::InvalidCollectionRequest)?;
+        let request = WorkerRequest::collection(self.take_request_id(), collection)
+            .map_err(|_| ClientError::InvalidCollectionRequest)?;
+        let response = require_collection_response(&self.call(request).await?)?;
+        match response {
+            CollectionResponse::Cancelled {
+                collection_id: cancelled,
+            } if cancelled == collection_id => Ok(()),
+            _ => Err(ClientError::InvalidResponse),
+        }
     }
 
     /// Run a public-profile task while periodically yielding for lease
@@ -492,6 +645,60 @@ impl BlockingStationClient {
         ))
     }
 
+    pub fn begin_collection(
+        &self,
+        profile_id: impl Into<String>,
+        task: CollectionTask,
+    ) -> Result<CollectionHandle, ClientError> {
+        self.runtime
+            .block_on(self.client.begin_collection(profile_id, task))
+    }
+
+    pub fn begin_collection_with_id(
+        &self,
+        profile_id: impl Into<String>,
+        collection_id: CollectionId,
+        task: CollectionTask,
+    ) -> Result<CollectionHandle, ClientError> {
+        self.runtime.block_on(
+            self.client
+                .begin_collection_with_id(profile_id, collection_id, task),
+        )
+    }
+
+    pub fn read_trace(
+        &self,
+        collection_id: CollectionId,
+        cursor: TraceCursor,
+        limit: u8,
+    ) -> Result<TracePage, ClientError> {
+        self.runtime
+            .block_on(self.client.read_trace(collection_id, cursor, limit))
+    }
+
+    pub fn read_artifact_chunk(
+        &self,
+        collection_id: CollectionId,
+        sha256: [u8; 32],
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<ArtifactChunk, ClientError> {
+        self.runtime.block_on(self.client.read_artifact_chunk(
+            collection_id,
+            sha256,
+            offset,
+            max_bytes,
+        ))
+    }
+
+    pub fn cancel_collection(
+        &self,
+        collection_id: CollectionId,
+    ) -> Result<(), ClientError> {
+        self.runtime
+            .block_on(self.client.cancel_collection(collection_id))
+    }
+
     pub fn identity_status(
         &self,
         profile_id: impl Into<String>,
@@ -638,6 +845,15 @@ fn require_task_result(
     Ok(result)
 }
 
+fn require_collection_response(
+    response: &WorkerResponse,
+) -> Result<CollectionResponse, ClientError> {
+    require_ok(response)?;
+    response
+        .decode_collection_response()
+        .map_err(|_| ClientError::InvalidResponse)
+}
+
 fn runtime_satisfies_contract(
     runtime: &ResolvedRuntimeRecord,
     contract: &TaskRuntimeContract,
@@ -669,6 +885,27 @@ pub struct CaptureResult {
     pub png: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionHandle {
+    collection_id: CollectionId,
+    cursor: TraceCursor,
+    runtime: ResolvedRuntimeRecord,
+}
+
+impl CollectionHandle {
+    pub fn collection_id(&self) -> CollectionId {
+        self.collection_id
+    }
+
+    pub fn cursor(&self) -> TraceCursor {
+        self.cursor
+    }
+
+    pub fn runtime(&self) -> &ResolvedRuntimeRecord {
+        &self.runtime
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
     #[error("invalid pipe name")]
@@ -689,6 +926,8 @@ pub enum ClientError {
     RequestTimeout,
     #[error("station returned an invalid response")]
     InvalidResponse,
+    #[error("invalid collection request")]
+    InvalidCollectionRequest,
     #[error("failed to create station client runtime: {0}")]
     Runtime(#[source] std::io::Error),
     #[error("station rejected request with {status:?}: {message}")]

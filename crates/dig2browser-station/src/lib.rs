@@ -31,12 +31,14 @@ use dig2browser_core::{
 };
 use tokio::sync::{Mutex, RwLock, Semaphore};
 
+mod collection;
 pub mod ipc;
 pub mod runtime;
 
 pub use dig2browser_core::{
     ResolvedRuntime, RuntimeKind, RuntimeRequirements, RuntimeSelector,
 };
+pub use collection::CollectionError;
 pub use runtime::{RuntimeFactory, RuntimeRegistry, RuntimeRegistryError};
 
 const MAX_RESIDENT: usize = 256;
@@ -679,6 +681,10 @@ impl BrowserStation {
                 session_state_gate: Mutex::new(()),
             }),
         }
+    }
+
+    pub fn profiles_root(&self) -> &Path {
+        &self.inner.config.profiles_root
     }
 
     /// Acquire a capability-bounded lease. A persistent identity is never
@@ -1417,6 +1423,22 @@ impl BrowserLease {
     /// global command slot. Other consumers cannot interleave page mutations
     /// between navigation, interaction, extraction, and capture.
     pub async fn run_task(&self, task: &BrowserTask) -> Result<BrowserTaskResult, StationError> {
+        self.run_task_controlled(task, None).await
+    }
+
+    pub(crate) async fn run_task_with_control(
+        &self,
+        task: &BrowserTask,
+        cancelled: &AtomicBool,
+    ) -> Result<BrowserTaskResult, StationError> {
+        self.run_task_controlled(task, Some(cancelled)).await
+    }
+
+    async fn run_task_controlled(
+        &self,
+        task: &BrowserTask,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<BrowserTaskResult, StationError> {
         self.validate_task_capabilities(task)?;
         let _operation = self.station.inner.operation_gate.read().await;
         if self.station.inner.shutting_down.load(Ordering::Acquire) {
@@ -1436,10 +1458,18 @@ impl BrowserLease {
         let mut replies = Vec::with_capacity(task.steps().len());
         let mut step_metrics = Vec::with_capacity(task.steps().len());
         for (index, step) in task.steps().iter().enumerate() {
+            if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+                return Err(StationError::TaskCancelled);
+            }
             let started = Instant::now();
-            let first_attempt = self.execute_task_step(step).await;
+            let first_attempt = self
+                .execute_task_step_controlled(step, cancelled)
+                .await;
             let reply = match first_attempt {
                 Ok(reply) => reply,
+                Err(StationError::TaskCancelled) => {
+                    return Err(StationError::TaskCancelled)
+                }
                 Err(error)
                     if index == 0
                         && matches!(step, BrowserTaskStep::Navigate { .. })
@@ -1453,12 +1483,18 @@ impl BrowserLease {
                             index,
                             source: Box::new(StationError::from(source)),
                         })?;
-                    self.execute_task_step(step)
-                        .await
-                        .map_err(|source| StationError::TaskStepFailed {
-                            index,
-                            source: Box::new(source),
-                        })?
+                    match self.execute_task_step_controlled(step, cancelled).await {
+                        Ok(reply) => reply,
+                        Err(StationError::TaskCancelled) => {
+                            return Err(StationError::TaskCancelled)
+                        }
+                        Err(source) => {
+                            return Err(StationError::TaskStepFailed {
+                                index,
+                                source: Box::new(source),
+                            })
+                        }
+                    }
                 }
                 Err(source) => {
                     return Err(StationError::TaskStepFailed {
@@ -1479,6 +1515,31 @@ impl BrowserLease {
             replies,
             step_metrics,
         })
+    }
+
+    async fn execute_task_step_controlled(
+        &self,
+        step: &BrowserTaskStep,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<AgentReply, StationError> {
+        if let BrowserTaskStep::Wait { duration } = step {
+            let deadline = Instant::now() + *duration;
+            loop {
+                if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+                    return Err(StationError::TaskCancelled);
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Ok(AgentReply::Acknowledged);
+                }
+                tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
+            }
+        }
+        let reply = self.execute_task_step(step).await?;
+        if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+            return Err(StationError::TaskCancelled);
+        }
+        Ok(reply)
     }
 
     async fn execute_task_step(
@@ -1775,6 +1836,8 @@ pub enum StationError {
     SessionIo(#[source] std::io::Error),
     #[error("browser worker returned an invalid reply")]
     InvalidWorkerReply,
+    #[error("browser task was cancelled")]
+    TaskCancelled,
     #[error("browser task step {index} failed")]
     TaskStepFailed {
         index: usize,

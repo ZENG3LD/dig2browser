@@ -1,5 +1,6 @@
 //! Multi-client named-pipe server for the station daemon.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -10,15 +11,18 @@ use dig2browser::agentic::{
 };
 use dig2browser_protocol::{
     read_worker_request, validate_pipe_suffix, write_worker_response,
-    CaptureCompleteness, CollectionTask, CollectionTaskResult, EvidenceCapture,
-    FailureClass, ProfileClass, RequestKind, ResolvedRuntimeRecord, ResponseStatus,
-    StationStatus, TaskCapturePolicy, TaskReply, TaskStep, WorkerRequest,
-    WorkerResponse, PROTOCOL_VERSION,
+    CaptureCompleteness, CollectionRequest, CollectionResponse, CollectionTask,
+    CollectionTaskResult, EvidenceCapture, FailureClass, ProfileClass,
+    RequestKind, ResolvedRuntimeRecord, ResponseStatus, StationStatus,
+    TaskCapturePolicy, TaskReply, TaskStep, WorkerRequest, WorkerResponse,
+    PROTOCOL_VERSION,
 };
+use dig2browser_trace::LedgerError;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 
 use crate::{
+    collection::{BeginCollection, CollectionError, CollectionManager},
     BrowserLease, BrowserStation, BrowserTask, BrowserTaskStep, IdentityRequest,
     RuntimeRegistryError, RuntimeRequirements, RuntimeSelector, StationError,
     StationFleetStatus,
@@ -178,6 +182,9 @@ pub struct ServerConfig {
     allow_session_state_updates: bool,
     allow_headful_auth: bool,
     allow_session_health: bool,
+    trace_root: Option<PathBuf>,
+    allow_durable_read: bool,
+    allow_durable_write: bool,
 }
 
 impl ServerConfig {
@@ -207,6 +214,9 @@ impl ServerConfig {
             allow_session_state_updates: false,
             allow_headful_auth: false,
             allow_session_health: false,
+            trace_root: None,
+            allow_durable_read: false,
+            allow_durable_write: false,
         })
     }
 
@@ -242,6 +252,25 @@ impl ServerConfig {
 
     pub fn allow_session_health(mut self, allow: bool) -> Self {
         self.allow_session_health = allow;
+        self
+    }
+
+    pub fn trace_root(mut self, root: impl Into<PathBuf>) -> Result<Self, ConfigError> {
+        let root = root.into();
+        if !root.is_absolute() {
+            return Err(ConfigError::InvalidTraceRoot);
+        }
+        self.trace_root = Some(root);
+        Ok(self)
+    }
+
+    pub fn allow_durable_read(mut self, allow: bool) -> Self {
+        self.allow_durable_read = allow;
+        self
+    }
+
+    pub fn allow_durable_write(mut self, allow: bool) -> Self {
+        self.allow_durable_write = allow;
         self
     }
 
@@ -304,6 +333,11 @@ async fn run_windows_server(
     let (connection_shutdown, _) = watch::channel(false);
     let (remote_shutdown, mut remote_requests) = mpsc::channel::<()>(1);
     let telemetry = Arc::new(ServerTelemetry::default());
+    let collections = config
+        .trace_root
+        .as_ref()
+        .map(|root| CollectionManager::open(station.clone(), root.clone()))
+        .transpose()?;
     let mut connections = JoinSet::new();
     let mut first_instance = true;
     let mut remote_stop = false;
@@ -354,29 +388,26 @@ async fn run_windows_server(
             connected = server.connect() => {
                 connected?;
                 telemetry.connection_accepted();
-                let station = station.clone();
-                let telemetry = Arc::clone(&telemetry);
                 let connection_shutdown = connection_shutdown.subscribe();
-                let remote_shutdown = remote_shutdown.clone();
-                let allow_remote_shutdown = config.allow_remote_shutdown;
-                let task_permissions = TaskPermissions {
-                    interaction: config.allow_interactive_tasks,
-                    script: config.allow_scripted_tasks,
-                    identity_status: config.allow_identity_status,
-                    session_updates: config.allow_session_state_updates,
-                    headful_auth: config.allow_headful_auth,
-                    session_health: config.allow_session_health,
+                let context = ConnectionContext {
+                    station: station.clone(),
+                    collections: collections.clone(),
+                    telemetry: Arc::clone(&telemetry),
+                    remote_shutdown: remote_shutdown.clone(),
+                    allow_remote_shutdown: config.allow_remote_shutdown,
+                    task_permissions: TaskPermissions {
+                        interaction: config.allow_interactive_tasks,
+                        script: config.allow_scripted_tasks,
+                        identity_status: config.allow_identity_status,
+                        session_updates: config.allow_session_state_updates,
+                        headful_auth: config.allow_headful_auth,
+                        session_health: config.allow_session_health,
+                        durable_read: config.allow_durable_read,
+                        durable_write: config.allow_durable_write,
+                    },
                 };
                 connections.spawn(async move {
-                    serve_connection(
-                        server,
-                        station,
-                        telemetry,
-                        connection_shutdown,
-                        remote_shutdown,
-                        allow_remote_shutdown,
-                        task_permissions,
-                    ).await
+                    serve_connection(server, context, connection_shutdown).await
                 });
             }
             changed = shutdown.changed() => {
@@ -406,7 +437,7 @@ async fn run_windows_server(
         }
     })
     .await;
-    let drain_timed_out = drained.is_err();
+    let mut drain_timed_out = drained.is_err();
     if drain_timed_out {
         telemetry.aborted_connections.fetch_add(
             u64::try_from(connections.len()).unwrap_or(u64::MAX),
@@ -415,7 +446,12 @@ async fn run_windows_server(
         connections.abort_all();
         while connections.join_next().await.is_some() {}
     }
+    let collection_shutdown = match collections {
+        Some(collections) => collections.shutdown(config.drain_timeout).await,
+        None => Ok(false),
+    };
     let shutdown_report = station.shutdown().await?;
+    drain_timed_out |= collection_shutdown?;
     Ok(ServerReport {
         stop_reason: if remote_stop {
             StopReason::RemoteRequest
@@ -431,15 +467,29 @@ async fn run_windows_server(
 }
 
 #[cfg(windows)]
-async fn serve_connection(
-    mut stream: tokio::net::windows::named_pipe::NamedPipeServer,
+struct ConnectionContext {
     station: BrowserStation,
+    collections: Option<CollectionManager>,
     telemetry: Arc<ServerTelemetry>,
-    mut shutdown: watch::Receiver<bool>,
     remote_shutdown: mpsc::Sender<()>,
     allow_remote_shutdown: bool,
     task_permissions: TaskPermissions,
+}
+
+#[cfg(windows)]
+async fn serve_connection(
+    mut stream: tokio::net::windows::named_pipe::NamedPipeServer,
+    context: ConnectionContext,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), ServerError> {
+    let ConnectionContext {
+        station,
+        collections,
+        telemetry,
+        remote_shutdown,
+        allow_remote_shutdown,
+        task_permissions,
+    } = context;
     let _active = ActiveConnection {
         telemetry: telemetry.as_ref(),
     };
@@ -472,6 +522,14 @@ async fn serve_connection(
                 run_task(
                     &station,
                     telemetry.as_ref(),
+                    &request,
+                    task_permissions,
+                )
+                .await
+            }
+            RequestKind::Collection => {
+                collection_request(
+                    collections.as_ref(),
                     &request,
                     task_permissions,
                 )
@@ -530,6 +588,11 @@ async fn serve_connection(
                 ResponseStatus::Invalid,
                 "remote shutdown disabled",
             ),
+            _ => WorkerResponse::failure(
+                &request,
+                ResponseStatus::Unsupported,
+                "request kind unsupported",
+            ),
         };
         write_worker_response(&mut stream, &response).await?;
         if should_shutdown {
@@ -547,6 +610,219 @@ struct TaskPermissions {
     session_updates: bool,
     headful_auth: bool,
     session_health: bool,
+    durable_read: bool,
+    durable_write: bool,
+}
+
+async fn collection_request(
+    collections: Option<&CollectionManager>,
+    request: &WorkerRequest,
+    permissions: TaskPermissions,
+) -> WorkerResponse {
+    let Some(collections) = collections else {
+        return WorkerResponse::failure(
+            request,
+            ResponseStatus::Unsupported,
+            "durable collections unavailable",
+        );
+    };
+    let Some(operation) = request.collection.as_ref() else {
+        return WorkerResponse::failure(
+            request,
+            ResponseStatus::Invalid,
+            "collection request missing",
+        );
+    };
+    let result = match operation {
+        CollectionRequest::Begin {
+            collection_id,
+            profile_class,
+            persona,
+            task,
+        } => {
+            if !permissions.durable_write || !permissions.durable_read {
+                return WorkerResponse::failure(
+                    request,
+                    ResponseStatus::Invalid,
+                    "durable collection begin disabled",
+                );
+            }
+            if *profile_class != ProfileClass::Public {
+                return WorkerResponse::failure(
+                    request,
+                    ResponseStatus::Unsupported,
+                    "authenticated durable collections unsupported",
+                );
+            }
+            if task.requires_interaction() && !permissions.interaction {
+                return WorkerResponse::failure(
+                    request,
+                    ResponseStatus::Invalid,
+                    "interactive tasks disabled",
+                );
+            }
+            if task.requires_script() && !permissions.script {
+                return WorkerResponse::failure(
+                    request,
+                    ResponseStatus::Invalid,
+                    "scripted tasks disabled",
+                );
+            }
+            let station_task = match to_station_task(task) {
+                Ok(task) => task,
+                Err(_) => {
+                    return WorkerResponse::failure(
+                        request,
+                        ResponseStatus::Invalid,
+                        "invalid collection task",
+                    )
+                }
+            };
+            let (runtime_selector, runtime_requirements) = task
+                .runtime_contract()
+                .map(|contract| {
+                    (
+                        contract.selector(),
+                        Some(contract.requirements().clone()),
+                    )
+                })
+                .unwrap_or((RuntimeSelector::Auto, None));
+            let mut canonical_request = request.clone();
+            canonical_request.request_id = 0;
+            let task_sha256 = match canonical_request.encode() {
+                Ok(bytes) => dig2browser::digest::sha256_bytes(&bytes),
+                Err(_) => {
+                    return WorkerResponse::failure(
+                        request,
+                        ResponseStatus::Protocol,
+                        "collection digest unavailable",
+                    )
+                }
+            };
+            collections
+                .begin(BeginCollection {
+                    collection_id: *collection_id,
+                    task_sha256,
+                    identity: IdentityRequest::public_persona(
+                        &request.profile_id,
+                        persona.clone(),
+                    ),
+                    capabilities: task_capabilities(task),
+                    runtime_selector,
+                    runtime_requirements,
+                    task: station_task,
+                })
+                .await
+                .map(|collection_id| CollectionResponse::Accepted { collection_id })
+        }
+        CollectionRequest::ReadTrace {
+            collection_id,
+            cursor,
+            limit,
+        } => {
+            if !permissions.durable_read {
+                return WorkerResponse::failure(
+                    request,
+                    ResponseStatus::Invalid,
+                    "durable collection reads disabled",
+                );
+            }
+            collections
+                .read_trace(*collection_id, *cursor, *limit)
+                .map(CollectionResponse::TracePage)
+        }
+        CollectionRequest::ReadArtifact {
+            collection_id,
+            sha256,
+            offset,
+            max_bytes,
+        } => {
+            if !permissions.durable_read {
+                return WorkerResponse::failure(
+                    request,
+                    ResponseStatus::Invalid,
+                    "durable collection reads disabled",
+                );
+            }
+            collections
+                .read_artifact(*collection_id, *sha256, *offset, *max_bytes)
+                .map(CollectionResponse::ArtifactChunk)
+        }
+        CollectionRequest::Cancel { collection_id } => {
+            if !permissions.durable_write {
+                return WorkerResponse::failure(
+                    request,
+                    ResponseStatus::Invalid,
+                    "durable collection writes disabled",
+                );
+            }
+            collections
+                .cancel(*collection_id)
+                .await
+                .map(|_| CollectionResponse::Cancelled {
+                    collection_id: *collection_id,
+                })
+        }
+    };
+    match result {
+        Ok(response) => WorkerResponse::collection_response(request, &response)
+            .unwrap_or_else(|_| {
+                WorkerResponse::failure(
+                    request,
+                    ResponseStatus::Protocol,
+                    "collection response invalid",
+                )
+            }),
+        Err(error) => collection_error_response(request, &error),
+    }
+}
+
+fn collection_error_response(
+    request: &WorkerRequest,
+    error: &CollectionError,
+) -> WorkerResponse {
+    let (status, message) = match error {
+        CollectionError::CollectionConflict
+        | CollectionError::InvalidTask
+        | CollectionError::Station(
+            StationError::Identity(_)
+            | StationError::PersonaMismatch
+            | StationError::PersonaBindingRequired
+            | StationError::IdentityClassMismatch
+            | StationError::IdentityClassBindingRequired
+            | StationError::InvalidPersona,
+        )
+        | CollectionError::Ledger(
+            LedgerError::CollectionNotFound
+            | LedgerError::ArtifactNotCommitted
+            | LedgerError::InvalidCursor,
+        ) => (ResponseStatus::Invalid, "collection request rejected"),
+        CollectionError::Station(error) if is_runtime_contract_unsupported(error) => {
+            (ResponseStatus::Unsupported, "runtime contract unsupported")
+        }
+        CollectionError::AtCapacity
+        | CollectionError::AdmissionClosed
+        | CollectionError::TerminalPersistenceFailed
+        | CollectionError::Station(
+            StationError::AtCapacity
+            | StationError::RuntimeSelectionBusy
+            | StationError::ShuttingDown,
+        ) => (ResponseStatus::Unavailable, "collection unavailable"),
+        CollectionError::Ledger(
+            LedgerError::ArtifactTooLarge | LedgerError::EventLimitExceeded,
+        ) => (ResponseStatus::TooLarge, "collection limit exceeded"),
+        CollectionError::CorruptTrace
+        | CollectionError::ManagerStatePoisoned
+        | CollectionError::LedgerPoisoned
+        | CollectionError::Protocol(_)
+        | CollectionError::Ledger(
+            LedgerError::Protocol(_)
+            | LedgerError::InvalidTransition(_)
+            | LedgerError::Corrupt(_),
+        ) => (ResponseStatus::Protocol, "collection trace invalid"),
+        _ => (ResponseStatus::Unavailable, "collection unavailable"),
+    };
+    WorkerResponse::failure(request, status, message)
 }
 
 async fn check_auth_session(
@@ -1302,6 +1578,8 @@ pub enum ConfigError {
     InvalidConnectionLimit,
     #[error("invalid drain timeout")]
     InvalidDrainTimeout,
+    #[error("trace root must be absolute")]
+    InvalidTraceRoot,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1312,6 +1590,8 @@ pub enum ServerError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Frame(#[from] dig2browser_protocol::FrameError),
+    #[error(transparent)]
+    Collection(#[from] CollectionError),
     #[error(transparent)]
     Station(#[from] crate::StationError),
 }
