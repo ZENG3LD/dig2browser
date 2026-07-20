@@ -1,8 +1,9 @@
 //! Stateful resource owner for `dig2browser` consumers.
 //!
 //! `dig2browser` owns protocols and one browser runtime. This crate owns reuse,
-//! admission, leases, capacity and coordinated final shutdown. Product-specific
-//! crawling, monitoring schedules and evidence storage stay in consumers.
+//! admission, leases, capacity, reusable bounded crawling and coordinated final
+//! shutdown. Product-specific discovery policy, monitoring schedules and case
+//! publication stay in consumers.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -35,6 +36,7 @@ use tokio::sync::{Mutex, RwLock, Semaphore};
 use route::PreparedRoute;
 
 mod collection;
+mod crawl;
 mod egress;
 pub mod ipc;
 mod route;
@@ -44,6 +46,7 @@ pub use dig2browser_core::{
     ResolvedRuntime, RuntimeKind, RuntimeRequirements, RuntimeSelector,
 };
 pub use collection::CollectionError;
+pub use crawl::CrawlError;
 pub use egress::{
     EgressError, EgressPeerPolicy, EgressPeerPolicyError, EgressProxy,
     EgressReport,

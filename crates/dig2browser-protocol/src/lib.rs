@@ -4,11 +4,19 @@ use std::io;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+mod crawl;
 mod identity;
 mod session;
 mod task;
 mod trace;
 
+pub use crawl::{
+    CrawlCounts, CrawlCursor, CrawlEvent, CrawlEventKind, CrawlEventPage, CrawlJobId,
+    CrawlPhase, CrawlRequest, CrawlResponse, CrawlSpec, CrawlStatus,
+    PageArtifact, MAX_CRAWL_ALLOWED_ORIGINS, MAX_CRAWL_DEPTH,
+    MAX_CRAWL_EVENTS, MAX_CRAWL_EVENT_DETAIL_BYTES, MAX_CRAWL_PAGES,
+    MAX_CRAWL_RETRIES, MAX_CRAWL_SEEDS, MAX_CRAWL_URL_BYTES,
+};
 pub use identity::{BrowserPersona, MobilePersonaConfig, PersonaKind};
 pub use session::{
     IdentitySessionStatus, ProfileClass, SessionHealthProbe, SessionPhase,
@@ -74,6 +82,7 @@ pub enum RequestKind {
     FinishAuthSession = 9,
     CheckAuthSession = 10,
     Collection = 11,
+    Crawl = 12,
 }
 
 impl RequestKind {
@@ -90,6 +99,7 @@ impl RequestKind {
             9 => Ok(Self::FinishAuthSession),
             10 => Ok(Self::CheckAuthSession),
             11 => Ok(Self::Collection),
+            12 => Ok(Self::Crawl),
             _ => Err(ProtocolError::InvalidRequest),
         }
     }
@@ -107,6 +117,7 @@ pub struct WorkerRequest {
     pub session_update: Option<SessionStateUpdate>,
     pub session_probe: Option<SessionHealthProbe>,
     pub collection: Option<CollectionRequest>,
+    pub crawl: Option<CrawlRequest>,
 }
 
 impl WorkerRequest {
@@ -122,6 +133,7 @@ impl WorkerRequest {
             session_update: None,
             session_probe: None,
             collection: None,
+            crawl: None,
         }
     }
 
@@ -171,6 +183,7 @@ impl WorkerRequest {
             session_update: None,
             session_probe: None,
             collection: None,
+            crawl: None,
         }
     }
 
@@ -186,6 +199,7 @@ impl WorkerRequest {
             session_update: None,
             session_probe: None,
             collection: None,
+            crawl: None,
         }
     }
 
@@ -205,6 +219,7 @@ impl WorkerRequest {
             session_update: Some(update),
             session_probe: None,
             collection: None,
+            crawl: None,
         }
     }
 
@@ -225,6 +240,7 @@ impl WorkerRequest {
             session_update: None,
             session_probe: None,
             collection: None,
+            crawl: None,
         }
     }
 
@@ -240,6 +256,7 @@ impl WorkerRequest {
             session_update: None,
             session_probe: None,
             collection: None,
+            crawl: None,
         }
     }
 
@@ -260,6 +277,7 @@ impl WorkerRequest {
             session_update: None,
             session_probe: Some(probe),
             collection: None,
+            crawl: None,
         }
     }
 
@@ -282,6 +300,7 @@ impl WorkerRequest {
             session_update: None,
             session_probe: None,
             collection: Some(collection),
+            crawl: None,
         };
         request.validate()?;
         Ok(request)
@@ -305,6 +324,56 @@ impl WorkerRequest {
             session_update: None,
             session_probe: None,
             collection: Some(collection),
+            crawl: None,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn begin_crawl(
+        request_id: u64,
+        profile_id: impl Into<String>,
+        crawl: CrawlRequest,
+    ) -> Result<Self, ProtocolError> {
+        if !crawl.is_begin() {
+            return Err(ProtocolError::InvalidCrawlPayload);
+        }
+        let request = Self {
+            kind: RequestKind::Crawl,
+            request_id,
+            profile_id: profile_id.into(),
+            url: String::new(),
+            task: None,
+            persona: None,
+            profile_class: None,
+            session_update: None,
+            session_probe: None,
+            collection: None,
+            crawl: Some(crawl),
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn crawl(
+        request_id: u64,
+        crawl: CrawlRequest,
+    ) -> Result<Self, ProtocolError> {
+        if crawl.is_begin() {
+            return Err(ProtocolError::InvalidCrawlPayload);
+        }
+        let request = Self {
+            kind: RequestKind::Crawl,
+            request_id,
+            profile_id: String::new(),
+            url: String::new(),
+            task: None,
+            persona: None,
+            profile_class: None,
+            session_update: None,
+            session_probe: None,
+            collection: None,
+            crawl: Some(crawl),
         };
         request.validate()?;
         Ok(request)
@@ -334,6 +403,7 @@ impl WorkerRequest {
             session_update: None,
             session_probe: None,
             collection: None,
+            crawl: None,
         }
     }
 
@@ -401,12 +471,23 @@ impl WorkerRequest {
         } else {
             None
         };
+        let crawl_payload = if self.kind == RequestKind::Crawl {
+            Some(
+                self.crawl
+                    .as_ref()
+                    .ok_or(ProtocolError::InvalidRequest)?
+                    .encode()?,
+            )
+        } else {
+            None
+        };
         let body = task_payload
             .as_deref()
             .or(session_payload.as_deref())
             .or(auth_payload.as_deref())
             .or(probe_payload.as_deref())
             .or(collection_payload.as_deref())
+            .or(crawl_payload.as_deref())
             .unwrap_or(self.url.as_bytes());
         let url_len = u32::try_from(body.len()).map_err(|_| ProtocolError::InvalidRequest)?;
         let total = REQUEST_HEADER_BYTES
@@ -431,6 +512,9 @@ impl WorkerRequest {
 
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.kind != RequestKind::Collection && self.collection.is_some() {
+            return Err(ProtocolError::InvalidRequest);
+        }
+        if self.kind != RequestKind::Crawl && self.crawl.is_some() {
             return Err(ProtocolError::InvalidRequest);
         }
         match self.kind {
@@ -566,6 +650,29 @@ impl WorkerRequest {
                     .ok_or(ProtocolError::InvalidRequest)?;
                 collection.validate()?;
                 if collection.is_begin() {
+                    validate_profile_id(&self.profile_id)
+                } else if self.profile_id.is_empty() {
+                    Ok(())
+                } else {
+                    Err(ProtocolError::InvalidRequest)
+                }
+            }
+            RequestKind::Crawl => {
+                if !self.url.is_empty()
+                    || self.task.is_some()
+                    || self.persona.is_some()
+                    || self.profile_class.is_some()
+                    || self.session_update.is_some()
+                    || self.session_probe.is_some()
+                {
+                    return Err(ProtocolError::InvalidRequest);
+                }
+                let crawl = self
+                    .crawl
+                    .as_ref()
+                    .ok_or(ProtocolError::InvalidRequest)?;
+                crawl.validate()?;
+                if crawl.is_begin() {
                     validate_profile_id(&self.profile_id)
                 } else if self.profile_id.is_empty() {
                     Ok(())
@@ -826,6 +933,16 @@ impl WorkerResponse {
         Ok(response)
     }
 
+    pub fn crawl_response(
+        request: &WorkerRequest,
+        result: &CrawlResponse,
+    ) -> Result<Self, ProtocolError> {
+        let mut response = Self::empty(request, ResponseStatus::Ok);
+        response.html = result.encode()?;
+        response.validate()?;
+        Ok(response)
+    }
+
     pub fn decode_collection_response(&self) -> Result<CollectionResponse, ProtocolError> {
         if self.kind != RequestKind::Collection
             || self.status != ResponseStatus::Ok
@@ -838,6 +955,20 @@ impl WorkerResponse {
             return Err(ProtocolError::InvalidCollectionPayload);
         }
         CollectionResponse::decode(&self.html)
+    }
+
+    pub fn decode_crawl_response(&self) -> Result<CrawlResponse, ProtocolError> {
+        if self.kind != RequestKind::Crawl
+            || self.status != ResponseStatus::Ok
+            || self.http_status.is_some()
+            || !self.final_url.is_empty()
+            || !self.title.is_empty()
+            || !self.error.is_empty()
+            || !self.png.is_empty()
+        {
+            return Err(ProtocolError::InvalidCrawlPayload);
+        }
+        CrawlResponse::decode(&self.html)
     }
 
     pub fn decode_task_result(&self) -> Result<CollectionTaskResult, ProtocolError> {
@@ -921,6 +1052,9 @@ impl WorkerResponse {
         }
         if self.kind == RequestKind::Collection && self.status == ResponseStatus::Ok {
             self.decode_collection_response()?;
+        }
+        if self.kind == RequestKind::Crawl && self.status == ResponseStatus::Ok {
+            self.decode_crawl_response()?;
         }
         if matches!(
             self.kind,
@@ -1172,6 +1306,24 @@ where
             session_update: None,
             session_probe: None,
             collection: Some(CollectionRequest::decode(body)?),
+            crawl: None,
+        };
+        request.validate()?;
+        return Ok(Some(request));
+    }
+    if kind == RequestKind::Crawl {
+        let request = WorkerRequest {
+            kind,
+            request_id,
+            profile_id,
+            url: String::new(),
+            task: None,
+            persona: None,
+            profile_class: None,
+            session_update: None,
+            session_probe: None,
+            collection: None,
+            crawl: Some(CrawlRequest::decode(body)?),
         };
         request.validate()?;
         return Ok(Some(request));
@@ -1202,6 +1354,7 @@ where
             session_update: None,
             session_probe: Some(session_probe),
             collection: None,
+            crawl: None,
         };
         request.validate()?;
         return Ok(Some(request));
@@ -1235,6 +1388,7 @@ where
         session_update,
         session_probe: None,
         collection: None,
+        crawl: None,
     };
     request.validate()?;
     Ok(Some(request))
@@ -1407,6 +1561,7 @@ pub enum ProtocolError {
     InvalidIdentityPayload,
     InvalidSessionPayload,
     InvalidCollectionPayload,
+    InvalidCrawlPayload,
 }
 
 impl std::fmt::Display for ProtocolError {
@@ -1426,6 +1581,7 @@ impl std::fmt::Display for ProtocolError {
             Self::InvalidCollectionPayload => {
                 write!(formatter, "collection payload is invalid")
             }
+            Self::InvalidCrawlPayload => write!(formatter, "crawl payload is invalid"),
         }
     }
 }
@@ -1477,7 +1633,7 @@ mod tests {
     }
 
     #[test]
-    fn request_kind_wire_codes_are_stable_and_collection_is_append_only() {
+    fn request_kind_wire_codes_are_stable_and_extensions_are_append_only() {
         assert_eq!(RequestKind::Capture as u8, 1);
         assert_eq!(RequestKind::Health as u8, 2);
         assert_eq!(RequestKind::Shutdown as u8, 3);
@@ -1489,6 +1645,7 @@ mod tests {
         assert_eq!(RequestKind::FinishAuthSession as u8, 9);
         assert_eq!(RequestKind::CheckAuthSession as u8, 10);
         assert_eq!(RequestKind::Collection as u8, 11);
+        assert_eq!(RequestKind::Crawl as u8, 12);
     }
 
     #[tokio::test]

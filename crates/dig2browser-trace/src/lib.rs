@@ -100,6 +100,12 @@ impl TraceLedger {
         root: impl AsRef<Path>,
         successor_timestamp_unix_ms: u64,
     ) -> Result<Self, LedgerError> {
+        let ledger = Self::open_deferred(root)?;
+        ledger.reconcile_at(successor_timestamp_unix_ms, &[])?;
+        Ok(ledger)
+    }
+
+    pub fn open_deferred(root: impl AsRef<Path>) -> Result<Self, LedgerError> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
         let lock = OpenOptions::new()
@@ -118,8 +124,36 @@ impl TraceLedger {
         fs::create_dir_all(ledger.collections_dir())?;
         fs::create_dir_all(ledger.artifacts_dir())?;
         sync_directory(&ledger.root)?;
-        ledger.reconcile_successor(successor_timestamp_unix_ms)?;
         Ok(ledger)
+    }
+
+    pub fn incomplete_collection_ids(&self) -> Result<Vec<CollectionId>, LedgerError> {
+        let mut incomplete = Vec::new();
+        for collection_id in self.collection_ids()? {
+            if !self.replay(collection_id)?.terminal {
+                incomplete.push(collection_id);
+            }
+        }
+        Ok(incomplete)
+    }
+
+    pub fn reconcile_at(
+        &self,
+        timestamp_unix_ms: u64,
+        preserve: &[CollectionId],
+    ) -> Result<(), LedgerError> {
+        for collection_id in self.incomplete_collection_ids()? {
+            if preserve.contains(&collection_id) {
+                continue;
+            }
+            let replay = self.replay(collection_id)?;
+            self.append_kind(
+                collection_id,
+                timestamp_unix_ms.max(replay.last_timestamp),
+                TraceEventKind::Interrupted(InterruptedReason::SuccessorReconciliation),
+            )?;
+        }
+        Ok(())
     }
 
     pub fn begin_collection(
@@ -412,7 +446,7 @@ impl TraceLedger {
         Ok(())
     }
 
-    fn reconcile_successor(&self, timestamp_unix_ms: u64) -> Result<(), LedgerError> {
+    fn collection_ids(&self) -> Result<Vec<CollectionId>, LedgerError> {
         let mut collections = Vec::new();
         for entry in fs::read_dir(self.collections_dir())? {
             let entry = entry?;
@@ -429,17 +463,7 @@ impl TraceLedger {
             collections.push(CollectionId::new(bytes)?);
         }
         collections.sort_by_key(|id| id.into_bytes());
-        for collection_id in collections {
-            let replay = self.replay(collection_id)?;
-            if !replay.terminal {
-                self.append_kind(
-                    collection_id,
-                    timestamp_unix_ms.max(replay.last_timestamp),
-                    TraceEventKind::Interrupted(InterruptedReason::SuccessorReconciliation),
-                )?;
-            }
-        }
-        Ok(())
+        Ok(collections)
     }
 
     fn collections_dir(&self) -> PathBuf {
@@ -998,6 +1022,53 @@ mod tests {
             .read_trace(id, TraceCursor::START, 64)
             .expect("stable page");
         assert_eq!(page.events().len(), 2);
+    }
+
+    #[test]
+    fn deferred_open_preserves_selected_incomplete_collections_until_reconcile() {
+        let root = TestRoot::new("deferred-successor");
+        let preserved = collection(40);
+        let interrupted = collection(41);
+        {
+            let ledger = TraceLedger::open_at(&root.0, 1).expect("initial ledger");
+            ledger
+                .begin_collection(preserved, 10, started(1))
+                .expect("start preserved collection");
+            ledger
+                .begin_collection(interrupted, 11, started(1))
+                .expect("start interrupted collection");
+        }
+
+        let ledger = TraceLedger::open_deferred(&root.0).expect("deferred successor");
+        assert_eq!(
+            ledger.incomplete_collection_ids().expect("list incomplete"),
+            vec![preserved, interrupted]
+        );
+        let preserved_page = ledger
+            .read_trace(preserved, TraceCursor::START, 64)
+            .expect("read deferred trace");
+        assert_eq!(preserved_page.events().len(), 1);
+        assert!(!preserved_page.is_complete());
+
+        ledger
+            .reconcile_at(20, &[preserved])
+            .expect("reconcile unpreserved collection");
+        assert_eq!(
+            ledger.incomplete_collection_ids().expect("list preserved"),
+            vec![preserved]
+        );
+        assert!(ledger
+            .read_trace(interrupted, TraceCursor::START, 64)
+            .expect("read interrupted trace")
+            .is_complete());
+
+        ledger
+            .reconcile_at(21, &[])
+            .expect("finish successor reconciliation");
+        assert!(ledger
+            .incomplete_collection_ids()
+            .expect("no incomplete collections")
+            .is_empty());
     }
 
     #[test]

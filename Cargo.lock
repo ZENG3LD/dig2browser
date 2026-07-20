@@ -581,6 +581,16 @@ name = "dig2browser-core"
 version = "0.1.0"
 
 [[package]]
+name = "dig2browser-crawler"
+version = "0.1.0"
+dependencies = [
+ "scraper",
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "dig2browser-probe"
 version = "0.1.0"
 dependencies = [
@@ -593,7 +603,7 @@ dependencies = [
 
 [[package]]
 name = "dig2browser-protocol"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dig2browser-core",
  "tokio",
@@ -620,6 +630,7 @@ dependencies = [
  "dig2browser",
  "dig2browser-client",
  "dig2browser-core",
+ "dig2browser-crawler",
  "dig2browser-probe",
  "dig2browser-protocol",
  "dig2browser-runtime-lightweight",

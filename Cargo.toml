@@ -14,6 +14,7 @@ members = [
     ".",
     "crates/dig2browser-client",
     "crates/dig2browser-core",
+    "crates/dig2browser-crawler",
     "crates/dig2browser-probe",
     "crates/dig2browser-protocol",
     "crates/dig2browser-runtime-lightweight",

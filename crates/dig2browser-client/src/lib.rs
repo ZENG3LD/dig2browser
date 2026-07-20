@@ -13,8 +13,11 @@ pub use dig2browser_protocol::{
     ArtifactChunk, ArtifactCommitted, ArtifactMediaType, ArtifactRef,
     ArtifactRole, BrowserPersona, CaptureCompleteness, CollectionId,
     CollectionRequest, CollectionResponse, CollectionTask, CollectionTaskResult,
-    CompiledPersona, ControlTransport, EngineFamily, EvidenceCapture, FailureClass,
+    CompiledPersona, ControlTransport, CrawlCounts, CrawlCursor, CrawlEvent, CrawlEventKind,
+    CrawlEventPage, CrawlJobId, CrawlPhase, CrawlRequest, CrawlResponse, CrawlSpec,
+    CrawlStatus, EngineFamily, EvidenceCapture, FailureClass,
     IdentitySessionStatus, InterruptedReason, MobilePersonaConfig, PersonaKind,
+    PageArtifact,
     PersonaCompiler, PersonaDeviceClass, PersonaMode, PersonaPreset, ProfileClass,
     ResolvedRuntimeRecord, ResponseStatus, RouteRef, RouteRefError, RuntimeFeature,
     RuntimeKind, RuntimeLimitation, RuntimeRequirements, RuntimeSelector,
@@ -22,7 +25,9 @@ pub use dig2browser_protocol::{
     StationStatus, StepOutcome, StepSummary, SupportLevel, TaskCapturePolicy,
     TaskReply, TaskRuntimeContract, TaskStep, TerminalOutcome, TerminalTrace,
     TraceCursor, TraceEvent, TraceEventKind, TracePage,
-    MAX_ARTIFACT_CHUNK_BYTES, MAX_TRACE_EVENTS, DEFAULT_STATION_PIPE, HOST_DIRECT,
+    MAX_ARTIFACT_CHUNK_BYTES, MAX_CRAWL_ALLOWED_ORIGINS, MAX_CRAWL_DEPTH,
+    MAX_CRAWL_EVENTS, MAX_CRAWL_PAGES, MAX_CRAWL_RETRIES, MAX_CRAWL_SEEDS,
+    MAX_CRAWL_URL_BYTES, MAX_TRACE_EVENTS, DEFAULT_STATION_PIPE, HOST_DIRECT,
 };
 
 const MIN_TIMEOUT: Duration = Duration::from_millis(100);
@@ -329,6 +334,107 @@ impl StationClient {
             CollectionResponse::Cancelled {
                 collection_id: cancelled,
             } if cancelled == collection_id => Ok(()),
+            _ => Err(ClientError::InvalidResponse),
+        }
+    }
+
+    pub async fn begin_crawl(
+        &self,
+        profile_id: impl Into<String>,
+        spec: CrawlSpec,
+    ) -> Result<CrawlJobId, ClientError> {
+        let job_id = CrawlJobId::new(*uuid::Uuid::new_v4().as_bytes())
+            .map_err(|_| ClientError::InvalidCrawlRequest)?;
+        self.begin_crawl_with_id(profile_id, job_id, spec).await
+    }
+
+    pub async fn begin_crawl_with_id(
+        &self,
+        profile_id: impl Into<String>,
+        job_id: CrawlJobId,
+        spec: CrawlSpec,
+    ) -> Result<CrawlJobId, ClientError> {
+        self.begin_crawl_with_identity(
+            profile_id,
+            job_id,
+            ProfileClass::Public,
+            BrowserPersona::desktop_default(),
+            spec,
+        )
+        .await
+    }
+
+    pub async fn begin_crawl_with_identity(
+        &self,
+        profile_id: impl Into<String>,
+        job_id: CrawlJobId,
+        profile_class: ProfileClass,
+        persona: BrowserPersona,
+        spec: CrawlSpec,
+    ) -> Result<CrawlJobId, ClientError> {
+        let crawl = CrawlRequest::begin(job_id, profile_class, persona, spec)
+            .map_err(|_| ClientError::InvalidCrawlRequest)?;
+        let request = WorkerRequest::begin_crawl(
+            self.take_request_id(),
+            profile_id,
+            crawl,
+        )
+        .map_err(|_| ClientError::InvalidCrawlRequest)?;
+        let response = require_crawl_response(&self.call(request).await?)?;
+        match response {
+            CrawlResponse::Accepted { job_id: accepted } if accepted == job_id => {
+                Ok(job_id)
+            }
+            _ => Err(ClientError::InvalidResponse),
+        }
+    }
+
+    pub async fn crawl_status(
+        &self,
+        job_id: CrawlJobId,
+    ) -> Result<CrawlStatus, ClientError> {
+        let crawl = CrawlRequest::status(job_id)
+            .map_err(|_| ClientError::InvalidCrawlRequest)?;
+        let request = WorkerRequest::crawl(self.take_request_id(), crawl)
+            .map_err(|_| ClientError::InvalidCrawlRequest)?;
+        let response = require_crawl_response(&self.call(request).await?)?;
+        let CrawlResponse::Status(status) = response else {
+            return Err(ClientError::InvalidResponse);
+        };
+        if status.job_id() != job_id {
+            return Err(ClientError::InvalidResponse);
+        }
+        Ok(status)
+    }
+
+    pub async fn read_crawl_events(
+        &self,
+        job_id: CrawlJobId,
+        cursor: CrawlCursor,
+        limit: u8,
+    ) -> Result<CrawlEventPage, ClientError> {
+        let crawl = CrawlRequest::read_events(job_id, cursor, limit)
+            .map_err(|_| ClientError::InvalidCrawlRequest)?;
+        let request = WorkerRequest::crawl(self.take_request_id(), crawl)
+            .map_err(|_| ClientError::InvalidCrawlRequest)?;
+        let response = require_crawl_response(&self.call(request).await?)?;
+        let CrawlResponse::Events(page) = response else {
+            return Err(ClientError::InvalidResponse);
+        };
+        if page.job_id() != job_id || page.validate_after(cursor).is_err() {
+            return Err(ClientError::InvalidResponse);
+        }
+        Ok(page)
+    }
+
+    pub async fn cancel_crawl(&self, job_id: CrawlJobId) -> Result<(), ClientError> {
+        let crawl = CrawlRequest::cancel(job_id)
+            .map_err(|_| ClientError::InvalidCrawlRequest)?;
+        let request = WorkerRequest::crawl(self.take_request_id(), crawl)
+            .map_err(|_| ClientError::InvalidCrawlRequest)?;
+        let response = require_crawl_response(&self.call(request).await?)?;
+        match response {
+            CrawlResponse::Cancelled { job_id: cancelled } if cancelled == job_id => Ok(()),
             _ => Err(ClientError::InvalidResponse),
         }
     }
@@ -700,6 +806,65 @@ impl BlockingStationClient {
             .block_on(self.client.cancel_collection(collection_id))
     }
 
+    pub fn begin_crawl(
+        &self,
+        profile_id: impl Into<String>,
+        spec: CrawlSpec,
+    ) -> Result<CrawlJobId, ClientError> {
+        self.runtime
+            .block_on(self.client.begin_crawl(profile_id, spec))
+    }
+
+    pub fn begin_crawl_with_id(
+        &self,
+        profile_id: impl Into<String>,
+        job_id: CrawlJobId,
+        spec: CrawlSpec,
+    ) -> Result<CrawlJobId, ClientError> {
+        self.runtime.block_on(
+            self.client
+                .begin_crawl_with_id(profile_id, job_id, spec),
+        )
+    }
+
+    pub fn begin_crawl_with_identity(
+        &self,
+        profile_id: impl Into<String>,
+        job_id: CrawlJobId,
+        profile_class: ProfileClass,
+        persona: BrowserPersona,
+        spec: CrawlSpec,
+    ) -> Result<CrawlJobId, ClientError> {
+        self.runtime.block_on(self.client.begin_crawl_with_identity(
+            profile_id,
+            job_id,
+            profile_class,
+            persona,
+            spec,
+        ))
+    }
+
+    pub fn crawl_status(
+        &self,
+        job_id: CrawlJobId,
+    ) -> Result<CrawlStatus, ClientError> {
+        self.runtime.block_on(self.client.crawl_status(job_id))
+    }
+
+    pub fn read_crawl_events(
+        &self,
+        job_id: CrawlJobId,
+        cursor: CrawlCursor,
+        limit: u8,
+    ) -> Result<CrawlEventPage, ClientError> {
+        self.runtime
+            .block_on(self.client.read_crawl_events(job_id, cursor, limit))
+    }
+
+    pub fn cancel_crawl(&self, job_id: CrawlJobId) -> Result<(), ClientError> {
+        self.runtime.block_on(self.client.cancel_crawl(job_id))
+    }
+
     pub fn identity_status(
         &self,
         profile_id: impl Into<String>,
@@ -855,6 +1020,13 @@ fn require_collection_response(
         .map_err(|_| ClientError::InvalidResponse)
 }
 
+fn require_crawl_response(response: &WorkerResponse) -> Result<CrawlResponse, ClientError> {
+    require_ok(response)?;
+    response
+        .decode_crawl_response()
+        .map_err(|_| ClientError::InvalidResponse)
+}
+
 fn runtime_satisfies_contract(
     runtime: &ResolvedRuntimeRecord,
     contract: &TaskRuntimeContract,
@@ -929,6 +1101,8 @@ pub enum ClientError {
     InvalidResponse,
     #[error("invalid collection request")]
     InvalidCollectionRequest,
+    #[error("invalid crawl request")]
+    InvalidCrawlRequest,
     #[error("failed to create station client runtime: {0}")]
     Runtime(#[source] std::io::Error),
     #[error("station rejected request with {status:?}: {message}")]
@@ -1001,6 +1175,11 @@ mod tests {
         assert_eq!(RequestKind::Task as u8, 5);
         assert_eq!(RequestKind::IdentityStatus as u8, 6);
         assert_eq!(RequestKind::UpdateIdentityState as u8, 7);
+        assert_eq!(RequestKind::BeginAuthSession as u8, 8);
+        assert_eq!(RequestKind::FinishAuthSession as u8, 9);
+        assert_eq!(RequestKind::CheckAuthSession as u8, 10);
+        assert_eq!(RequestKind::Collection as u8, 11);
+        assert_eq!(RequestKind::Crawl as u8, 12);
     }
 
     #[test]

@@ -24,7 +24,7 @@ use dig2browser_station::ipc::{
 };
 #[cfg(windows)]
 use dig2browser_station::{
-    BrowserStation, CollectionError, ConfigError as StationConfigError, EgressError,
+    BrowserStation, CollectionError, ConfigError as StationConfigError, CrawlError, EgressError,
     EgressPeerPolicy, EgressPeerPolicyError, EgressProxy, EgressReport,
     EgressRouteError, ProfilesRootError, ProfilesRootOwnership, RouteDescriptor,
     RouteRegistry, RouteRegistryError, RuntimeKind, RuntimeSelector, StationConfig,
@@ -61,6 +61,11 @@ struct Cli {
     profiles_root: PathBuf,
     #[arg(long)]
     trace_root: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Own this durable crawl root and resume unfinished crawl jobs"
+    )]
+    crawl_root: Option<PathBuf>,
     #[arg(long, default_value_t = 16)]
     max_resident: usize,
     #[arg(long, default_value_t = 32)]
@@ -103,6 +108,10 @@ struct Cli {
     allow_durable_read: bool,
     #[arg(long, default_value_t = false)]
     allow_durable_write: bool,
+    #[arg(long, default_value_t = false)]
+    allow_crawl_read: bool,
+    #[arg(long, default_value_t = false)]
+    allow_crawl_write: bool,
 }
 
 #[cfg(windows)]
@@ -172,9 +181,14 @@ async fn run(cli: Cli) -> Result<DaemonReport, DaemonError> {
     .allow_headful_auth(cli.allow_headful_auth)
     .allow_session_health(cli.allow_session_health)
     .allow_durable_read(cli.allow_durable_read)
-    .allow_durable_write(cli.allow_durable_write);
+    .allow_durable_write(cli.allow_durable_write)
+    .allow_crawl_read(cli.allow_crawl_read)
+    .allow_crawl_write(cli.allow_crawl_write);
     if let Some(trace_root) = cli.trace_root {
         server_config = server_config.trace_root(trace_root)?;
+    }
+    if let Some(crawl_root) = cli.crawl_root {
+        server_config = server_config.crawl_root(crawl_root)?;
     }
     let station = BrowserStation::new(station_config);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -331,6 +345,7 @@ impl DaemonError {
             Self::Server(ServerError::UnsupportedPlatform) => "unsupported_platform",
             Self::Server(ServerError::Io(_)) => "station_endpoint_unavailable",
             Self::Server(ServerError::Frame(_)) => "station_protocol_failure",
+            Self::Server(ServerError::CrawlTraceRequired) => "invalid_config",
             Self::Server(ServerError::Collection(
                 CollectionError::Ledger(dig2browser_trace::LedgerError::WriterLocked),
             )) => "trace_root_owned",
@@ -350,6 +365,27 @@ impl DaemonError {
                 ),
             )) => "trace_corrupt",
             Self::Server(ServerError::Collection(_)) => "trace_root_unavailable",
+            Self::Server(ServerError::Crawl(CrawlError::RootLocked)) => "crawl_root_owned",
+            Self::Server(ServerError::Crawl(
+                CrawlError::RootNotAbsolute | CrawlError::RootOverlap,
+            )) => "invalid_config",
+            Self::Server(ServerError::Crawl(
+                CrawlError::InvalidJournalName
+                | CrawlError::InvalidBinding
+                | CrawlError::InvalidProfileId
+                | CrawlError::InvalidBudget
+                | CrawlError::CorruptState(_)
+                | CrawlError::MissingHtmlCapture
+                | CrawlError::InvalidArtifactReference
+                | CrawlError::InvalidHex
+                | CrawlError::CountOverflow
+                | CrawlError::ManagerStatePoisoned
+                | CrawlError::Protocol(_)
+                | CrawlError::Crawler(_)
+                | CrawlError::Spec(_)
+                | CrawlError::CanonicalUrl(_),
+            )) => "crawl_corrupt",
+            Self::Server(ServerError::Crawl(_)) => "crawl_root_unavailable",
             Self::Server(ServerError::Station(_)) => "station_shutdown_failure",
         }
     }

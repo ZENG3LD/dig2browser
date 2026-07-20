@@ -9,11 +9,16 @@ description = "Central resource owner and consumer facade for dig2browser runtim
 name = "dig2browser_station"
 path = "src/lib.rs"
 
+[features]
+default = []
+crawler-test-hooks = []
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 dig2browser = { path = "../.." }
 dig2browser-client = { path = "../dig2browser-client" }
 dig2browser-core = { path = "../dig2browser-core" }
+dig2browser-crawler = { path = "../dig2browser-crawler" }
 dig2browser-protocol = { path = "../dig2browser-protocol" }
 dig2browser-runtime-lightweight = { path = "../dig2browser-runtime-lightweight" }
 dig2browser-trace = { path = "../dig2browser-trace" }

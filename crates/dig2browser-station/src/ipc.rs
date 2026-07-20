@@ -12,8 +12,8 @@ use dig2browser::agentic::{
 use dig2browser_protocol::{
     read_worker_request, validate_pipe_suffix, write_worker_response,
     CaptureCompleteness, CollectionRequest, CollectionResponse, CollectionTask,
-    CollectionTaskResult, EvidenceCapture, FailureClass, ProfileClass,
-    RequestKind, ResolvedRuntimeRecord, ResponseStatus, StationStatus,
+    CollectionTaskResult, CrawlRequest, EvidenceCapture, FailureClass,
+    ProfileClass, RequestKind, ResolvedRuntimeRecord, ResponseStatus, StationStatus,
     TaskCapturePolicy, TaskReply, TaskStep, WorkerRequest, WorkerResponse,
     PROTOCOL_VERSION,
 };
@@ -23,6 +23,7 @@ use tokio::task::JoinSet;
 
 use crate::{
     collection::{BeginCollection, CollectionError, CollectionManager},
+    crawl::{CrawlError, CrawlManager},
     BrowserLease, BrowserStation, BrowserTask, BrowserTaskStep, IdentityRequest,
     RuntimeRegistryError, RuntimeRequirements, RuntimeSelector, StationError,
     StationFleetStatus,
@@ -183,8 +184,11 @@ pub struct ServerConfig {
     allow_headful_auth: bool,
     allow_session_health: bool,
     trace_root: Option<PathBuf>,
+    crawl_root: Option<PathBuf>,
     allow_durable_read: bool,
     allow_durable_write: bool,
+    allow_crawl_read: bool,
+    allow_crawl_write: bool,
 }
 
 impl ServerConfig {
@@ -215,8 +219,11 @@ impl ServerConfig {
             allow_headful_auth: false,
             allow_session_health: false,
             trace_root: None,
+            crawl_root: None,
             allow_durable_read: false,
             allow_durable_write: false,
+            allow_crawl_read: false,
+            allow_crawl_write: false,
         })
     }
 
@@ -264,6 +271,15 @@ impl ServerConfig {
         Ok(self)
     }
 
+    pub fn crawl_root(mut self, root: impl Into<PathBuf>) -> Result<Self, ConfigError> {
+        let root = root.into();
+        if !root.is_absolute() {
+            return Err(ConfigError::InvalidCrawlRoot);
+        }
+        self.crawl_root = Some(root);
+        Ok(self)
+    }
+
     pub fn allow_durable_read(mut self, allow: bool) -> Self {
         self.allow_durable_read = allow;
         self
@@ -271,6 +287,16 @@ impl ServerConfig {
 
     pub fn allow_durable_write(mut self, allow: bool) -> Self {
         self.allow_durable_write = allow;
+        self
+    }
+
+    pub fn allow_crawl_read(mut self, allow: bool) -> Self {
+        self.allow_crawl_read = allow;
+        self
+    }
+
+    pub fn allow_crawl_write(mut self, allow: bool) -> Self {
+        self.allow_crawl_write = allow;
         self
     }
 
@@ -333,11 +359,37 @@ async fn run_windows_server(
     let (connection_shutdown, _) = watch::channel(false);
     let (remote_shutdown, mut remote_requests) = mpsc::channel::<()>(1);
     let telemetry = Arc::new(ServerTelemetry::default());
+    let crawl_execution_authorized = config.allow_crawl_write
+        && config.allow_crawl_read
+        && config.allow_durable_write
+        && config.allow_durable_read;
     let collections = config
         .trace_root
         .as_ref()
-        .map(|root| CollectionManager::open(station.clone(), root.clone()))
+        .map(|root| CollectionManager::open_deferred(station.clone(), root.clone()))
         .transpose()?;
+    let crawls = match (config.crawl_root.as_ref(), config.trace_root.as_ref(), collections.as_ref()) {
+        (Some(crawl_root), Some(trace_root), Some(collections)) => Some(CrawlManager::open_deferred(
+            station.clone(),
+            collections.clone(),
+            crawl_root.clone(),
+            trace_root,
+            crawl_execution_authorized,
+        )?),
+        (Some(_), _, _) => return Err(ServerError::CrawlTraceRequired),
+        (None, _, _) => None,
+    };
+    if let Some(crawls) = &crawls {
+        crawls.reconcile_and_recover()?;
+    }
+    if let Some(collections) = &collections {
+        let crawl_reconciliation_authorized =
+            crawls.is_some() && crawl_execution_authorized;
+        collections.reconcile_successor(!crawl_reconciliation_authorized)?;
+    }
+    if let Some(crawls) = &crawls {
+        crawls.start_runners()?;
+    }
     let mut connections = JoinSet::new();
     let mut first_instance = true;
     let mut remote_stop = false;
@@ -392,6 +444,7 @@ async fn run_windows_server(
                 let context = ConnectionContext {
                     station: station.clone(),
                     collections: collections.clone(),
+                    crawls: crawls.clone(),
                     telemetry: Arc::clone(&telemetry),
                     remote_shutdown: remote_shutdown.clone(),
                     allow_remote_shutdown: config.allow_remote_shutdown,
@@ -404,6 +457,8 @@ async fn run_windows_server(
                         session_health: config.allow_session_health,
                         durable_read: config.allow_durable_read,
                         durable_write: config.allow_durable_write,
+                        crawl_read: config.allow_crawl_read,
+                        crawl_write: config.allow_crawl_write,
                     },
                 };
                 connections.spawn(async move {
@@ -446,6 +501,11 @@ async fn run_windows_server(
         connections.abort_all();
         while connections.join_next().await.is_some() {}
     }
+    let crawl_shutdown = match crawls {
+        Some(crawls) => crawls.shutdown(config.drain_timeout).await,
+        None => Ok(false),
+    };
+    drain_timed_out |= crawl_shutdown?;
     let collection_shutdown = match collections {
         Some(collections) => collections.shutdown(config.drain_timeout).await,
         None => Ok(false),
@@ -470,6 +530,7 @@ async fn run_windows_server(
 struct ConnectionContext {
     station: BrowserStation,
     collections: Option<CollectionManager>,
+    crawls: Option<CrawlManager>,
     telemetry: Arc<ServerTelemetry>,
     remote_shutdown: mpsc::Sender<()>,
     allow_remote_shutdown: bool,
@@ -485,6 +546,7 @@ async fn serve_connection(
     let ConnectionContext {
         station,
         collections,
+        crawls,
         telemetry,
         remote_shutdown,
         allow_remote_shutdown,
@@ -530,6 +592,14 @@ async fn serve_connection(
             RequestKind::Collection => {
                 collection_request(
                     collections.as_ref(),
+                    &request,
+                    task_permissions,
+                )
+                .await
+            }
+            RequestKind::Crawl => {
+                crawl_request(
+                    crawls.as_ref(),
                     &request,
                     task_permissions,
                 )
@@ -612,6 +682,108 @@ struct TaskPermissions {
     session_health: bool,
     durable_read: bool,
     durable_write: bool,
+    crawl_read: bool,
+    crawl_write: bool,
+}
+
+async fn crawl_request(
+    crawls: Option<&CrawlManager>,
+    request: &WorkerRequest,
+    permissions: TaskPermissions,
+) -> WorkerResponse {
+    let Some(crawls) = crawls else {
+        return WorkerResponse::failure(
+            request,
+            ResponseStatus::Unsupported,
+            "durable crawler unavailable",
+        );
+    };
+    let Some(operation) = request.crawl.as_ref() else {
+        return WorkerResponse::failure(
+            request,
+            ResponseStatus::Invalid,
+            "crawl request missing",
+        );
+    };
+    match operation {
+        CrawlRequest::Begin { .. }
+            if !permissions.crawl_write
+                || !permissions.crawl_read
+                || !permissions.durable_read
+                || !permissions.durable_write =>
+        {
+            return WorkerResponse::failure(
+                request,
+                ResponseStatus::Invalid,
+                "crawl begin disabled",
+            )
+        }
+        CrawlRequest::Status { .. } | CrawlRequest::ReadEvents { .. }
+            if !permissions.crawl_read =>
+        {
+            return WorkerResponse::failure(
+                request,
+                ResponseStatus::Invalid,
+                "crawl reads disabled",
+            )
+        }
+        CrawlRequest::Cancel { .. } if !permissions.crawl_write => {
+            return WorkerResponse::failure(
+                request,
+                ResponseStatus::Invalid,
+                "crawl writes disabled",
+            )
+        }
+        _ => {}
+    }
+    match crawls.handle(&request.profile_id, operation.clone()).await {
+        Ok(response) => WorkerResponse::crawl_response(request, &response)
+            .unwrap_or_else(|_| {
+                WorkerResponse::failure(
+                    request,
+                    ResponseStatus::Protocol,
+                    "crawl response invalid",
+                )
+            }),
+        Err(error) => crawl_error_response(request, &error),
+    }
+}
+
+fn crawl_error_response(request: &WorkerRequest, error: &CrawlError) -> WorkerResponse {
+    let (status, message) = match error {
+        CrawlError::AuthenticatedProfileUnsupported => {
+            (ResponseStatus::Unsupported, "authenticated crawling unsupported")
+        }
+        CrawlError::JobNotFound
+        | CrawlError::JobConflict
+        | CrawlError::JobTerminal
+        | CrawlError::InvalidJournalName
+        | CrawlError::InvalidBinding
+        | CrawlError::InvalidProfileId
+        | CrawlError::InvalidBudget
+        | CrawlError::InvalidCursor
+        | CrawlError::FinalUrlOutsideScope
+        | CrawlError::InvalidArtifactReference
+        | CrawlError::InvalidHex
+        | CrawlError::CanonicalUrl(_)
+        | CrawlError::Spec(_)
+        | CrawlError::Task(_) => (ResponseStatus::Invalid, "crawl request rejected"),
+        CrawlError::ArtifactTooLarge => {
+            (ResponseStatus::TooLarge, "crawl artifact exceeds limit")
+        }
+        CrawlError::AdmissionClosed
+        | CrawlError::RuntimeUnavailable
+        | CrawlError::Collection(_)
+        | CrawlError::Station(_) => (ResponseStatus::Unavailable, "crawler unavailable"),
+        CrawlError::CorruptState(_)
+        | CrawlError::MissingHtmlCapture
+        | CrawlError::CountOverflow
+        | CrawlError::ManagerStatePoisoned
+        | CrawlError::Protocol(_)
+        | CrawlError::Crawler(_) => (ResponseStatus::Protocol, "crawl state invalid"),
+        _ => (ResponseStatus::Unavailable, "crawler unavailable"),
+    };
+    WorkerResponse::failure(request, status, message)
 }
 
 async fn collection_request(
@@ -711,6 +883,7 @@ async fn collection_request(
                     runtime_selector,
                     runtime_requirements,
                     task: station_task,
+                    persist_capture_receipt: false,
                 })
                 .await
                 .map(|collection_id| CollectionResponse::Accepted { collection_id })
@@ -817,6 +990,7 @@ fn collection_error_response(
             LedgerError::ArtifactTooLarge | LedgerError::EventLimitExceeded,
         ) => (ResponseStatus::TooLarge, "collection limit exceeded"),
         CollectionError::CorruptTrace
+        | CollectionError::CorruptReceipt
         | CollectionError::ManagerStatePoisoned
         | CollectionError::LedgerPoisoned
         | CollectionError::Protocol(_)
@@ -1637,6 +1811,8 @@ pub enum ConfigError {
     InvalidDrainTimeout,
     #[error("trace root must be absolute")]
     InvalidTraceRoot,
+    #[error("crawl root must be absolute")]
+    InvalidCrawlRoot,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1649,6 +1825,10 @@ pub enum ServerError {
     Frame(#[from] dig2browser_protocol::FrameError),
     #[error(transparent)]
     Collection(#[from] CollectionError),
+    #[error(transparent)]
+    Crawl(#[from] CrawlError),
+    #[error("crawl root requires a trace root")]
+    CrawlTraceRequired,
     #[error(transparent)]
     Station(#[from] crate::StationError),
 }
