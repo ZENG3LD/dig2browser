@@ -1,6 +1,7 @@
 //! CDP (Chrome DevTools Protocol) backend for StealthBrowser.
 //!
-//! Spawns a Chrome/Edge process, connects via WebSocket, and provides
+//! Spawns a Chrome/Edge process, connects through an inherited pipe by default
+//! on Windows (or an explicit WebSocket compatibility endpoint), and provides
 //! BrowserBackend + PageBackend implementations using dig2browser-cdp.
 
 use std::collections::HashMap;
@@ -13,6 +14,8 @@ use base64::Engine;
 use futures::future::BoxFuture;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
+#[cfg(windows)]
+use tokio::io::AsyncReadExt;
 use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tracing::debug;
@@ -24,6 +27,9 @@ use crate::detect::args::BrowserProfile;
 use crate::detect::version::browser_version;
 use crate::detect::{LaunchConfig, detect_browser};
 use crate::identity::ProfileOwnershipGuard;
+use crate::browser_process::BrowserProcess;
+#[cfg(windows)]
+use crate::browser_process::PreparedWindowsCdpProcess;
 use crate::process_tree::OwnedProcessTree;
 use crate::stealth::{StealthConfig, get_scripts};
 
@@ -44,9 +50,11 @@ pub(crate) struct CdpBrowserBackend {
     browser_closing: Arc<AtomicBool>,
     /// Child process — `Some` when we launched the browser ourselves, `None`
     /// in attach mode (we must not kill a browser the user opened manually).
-    _child: Option<tokio::process::Child>,
+    _child: Option<BrowserProcess>,
     /// Kernel-owned containment for the complete launched Chromium tree.
     _process_tree: Option<Arc<OwnedProcessTree>>,
+    /// Continuous browser stderr drain for owned pipe-controlled launches.
+    _stderr_task: Option<JoinHandle<()>>,
     /// Profile dir path, deleted on drop if ephemeral.
     profile_dir: std::path::PathBuf,
     profile_ephemeral: bool,
@@ -57,6 +65,29 @@ pub(crate) struct CdpBrowserBackend {
 struct CdpDiscovery {
     ws_url: String,
     browser_product: Option<String>,
+}
+
+struct EphemeralProfileCleanup {
+    path: std::path::PathBuf,
+    armed: bool,
+}
+
+impl EphemeralProfileCleanup {
+    fn new(path: std::path::PathBuf, armed: bool) -> Self {
+        Self { path, armed }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for EphemeralProfileCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
 }
 
 fn product_version(product: &str) -> Option<&str> {
@@ -81,6 +112,9 @@ impl Drop for CdpBrowserBackend {
         if let Some(process_tree) = self._process_tree.as_ref() {
             let _ = process_tree.terminate_now();
         }
+        if let Some(task) = self._stderr_task.take() {
+            task.abort();
+        }
         if self.profile_ephemeral {
             let _ = std::fs::remove_dir_all(&self.profile_dir);
         }
@@ -88,15 +122,16 @@ impl Drop for CdpBrowserBackend {
 }
 
 impl CdpBrowserBackend {
-    /// Spawn a Chrome/Edge process and connect via CDP WebSocket.
+    /// Spawn a Chrome/Edge process and connect through the owned CDP transport.
     pub(crate) async fn launch(
         launch: &LaunchConfig,
         stealth: &StealthConfig,
     ) -> Result<Self, BrowserError> {
         let binary = detect_browser(launch.browser_pref)?;
         let installed_version = browser_version(&binary);
-        let port = launch.debug_port.unwrap_or_else(LaunchConfig::find_free_port);
         let (profile_dir, profile_ephemeral) = launch.profile.resolve()?;
+        let mut profile_cleanup =
+            EphemeralProfileCleanup::new(profile_dir.clone(), profile_ephemeral);
         let profile_guard = match &launch.profile {
             BrowserProfile::Persistent(_) => Some(
                 ProfileOwnershipGuard::acquire(&profile_dir)
@@ -105,55 +140,202 @@ impl CdpBrowserBackend {
             BrowserProfile::Ephemeral => None,
         };
         let locale = Some(stealth.locale.locale.as_str());
-        let args = launch.build_args(&profile_dir, port, locale);
-
-        debug!(
-            "Launching CDP browser: {} with {} args on port {}",
-            binary.path.display(),
-            args.len(),
-            port
-        );
-
         let process_tree = Arc::new(
             OwnedProcessTree::new()
                 .map_err(|error| BrowserError::Launch(error.to_string()))?,
         );
-        let mut child = tokio::process::Command::new(&binary.path)
-            .args(&args)
-            .stderr(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stdin(std::process::Stdio::null())
-            // Ensure Chrome is killed if this process exits without calling close()
-            // (panic, early return, forgotten drop). tokio sends SIGKILL/TerminateProcess
-            // automatically when the Child is dropped with kill_on_drop set.
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| BrowserError::Launch(e.to_string()))?;
-        if let Err(error) = process_tree.assign(&child) {
-            let _ = child.start_kill();
-            return Err(BrowserError::Launch(format!(
-                "could not contain browser process tree: {error}"
-            )));
-        }
 
-        // Keep stderr as a secondary discovery channel. The primary channel is
-        // the loopback /json/version endpoint because current Chrome versions
-        // do not guarantee that the DevTools URL remains visible on stderr.
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| BrowserError::Launch("could not capture stderr".into()))?;
+        #[cfg(windows)]
+        let (client, child, stderr_task, browser_product) = {
+            if let Some(port) = launch.debug_port {
+                let args = launch.build_args(&profile_dir, port, locale);
+                debug!(
+                    "Launching CDP browser: {} with {} args on explicit port {}",
+                    binary.path.display(),
+                    args.len(),
+                    port
+                );
+                let mut child = tokio::process::Command::new(&binary.path)
+                    .args(&args)
+                    .stderr(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::null())
+                    .stdin(std::process::Stdio::null())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .map_err(|error| BrowserError::Launch(error.to_string()))?;
+                let raw_handle = child.raw_handle().ok_or_else(|| {
+                    BrowserError::Launch("child process handle is unavailable".into())
+                })?;
+                if let Err(error) = process_tree.assign_raw_handle(raw_handle) {
+                    let _ = child.start_kill();
+                    return Err(BrowserError::Launch(format!(
+                        "could not contain browser process tree: {error}"
+                    )));
+                }
+                let stderr = match child.stderr.take() {
+                    Some(stderr) => stderr,
+                    None => {
+                        let _ = process_tree.terminate_now();
+                        let _ = child.start_kill();
+                        return Err(BrowserError::Launch(
+                            "could not capture stderr".into(),
+                        ));
+                    }
+                };
+                let discovery = match Self::discover_launched_browser(
+                    stderr,
+                    &mut child,
+                    port,
+                )
+                .await
+                {
+                    Ok(discovery) => discovery,
+                    Err(error) => {
+                        let _ = process_tree.terminate_now();
+                        let _ = child.start_kill();
+                        return Err(error);
+                    }
+                };
+                debug!("CDP WebSocket URL: {}", discovery.ws_url);
+                let client = match CdpClient::connect(&discovery.ws_url).await {
+                    Ok(client) => client,
+                    Err(error) => {
+                        let _ = process_tree.terminate_now();
+                        let _ = child.start_kill();
+                        return Err(BrowserError::Connect(error.to_string()));
+                    }
+                };
+                (
+                    client,
+                    BrowserProcess::from_tokio(child),
+                    None,
+                    discovery.browser_product,
+                )
+            } else {
+                let prepared = PreparedWindowsCdpProcess::new()
+                    .map_err(|error| BrowserError::Launch(error.to_string()))?;
+                let (browser_read, browser_write) = prepared
+                    .child_cdp_handles()
+                    .map_err(|error| BrowserError::Launch(error.to_string()))?;
+                let args = launch.build_pipe_args(
+                    &profile_dir,
+                    locale,
+                    browser_read,
+                    browser_write,
+                );
+                debug!(
+                    "Launching CDP browser: {} with {} args over owned ASCIIZ pipes",
+                    binary.path.display(),
+                    args.len()
+                );
+                let mut spawned = prepared
+                    .spawn_suspended(&binary.path, &args)
+                    .map_err(|error| BrowserError::Launch(error.to_string()))?;
+                if let Err(error) = process_tree.assign_raw_handle(spawned.process.raw_handle()) {
+                    let _ = spawned.process.start_kill();
+                    return Err(BrowserError::Launch(format!(
+                        "could not contain browser process tree: {error}"
+                    )));
+                }
+                if let Err(error) = spawned.process.resume() {
+                    let _ = process_tree.terminate_now();
+                    return Err(BrowserError::Launch(format!(
+                        "could not resume contained browser process: {error}"
+                    )));
+                }
+                let stderr_task = Self::spawn_stderr_logger(spawned.stderr);
+                let client = match CdpClient::connect_pipe(
+                    spawned.cdp_reader,
+                    spawned.cdp_writer,
+                )
+                .await
+                {
+                    Ok(client) => client,
+                    Err(error) => {
+                        stderr_task.abort();
+                        let _ = process_tree.terminate_now();
+                        let _ = spawned.process.start_kill();
+                        return Err(BrowserError::Connect(error.to_string()));
+                    }
+                };
+                let root = client.root_session();
+                let version = match tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    root.call("Browser.getVersion", None),
+                )
+                .await
+                {
+                    Ok(Ok(version)) => version,
+                    Ok(Err(error)) => {
+                        stderr_task.abort();
+                        let _ = process_tree.terminate_now();
+                        let _ = spawned.process.start_kill();
+                        return Err(BrowserError::Connect(error.to_string()));
+                    }
+                    Err(_) => {
+                        stderr_task.abort();
+                        let _ = process_tree.terminate_now();
+                        let _ = spawned.process.start_kill();
+                        return Err(BrowserError::Connect(
+                            "timed out waiting for the CDP pipe".to_owned(),
+                        ));
+                    }
+                };
+                let browser_product = version["product"]
+                    .as_str()
+                    .map(str::to_owned);
+                (
+                    client,
+                    spawned.process,
+                    Some(stderr_task),
+                    browser_product,
+                )
+            }
+        };
 
-        let discovery = Self::discover_launched_browser(stderr, &mut child, port).await?;
-        debug!("CDP WebSocket URL: {}", discovery.ws_url);
-
-        let client = CdpClient::connect(&discovery.ws_url)
-            .await
-            .map_err(|e| BrowserError::Connect(e.to_string()))?;
+        #[cfg(not(windows))]
+        let (client, child, stderr_task, browser_product) = {
+            let port = launch.debug_port.unwrap_or_else(LaunchConfig::find_free_port);
+            let args = launch.build_args(&profile_dir, port, locale);
+            debug!(
+                "Launching CDP browser: {} with {} args on port {}",
+                binary.path.display(),
+                args.len(),
+                port
+            );
+            let mut child = tokio::process::Command::new(&binary.path)
+                .args(&args)
+                .stderr(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|error| BrowserError::Launch(error.to_string()))?;
+            if let Err(error) = process_tree.assign(&child) {
+                let _ = child.start_kill();
+                return Err(BrowserError::Launch(format!(
+                    "could not contain browser process tree: {error}"
+                )));
+            }
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| BrowserError::Launch("could not capture stderr".into()))?;
+            let discovery = Self::discover_launched_browser(stderr, &mut child, port).await?;
+            debug!("CDP WebSocket URL: {}", discovery.ws_url);
+            let client = CdpClient::connect(&discovery.ws_url)
+                .await
+                .map_err(|error| BrowserError::Connect(error.to_string()))?;
+            (
+                client,
+                BrowserProcess::from_tokio(child),
+                None,
+                discovery.browser_product,
+            )
+        };
 
         let root = client.root_session();
-        let runtime_version = discovery
-            .browser_product
+        let runtime_version = browser_product
             .as_deref()
             .and_then(product_version)
             .or(installed_version.as_deref());
@@ -161,7 +343,7 @@ impl CdpBrowserBackend {
         let mut resolved_stealth = stealth.clone();
         resolved_stealth.user_agent = user_agent.user_agent;
 
-        Ok(Self {
+        let backend = Self {
             client,
             root,
             launch: launch.clone(),
@@ -171,10 +353,13 @@ impl CdpBrowserBackend {
             browser_closing: Arc::new(AtomicBool::new(false)),
             _child: Some(child),
             _process_tree: Some(process_tree),
+            _stderr_task: stderr_task,
             profile_dir,
             profile_ephemeral,
             _profile_guard: profile_guard,
-        })
+        };
+        profile_cleanup.disarm();
+        Ok(backend)
     }
 
     /// Attach to an already-running Chrome/Edge that was launched with
@@ -201,6 +386,7 @@ impl CdpBrowserBackend {
             browser_closing: Arc::new(AtomicBool::new(false)),
             _child: None, // not our child — do not kill on drop
             _process_tree: None,
+            _stderr_task: None,
             profile_dir: std::path::PathBuf::new(),
             profile_ephemeral: false,
             _profile_guard: None,
@@ -258,6 +444,26 @@ impl CdpBrowserBackend {
             Arc::clone(&self.browser_closing),
             None,
         ))
+    }
+
+    #[cfg(windows)]
+    fn spawn_stderr_logger(mut stderr: tokio::fs::File) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut buffer = [0_u8; 8 * 1024];
+            loop {
+                match stderr.read(&mut buffer).await {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        let chunk = String::from_utf8_lossy(&buffer[..count]);
+                        debug!("browser stderr: {chunk}");
+                    }
+                    Err(error) => {
+                        debug!(%error, "browser stderr reader stopped");
+                        break;
+                    }
+                }
+            }
+        })
     }
 
     /// Poll the owned browser's loopback DevTools endpoint while retaining
@@ -547,6 +753,17 @@ impl BrowserBackend for CdpBrowserBackend {
                     process_tree
                         .terminate_and_wait(std::time::Duration::from_secs(3))
                         .await?;
+                }
+            }
+            if let Some(mut task) = self._stderr_task.take() {
+                if tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    &mut task,
+                )
+                .await
+                .is_err()
+                {
+                    task.abort();
                 }
             }
             let _ = self.client.close_transport().await;

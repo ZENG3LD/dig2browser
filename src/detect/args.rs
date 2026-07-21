@@ -139,6 +139,36 @@ impl LaunchConfig {
         args
     }
 
+    /// Build Chrome/Edge arguments for an inherited ASCIIZ DevTools pipe.
+    ///
+    /// The numeric handles are created and owned by the Windows process
+    /// launcher. They are protected from caller overrides just like the
+    /// loopback debugging endpoint.
+    #[cfg(windows)]
+    pub(crate) fn build_pipe_args(
+        &self,
+        profile_dir: &Path,
+        locale: Option<&str>,
+        browser_read_handle: u32,
+        browser_write_handle: u32,
+    ) -> Vec<String> {
+        let mut args = self.build_args(profile_dir, 0, locale);
+        args.retain(|argument| {
+            let name = argument
+                .split_once('=')
+                .map_or(argument.as_str(), |(name, _)| name);
+            !matches!(
+                name,
+                "--remote-debugging-address" | "--remote-debugging-port"
+            )
+        });
+        args.push("--remote-debugging-pipe".to_owned());
+        args.push(format!(
+            "--remote-debugging-io-pipes={browser_read_handle},{browser_write_handle}"
+        ));
+        args
+    }
+
     /// Find a free TCP port for remote debugging.
     pub fn find_free_port() -> u16 {
         // Try to bind port 0 — OS assigns a free port
@@ -160,6 +190,7 @@ fn is_protected_argument(argument: &str) -> bool {
         "--remote-debugging-address"
             | "--remote-debugging-port"
             | "--remote-debugging-pipe"
+            | "--remote-debugging-io-pipes"
             | "--user-data-dir"
             | "--no-sandbox"
             | "--disable-setuid-sandbox"
@@ -184,6 +215,8 @@ fn sanitized_extra_args(extra_args: &[String]) -> Vec<String> {
                     name.as_str(),
                     "--remote-debugging-address"
                         | "--remote-debugging-port"
+                        | "--remote-debugging-pipe"
+                        | "--remote-debugging-io-pipes"
                         | "--user-data-dir"
                 )
             {
@@ -239,6 +272,10 @@ mod tests {
                 "--user-data-dir=attacker-profile".into(),
                 "--remote-debugging-port".into(),
                 "5555".into(),
+                "--remote-debugging-pipe".into(),
+                "CBOR".into(),
+                "--remote-debugging-io-pipes".into(),
+                "123,456".into(),
                 "--no-sandbox".into(),
                 "--proxy-server=http://127.0.0.1:8080".into(),
             ],
@@ -249,6 +286,8 @@ mod tests {
         assert!(!args.iter().any(|argument| argument.contains("0.0.0.0")));
         assert!(!args.iter().any(|argument| argument.contains("4444")));
         assert!(!args.iter().any(|argument| argument == "5555"));
+        assert!(!args.iter().any(|argument| argument == "CBOR"));
+        assert!(!args.iter().any(|argument| argument == "123,456"));
         assert!(!args
             .iter()
             .any(|argument| argument.contains("attacker-profile")));
@@ -256,5 +295,31 @@ mod tests {
         assert!(args
             .iter()
             .any(|argument| argument == "--proxy-server=http://127.0.0.1:8080"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_launch_owns_inherited_handles_without_tcp_debugging() {
+        let config = LaunchConfig {
+            extra_args: vec![
+                "--remote-debugging-pipe=CBOR".into(),
+                "--remote-debugging-io-pipes=1,2".into(),
+            ],
+            ..LaunchConfig::default()
+        };
+        let args = config.build_pipe_args(Path::new("profile"), None, 123, 456);
+
+        assert!(args.iter().any(|argument| argument == "--remote-debugging-pipe"));
+        assert!(args
+            .iter()
+            .any(|argument| argument == "--remote-debugging-io-pipes=123,456"));
+        assert!(!args
+            .iter()
+            .any(|argument| argument.starts_with("--remote-debugging-address")));
+        assert!(!args
+            .iter()
+            .any(|argument| argument.starts_with("--remote-debugging-port")));
+        assert!(!args.iter().any(|argument| argument.contains("CBOR")));
+        assert!(!args.iter().any(|argument| argument.ends_with("=1,2")));
     }
 }

@@ -1,4 +1,4 @@
-//! CDP WebSocket client for dig2browser.
+//! CDP transport client for dig2browser.
 //!
 //! # Quick start
 //!

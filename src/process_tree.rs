@@ -56,22 +56,27 @@ impl OwnedProcessTree {
         Ok(Self {})
     }
 
-    pub(crate) fn assign(&self, child: &tokio::process::Child) -> io::Result<()> {
-        #[cfg(windows)]
-        {
-            use windows::Win32::Foundation::HANDLE;
-            use windows::Win32::System::JobObjects::AssignProcessToJobObject;
+    #[cfg(windows)]
+    pub(crate) fn assign_raw_handle(
+        &self,
+        raw_handle: *mut std::ffi::c_void,
+    ) -> io::Result<()> {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::JobObjects::AssignProcessToJobObject;
 
-            let raw_handle = child
-                .raw_handle()
-                .ok_or_else(|| io::Error::other("child process handle is unavailable"))?;
-            let process = HANDLE(raw_handle);
-            // SAFETY: both handles are valid for this call. The child remains
-            // owned by the caller and the Job Object remains owned by `self`.
-            unsafe { AssignProcessToJobObject(self.job, process) }
-                .map_err(windows_error)?;
+        if raw_handle.is_null() {
+            return Err(io::Error::other("child process handle is unavailable"));
         }
-        #[cfg(not(windows))]
+        let process = HANDLE(raw_handle);
+        // SAFETY: both handles are valid for this call. The browser process
+        // remains owned by the caller and the Job Object remains owned here.
+        unsafe { AssignProcessToJobObject(self.job, process) }
+            .map_err(windows_error)?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn assign(&self, child: &tokio::process::Child) -> io::Result<()> {
         let _ = child;
         Ok(())
     }

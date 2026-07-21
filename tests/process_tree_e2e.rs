@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use dig2browser::agentic::{BrowserWorker, BrowserWorkerConfig, CapabilitySet};
+use dig2browser::agentic::{
+    BrowserWorker, BrowserWorkerConfig, CapabilitySet, WorkerLifecycle,
+};
 use dig2browser::identity::{
     BrowserBackend, DevicePersona, IdentityClass, IdentityProfile,
 };
@@ -41,7 +43,12 @@ async fn process_tree_child() {
     config.command_timeout = Duration::from_secs(60);
     let worker = BrowserWorker::spawn(identity(&profiles), CapabilitySet::all(), config)
         .expect("spawn child browser worker");
-    worker.wait_until_settled().await.expect("start child Chromium");
+    let snapshot = worker.wait_until_settled().await.expect("start child Chromium");
+    assert_eq!(
+        snapshot.lifecycle,
+        WorkerLifecycle::Ready,
+        "child Chromium degraded during startup: {snapshot:?}"
+    );
     std::fs::write(&ready, std::process::id().to_string()).expect("publish ready marker");
     std::future::pending::<()>().await;
 }

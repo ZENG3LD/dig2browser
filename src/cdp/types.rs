@@ -5,7 +5,7 @@ use tokio::sync::oneshot;
 
 use crate::cdp::error::CdpError;
 
-/// An outbound CDP command sent over the WebSocket.
+/// An outbound CDP command sent over the active transport.
 ///
 /// The `response_tx` channel is excluded from serialization; it is stored in
 /// the pending-requests map while the frame is in-flight.

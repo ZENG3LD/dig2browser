@@ -11,6 +11,7 @@ pub mod identity;
 pub mod agentic;
 pub mod worker_ipc;
 pub mod digest;
+mod browser_process;
 mod process_tree;
 
 // Re-export main types at crate root
