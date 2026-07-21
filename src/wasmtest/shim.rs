@@ -5,7 +5,7 @@ use std::path::Path;
 use super::WasmTestError;
 
 /// The wasm-bindgen schema version this crate is pinned to.
-pub const EXPECTED_SCHEMA: &str = "0.2.114";
+pub const EXPECTED_SCHEMA: &str = "0.2.118";
 
 /// Paths of the generated shim files inside `out_dir`.
 pub struct ShimOutput {
@@ -199,7 +199,7 @@ fn looks_like_semver(s: &str) -> bool {
 
 /// Generate JS + wasm shim files into `out_dir` using `wasm_bindgen_cli_support`.
 ///
-/// # Real `Bindgen` API (confirmed against 0.2.114 source)
+/// # Real `Bindgen` API (confirmed against 0.2.118 source)
 ///
 /// ```text
 /// // All &mut self methods — builder pattern with mutation, not consume-and-return.
@@ -317,8 +317,19 @@ mod tests {
 
     #[test]
     fn looks_like_semver_valid() {
-        assert!(looks_like_semver("0.2.114"));
+        assert!(looks_like_semver(EXPECTED_SCHEMA));
         assert!(looks_like_semver("1.0.0"));
+    }
+
+    #[test]
+    fn expected_schema_matches_cli_support_pin() {
+        let manifest = include_str!("../../Cargo.toml");
+        let expected_pin = format!("wasm-bindgen-cli-support = \"={EXPECTED_SCHEMA}\"");
+
+        assert!(
+            manifest.lines().any(|line| line.trim() == expected_pin),
+            "EXPECTED_SCHEMA {EXPECTED_SCHEMA} must match the exact wasm-bindgen-cli-support pin"
+        );
     }
 
     #[test]

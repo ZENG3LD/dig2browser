@@ -69,7 +69,7 @@ aes-gcm = "0.10"
 base64 = "0.22"
 futures = "0.3"
 dashmap = "6"
-wasm-bindgen-cli-support = "=0.2.114"
+wasm-bindgen-cli-support = "=0.2.118"
 tiny_http = "0.12"
 zip = "2"
 

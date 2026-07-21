@@ -109,7 +109,7 @@ pub fn render_run_js(
 document.getElementById('output').textContent = "Loading Wasm module...";
 
 async function main(test) {{
-    const wasm = await init('./{stem}_bg.wasm');
+    const wasm = await init({{ module_or_path: './{stem}_bg.wasm' }});
 
     const cx = new Context();
     window.on_console_debug = __wbgtest_console_debug;
@@ -268,6 +268,20 @@ mod tests {
         assert!(
             js.contains("cx.filtered_count(3)"),
             "expected filtered_count(3) in run.js"
+        );
+    }
+
+    #[test]
+    fn render_run_js_uses_object_init_signature() {
+        let js = render_run_js("my_crate", &[], false, 0);
+
+        assert!(
+            js.contains("init({ module_or_path: './my_crate_bg.wasm' })"),
+            "expected the wasm-bindgen 0.2.118 object init signature"
+        );
+        assert!(
+            !js.contains("init('./my_crate_bg.wasm')"),
+            "deprecated positional init signature must not be emitted"
         );
     }
 

@@ -462,7 +462,7 @@ Each run uses an **isolated temporary browser profile** (e.g. `%TEMP%\dig2wasm-p
 | 1 | Test failures, parse error, or driver/browser error |
 | 124 | Global timeout elapsed **or** stall watchdog fired (no test progress for `DIG2_WASM_PER_TEST_TIMEOUT` seconds) **or** establishment timeout (`DIG2_WASM_ESTABLISH_TIMEOUT`) exceeded during `new_session`/`goto` |
 
-> **Version coupling:** the test crate's `wasm-bindgen` version must match the `wasm-bindgen-cli-support` version dig2browser is built against (currently **0.2.114**). A mismatch yields a clear "schema version mismatch" error — pin `wasm-bindgen = "=0.2.114"` in the test crate.
+> **Version coupling:** the test crate's `wasm-bindgen` version must match the `wasm-bindgen-cli-support` version dig2browser is built against (currently **0.2.118**). A mismatch yields a clear "schema version mismatch" error — pin `wasm-bindgen = "=0.2.118"` in the test crate.
 
 ## Process Lifecycle
 
