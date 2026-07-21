@@ -4,16 +4,23 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+#[cfg(feature = "tls-test-hooks")]
+use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+#[cfg(feature = "tls-test-hooks")]
+use std::time::Instant;
 
+#[cfg(feature = "tls-test-hooks")]
+use dig2browser::identity::ProfileOwnershipGuard;
 use dig2browser_client::{
     BrowserPersona, ClientConfig, ClientError, CollectionTask, ResponseStatus,
     RuntimeFeature, RuntimeKind, RuntimeRequirements, RuntimeSelector, StationClient,
     TaskCapturePolicy, TaskReply, TaskRuntimeContract, TaskStep,
 };
+use dig2browser_station::ProfilesRootOwnership;
 use tokio::io::AsyncReadExt;
 
 type ControlledResponse = (&'static str, Vec<(String, String)>, String);
@@ -166,6 +173,211 @@ impl Drop for ControlledOrigin {
     }
 }
 
+#[cfg(feature = "tls-test-hooks")]
+const HTTPS_PAGE: &str = "<!doctype html><html><head><title>secure fixture</title><link rel=\"icon\" href=\"data:,\"></head><body><main id=\"secure\">pinned transport</main></body></html>";
+
+#[cfg(feature = "tls-test-hooks")]
+struct ControlledHttpsOrigin {
+    address: SocketAddr,
+    directory: PathBuf,
+    certificate_spki: String,
+    child: Child,
+}
+
+#[cfg(feature = "tls-test-hooks")]
+impl ControlledHttpsOrigin {
+    fn start(base: &Path) -> Self {
+        let directory = base.join("https-fixture");
+        std::fs::create_dir_all(&directory).expect("create HTTPS fixture directory");
+        let openssl = openssl_executable();
+        let key = directory.join("key.pem");
+        let certificate = directory.join("certificate.pem");
+        let public_key = directory.join("public-key.pem");
+        let public_key_der = directory.join("public-key.der");
+        let public_key_sha256 = directory.join("public-key.sha256");
+        let public_key_sha256_base64 = directory.join("public-key.sha256.base64");
+        run_openssl(
+            &openssl,
+            &[
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-sha256",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=127.0.0.1",
+                "-addext",
+                "subjectAltName=IP:127.0.0.1",
+                "-keyout",
+                key.to_str().expect("UTF-8 HTTPS key path"),
+                "-out",
+                certificate.to_str().expect("UTF-8 HTTPS certificate path"),
+            ],
+        );
+        run_openssl(
+            &openssl,
+            &[
+                "x509",
+                "-in",
+                certificate.to_str().expect("UTF-8 HTTPS certificate path"),
+                "-pubkey",
+                "-noout",
+                "-out",
+                public_key.to_str().expect("UTF-8 HTTPS public-key path"),
+            ],
+        );
+        run_openssl(
+            &openssl,
+            &[
+                "pkey",
+                "-pubin",
+                "-in",
+                public_key.to_str().expect("UTF-8 HTTPS public-key path"),
+                "-outform",
+                "DER",
+                "-out",
+                public_key_der.to_str().expect("UTF-8 HTTPS DER path"),
+            ],
+        );
+        run_openssl(
+            &openssl,
+            &[
+                "dgst",
+                "-sha256",
+                "-binary",
+                "-out",
+                public_key_sha256.to_str().expect("UTF-8 HTTPS digest path"),
+                public_key_der.to_str().expect("UTF-8 HTTPS DER path"),
+            ],
+        );
+        run_openssl(
+            &openssl,
+            &[
+                "base64",
+                "-A",
+                "-in",
+                public_key_sha256.to_str().expect("UTF-8 HTTPS digest path"),
+                "-out",
+                public_key_sha256_base64
+                    .to_str()
+                    .expect("UTF-8 HTTPS base64 path"),
+            ],
+        );
+        let certificate_spki = std::fs::read_to_string(&public_key_sha256_base64)
+            .expect("read HTTPS SPKI SHA-256 base64");
+        assert_eq!(certificate_spki.len(), 44, "canonical SHA-256 base64 length");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{}",
+            HTTPS_PAGE.len(),
+            HTTPS_PAGE
+        );
+        std::fs::write(directory.join("secure"), response)
+            .expect("write controlled HTTPS response");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve HTTPS fixture port");
+        let address = listener.local_addr().expect("HTTPS fixture address");
+        drop(listener);
+        let child = Command::new(&openssl)
+            .args([
+                "s_server",
+                "-4",
+                "-accept",
+                &format!("127.0.0.1:{}", address.port()),
+                "-cert",
+                certificate.to_str().expect("UTF-8 HTTPS certificate path"),
+                "-key",
+                key.to_str().expect("UTF-8 HTTPS key path"),
+                "-HTTP",
+                "-quiet",
+            ])
+            .current_dir(&directory)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start controlled OpenSSL HTTPS fixture");
+        let mut fixture = Self {
+            address,
+            directory,
+            certificate_spki,
+            child,
+        };
+        fixture.wait_until_ready();
+        fixture
+    }
+
+    fn origin(&self) -> String {
+        format!("https://{}", self.address)
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.origin())
+    }
+
+    fn certificate_spki(&self) -> &str {
+        &self.certificate_spki
+    }
+
+    fn wait_until_ready(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if self.child.try_wait().expect("poll HTTPS fixture").is_some() {
+                panic!("OpenSSL HTTPS fixture exited before accepting connections");
+            }
+            if let Ok(stream) = TcpStream::connect_timeout(
+                &self.address,
+                Duration::from_millis(100),
+            ) {
+                drop(stream);
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "OpenSSL HTTPS fixture did not bind its controlled listener"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+}
+
+#[cfg(feature = "tls-test-hooks")]
+impl Drop for ControlledHttpsOrigin {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+#[cfg(feature = "tls-test-hooks")]
+fn openssl_executable() -> PathBuf {
+    if let Some(path) = std::env::var_os("DIG2BROWSER_OPENSSL") {
+        return PathBuf::from(path);
+    }
+    let git_openssl = PathBuf::from(r"C:\Program Files\Git\mingw64\bin\openssl.exe");
+    if git_openssl.is_file() {
+        return git_openssl;
+    }
+    PathBuf::from("openssl")
+}
+
+#[cfg(feature = "tls-test-hooks")]
+fn run_openssl(executable: &Path, arguments: &[&str]) {
+    let output = Command::new(executable)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run OpenSSL fixture command");
+    assert!(
+        output.status.success(),
+        "OpenSSL fixture command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn serve_request(
     stream: &mut TcpStream,
     response: &Responder,
@@ -214,6 +426,129 @@ fn serve_request(
         body.len()
     )?;
     stream.write_all(body.as_bytes())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stationd_remote_shutdown_at_connection_capacity_exits_e2e() {
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-capacity-shutdown-{unique}");
+    let profiles = e2e_temp_base().join(format!("dig2browser-capacity-shutdown-{unique}"));
+    std::fs::create_dir_all(&profiles).expect("create capacity-shutdown profiles root");
+    let mut daemon = spawn_capacity_shutdown_stationd(&pipe_name, &profiles);
+    let client = connect(&pipe_name).await;
+
+    client
+        .shutdown()
+        .await
+        .expect("request shutdown while the only connection slot is occupied");
+    let status = tokio::time::timeout(Duration::from_secs(15), daemon.wait())
+        .await
+        .expect("station did not exit after capacity-bound remote shutdown")
+        .expect("wait for capacity-shutdown station");
+    assert!(status.success(), "capacity-shutdown station failed: {status}");
+    let (stdout, stderr) = read_child_output(&mut daemon).await;
+    assert!(stderr.is_empty(), "capacity-shutdown station wrote stderr: {stderr}");
+    let report: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("parse capacity-shutdown station report");
+    assert_eq!(report["outcome"], "clean", "unclean station report: {stdout}");
+    assert_eq!(report["stop_reason"], "remote_request");
+    assert_eq!(report["accepted_connections"], 1);
+    assert_eq!(report["completed_connections"], 1);
+    assert_eq!(report["aborted_connections"], 0);
+
+    let released_profiles = ProfilesRootOwnership::acquire(&profiles)
+        .expect("capacity-shutdown station releases profiles-root ownership");
+    drop(released_profiles);
+    remove_tree(&profiles).await;
+}
+
+#[cfg(feature = "tls-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stationd_rejects_malformed_test_certificate_error_spki_before_profile_acquisition() {
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-invalid-spki-{unique}");
+    let profiles = e2e_temp_base().join(format!("dig2browser-invalid-spki-{unique}"));
+    assert!(!profiles.exists(), "invalid-config profile fixture must start absent");
+    let mut daemon = spawn_https_stationd(
+        &pipe_name,
+        &profiles,
+        "https://127.0.0.1:443",
+        Some("AA=="),
+    );
+    let status = tokio::time::timeout(Duration::from_secs(15), daemon.wait())
+        .await
+        .expect("invalid SPKI station exit timeout")
+        .expect("wait for invalid SPKI station");
+    assert!(!status.success(), "invalid SPKI station unexpectedly started");
+    let (stdout, stderr) = read_child_output(&mut daemon).await;
+    assert!(stdout.is_empty(), "invalid SPKI station wrote stdout: {stdout}");
+    assert!(
+        stderr.contains("\"error_class\":\"invalid_config\""),
+        "invalid SPKI station returned wrong error: {stderr}"
+    );
+    assert!(
+        !profiles.exists(),
+        "invalid SPKI configuration acquired or created the profiles root"
+    );
+}
+
+#[cfg(feature = "tls-test-hooks")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires installed Chrome, OpenSSL, and --features tls-test-hooks"]
+async fn stationd_chrome_spki_certificate_exception_reaches_https_through_owned_connect_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let unique = uuid::Uuid::new_v4();
+    let base = e2e_temp_base().join(format!("dig2browser-https-spki-{unique}"));
+    std::fs::create_dir_all(&base).expect("create HTTPS SPKI E2E root");
+    let https = ControlledHttpsOrigin::start(&base);
+
+    let pinned_pipe = format!("dig2browser-https-pinned-{unique}");
+    let pinned_profiles = base.join("profiles-pinned");
+    std::fs::create_dir_all(&pinned_profiles).expect("create pinned profiles root");
+    let mut pinned_daemon = spawn_https_stationd(
+        &pinned_pipe,
+        &pinned_profiles,
+        &https.origin(),
+        Some(https.certificate_spki()),
+    );
+    let pinned_client = connect(&pinned_pipe).await;
+    let requested_url = https.url("/secure");
+    let result = pinned_client
+        .run_task("https-pinned", https_task(requested_url.clone()))
+        .await
+        .expect("exact SPKI certificate exception must allow the controlled HTTPS document");
+    assert_eq!(result.replies().len(), 3);
+    assert_eq!(result.replies()[0], TaskReply::Acknowledged);
+    assert_eq!(
+        result.replies()[1],
+        TaskReply::Text("pinned transport".to_owned())
+    );
+    let TaskReply::Capture(capture) = &result.replies()[2] else {
+        panic!("pinned HTTPS task did not return an HTML capture");
+    };
+    assert_eq!(capture.requested_url, requested_url);
+    assert_eq!(capture.final_url, requested_url);
+    assert_eq!(capture.http_status, Some(200));
+    assert_eq!(capture.title, "secure fixture");
+    assert!(
+        String::from_utf8_lossy(&capture.html).contains("pinned transport"),
+        "HTML capture did not contain the controlled HTTPS marker"
+    );
+    pinned_client
+        .shutdown()
+        .await
+        .expect("request clean pinned station shutdown");
+    drop(pinned_client);
+    assert_https_clean_exit(&mut pinned_daemon).await;
+    let released_profiles = ProfilesRootOwnership::acquire(&pinned_profiles)
+        .expect("clean HTTPS station shutdown releases profiles-root ownership");
+    let released_profile = ProfileOwnershipGuard::acquire(pinned_profiles.join("https-pinned"))
+        .expect("clean HTTPS station shutdown releases the browser profile");
+    drop(released_profile);
+    drop(released_profiles);
+    drop(https);
+
+    remove_tree(&base).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -453,6 +788,29 @@ fn capture_task(runtime: RuntimeKind, url: String) -> CollectionTask {
     )
 }
 
+#[cfg(feature = "tls-test-hooks")]
+fn https_task(url: String) -> CollectionTask {
+    task(
+        RuntimeKind::Chrome,
+        vec![
+            TaskStep::Navigate { url },
+            TaskStep::ReadSelectorText {
+                selector: "#secure".to_owned(),
+            },
+            TaskStep::Capture {
+                policy: TaskCapturePolicy::HtmlOnly,
+            },
+        ],
+        vec![
+            RuntimeFeature::Navigate,
+            RuntimeFeature::DomInspect,
+            RuntimeFeature::CaptureState,
+            RuntimeFeature::CaptureHtml,
+            RuntimeFeature::Lifecycle,
+        ],
+    )
+}
+
 fn popup_task(url: String) -> CollectionTask {
     task(
         RuntimeKind::Chrome,
@@ -574,6 +932,94 @@ fn spawn_stationd(
         .expect("spawn navigation-policy station")
 }
 
+fn spawn_capacity_shutdown_stationd(
+    pipe_name: &str,
+    profiles: &Path,
+) -> tokio::process::Child {
+    let mut command = tokio::process::Command::new(
+        env!("CARGO_BIN_EXE_dig2browser-stationd"),
+    );
+    command.args([
+        "--pipe-name",
+        pipe_name,
+        "--profiles-root",
+        profiles.to_str().expect("profiles path is UTF-8"),
+        "--runtime",
+        "lightweight",
+        "--max-resident",
+        "1",
+        "--max-in-flight",
+        "1",
+        "--max-connections",
+        "1",
+        "--timeout-seconds",
+        "10",
+        "--drain-seconds",
+        "2",
+        "--allow-remote-shutdown",
+    ]);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn capacity-shutdown station")
+}
+
+#[cfg(feature = "tls-test-hooks")]
+fn spawn_https_stationd(
+    pipe_name: &str,
+    profiles: &Path,
+    allowed_origin: &str,
+    certificate_spki: Option<&str>,
+) -> tokio::process::Child {
+    let mut command = tokio::process::Command::new(
+        env!("CARGO_BIN_EXE_dig2browser-stationd"),
+    );
+    command.args([
+        "--pipe-name",
+        pipe_name,
+        "--profiles-root",
+        profiles.to_str().expect("profiles path is UTF-8"),
+        "--runtime",
+        "chrome",
+        "--allow-origin",
+        allowed_origin,
+        "--allow-private-peer",
+        "127.0.0.1",
+        "--max-resident",
+        "1",
+        "--max-in-flight",
+        "1",
+        "--max-connections",
+        "1",
+        "--timeout-seconds",
+        "10",
+        "--drain-seconds",
+        "2",
+        "--allow-remote-shutdown",
+        "--allow-interactive-tasks",
+    ]);
+    if let Some(certificate_spki) = certificate_spki {
+        command.args([
+            "--test-chrome-certificate-error-spki-sha256",
+            certificate_spki,
+        ]);
+    }
+    command
+        .env("HTTP_PROXY", "http://127.0.0.1:1")
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("ALL_PROXY", "http://127.0.0.1:1")
+        .env("NO_PROXY", "*")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn HTTPS policy station")
+}
+
 async fn connect(pipe_name: &str) -> StationClient {
     StationClient::connect(
         ClientConfig::new(
@@ -610,6 +1056,53 @@ async fn assert_clean_exit(daemon: &mut tokio::process::Child) {
             .is_some_and(|count| count >= 1),
         "policy station did not report a denied egress connection: {stdout}"
     );
+}
+
+#[cfg(feature = "tls-test-hooks")]
+async fn assert_https_clean_exit(daemon: &mut tokio::process::Child) {
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("HTTPS policy station exit timeout")
+        .expect("wait for HTTPS policy station");
+    assert!(status.success(), "HTTPS policy station failed: {status}");
+    let (stdout, stderr) = read_child_output(daemon).await;
+    assert!(stderr.is_empty(), "HTTPS policy station wrote stderr: {stderr}");
+    let report: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("parse HTTPS station exit report");
+    assert_eq!(report["outcome"], "clean", "unclean station report: {stdout}");
+    assert_eq!(report["stop_reason"], "remote_request");
+    assert_eq!(report["stopped_workers"], 1);
+    assert!(
+        report["egress_accepted_connections"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "HTTPS station did not own a CONNECT tunnel: {stdout}"
+    );
+    assert!(
+        report["egress_completed_connections"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "HTTPS station did not complete a CONNECT tunnel: {stdout}"
+    );
+    let accepted = report["egress_accepted_connections"]
+        .as_u64()
+        .expect("accepted egress count");
+    let classified = [
+        "egress_completed_connections",
+        "egress_denied_connections",
+        "egress_invalid_connections",
+        "egress_failed_connections",
+        "egress_timed_out_connections",
+        "egress_aborted_connections",
+    ]
+    .iter()
+    .map(|counter| report[*counter].as_u64().expect("classified egress count"))
+    .sum::<u64>();
+    assert_eq!(accepted, classified, "unaccounted egress connection: {stdout}");
+    for counter in ["egress_failed_connections", "egress_timed_out_connections"] {
+        assert_eq!(report[counter], 0, "dirty {counter} counter: {stdout}");
+    }
+    assert_eq!(report["egress_drain_timed_out"], false);
 }
 
 async fn read_child_output(child: &mut tokio::process::Child) -> (String, String) {

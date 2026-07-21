@@ -254,8 +254,11 @@ async fn run_actor(
     }
     snapshots.send_replace(snapshot.clone());
 
+    let mut shutdown_attempted = false;
     while let Some(envelope) = commands.recv().await {
         let is_shutdown = matches!(envelope.command, AgentCommand::Shutdown);
+        shutdown_attempted |= is_shutdown
+            && capabilities.contains(envelope.command.required_capability());
         let result = match tokio::time::timeout(
             command_timeout,
             handle_command(
@@ -284,10 +287,12 @@ async fn run_actor(
     if snapshot.lifecycle != WorkerLifecycle::Stopped {
         snapshot.lifecycle = WorkerLifecycle::ShuttingDown;
         snapshots.send_replace(snapshot.clone());
-        match tokio::time::timeout(command_timeout, runtime.close()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => snapshot.last_failure = Some(error.kind()),
-            Err(_) => snapshot.last_failure = Some(RuntimeFailureKind::Timeout),
+        if !shutdown_attempted {
+            match tokio::time::timeout(command_timeout, runtime.close()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => snapshot.last_failure = Some(error.kind()),
+                Err(_) => snapshot.last_failure = Some(RuntimeFailureKind::Timeout),
+            }
         }
         snapshot.lifecycle = WorkerLifecycle::Stopped;
         snapshot.current_origin = None;
@@ -641,6 +646,7 @@ mod tests {
         fail_navigation: bool,
         restart_needed: bool,
         navigation_delay: Option<Duration>,
+        close_delay: Option<Duration>,
         missing_selector: bool,
     }
 
@@ -662,8 +668,17 @@ mod tests {
         }
 
         fn close(&mut self) -> BoxFuture<'_, RuntimeResult<()>> {
-            self.state.lock().unwrap().closes += 1;
-            Box::pin(async { Ok(()) })
+            let close_delay = {
+                let mut state = self.state.lock().unwrap();
+                state.closes += 1;
+                state.close_delay
+            };
+            Box::pin(async move {
+                if let Some(delay) = close_delay {
+                    tokio::time::sleep(delay).await;
+                }
+                Ok(())
+            })
         }
 
         fn needs_restart(&self) -> bool {
@@ -989,5 +1004,61 @@ mod tests {
         assert_eq!(snapshot.lifecycle, WorkerLifecycle::Degraded);
         assert_eq!(snapshot.last_failure, Some(RuntimeFailureKind::Timeout));
         worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn timed_out_shutdown_attempts_runtime_close_only_once_and_stops_actor() {
+        let command_timeout = Duration::from_millis(100);
+        let state = Arc::new(Mutex::new(FakeState {
+            close_delay: Some(Duration::from_secs(60)),
+            ..FakeState::default()
+        }));
+        let worker = BrowserWorker::spawn_with_runtime_and_timeout(
+            identity(),
+            capabilities(),
+            4,
+            command_timeout,
+            FakeRuntime {
+                state: Arc::clone(&state),
+            },
+        )
+        .unwrap();
+        worker.wait_until_settled().await.unwrap();
+
+        let error = worker.shutdown().await.unwrap_err();
+
+        assert_eq!(error, WorkerError::CommandTimeout(command_timeout));
+        tokio::time::timeout(Duration::from_secs(1), worker.wait_stopped())
+            .await
+            .expect("worker actor did not stop after timed-out shutdown")
+            .expect("worker actor stopped without publishing completion");
+        let snapshot = worker.snapshot();
+        assert_eq!(snapshot.lifecycle, WorkerLifecycle::Stopped);
+        assert_eq!(snapshot.last_failure, Some(RuntimeFailureKind::Timeout));
+        assert_eq!(state.lock().unwrap().closes, 1);
+    }
+
+    #[tokio::test]
+    async fn capability_denied_shutdown_still_closes_runtime_once() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let worker = BrowserWorker::spawn_with_runtime(
+            identity(),
+            CapabilitySet::new([]).unwrap(),
+            4,
+            FakeRuntime {
+                state: Arc::clone(&state),
+            },
+        )
+        .unwrap();
+        worker.wait_until_settled().await.unwrap();
+
+        let error = worker.shutdown().await.unwrap_err();
+
+        assert_eq!(
+            error,
+            WorkerError::CapabilityDenied(Capability::L3(L3Capability::Lifecycle))
+        );
+        assert_eq!(worker.snapshot().lifecycle, WorkerLifecycle::Stopped);
+        assert_eq!(state.lock().unwrap().closes, 1);
     }
 }

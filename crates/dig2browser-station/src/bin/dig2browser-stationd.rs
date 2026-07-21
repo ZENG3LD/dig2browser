@@ -7,6 +7,8 @@ use std::process::ExitCode;
 #[cfg(windows)]
 use std::time::Duration;
 
+#[cfg(all(windows, feature = "tls-test-hooks"))]
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 #[cfg(windows)]
 use clap::{Parser, ValueEnum};
 #[cfg(windows)]
@@ -84,6 +86,13 @@ struct Cli {
         help = "Allow one exact non-global peer IP only for its matching IP-literal origin"
     )]
     allowed_private_peers: Vec<IpAddr>,
+    #[cfg(feature = "tls-test-hooks")]
+    #[arg(
+        long = "test-chrome-certificate-error-spki-sha256",
+        value_name = "BASE64_SHA256",
+        help = "Test-only Chrome certificate-error exception for one exact SPKI SHA-256; requires an exact HTTPS origin policy"
+    )]
+    test_chrome_certificate_error_spki_sha256: Option<String>,
     #[arg(long, default_value_t = 64)]
     max_connections: usize,
     #[arg(long, default_value_t = 90)]
@@ -135,7 +144,6 @@ async fn main() -> ExitCode {
 
 #[cfg(windows)]
 async fn run(cli: Cli) -> Result<DaemonReport, DaemonError> {
-    let profiles_owner = ProfilesRootOwnership::acquire(&cli.profiles_root)?;
     let navigation_policy = if cli.allowed_origins.is_empty() {
         NavigationPolicy::default()
     } else {
@@ -144,6 +152,13 @@ async fn run(cli: Cli) -> Result<DaemonReport, DaemonError> {
     if !navigation_policy.is_exact() && !cli.allowed_private_peers.is_empty() {
         return Err(DaemonError::PrivatePeersRequireExactPolicy);
     }
+    #[cfg(feature = "tls-test-hooks")]
+    let test_chrome_certificate_error_argument = test_chrome_certificate_error_launch_argument(
+        cli.test_chrome_certificate_error_spki_sha256.as_deref(),
+        cli.runtime,
+        &navigation_policy,
+    )?;
+    let profiles_owner = ProfilesRootOwnership::acquire(&cli.profiles_root)?;
     let egress_proxy = if navigation_policy.is_exact() {
         let peer_policy =
             EgressPeerPolicy::with_exact_exceptions(cli.allowed_private_peers)?;
@@ -158,6 +173,14 @@ async fn run(cli: Cli) -> Result<DaemonReport, DaemonError> {
     let worker = BrowserWorkerConfig {
         command_timeout,
         ..BrowserWorkerConfig::default()
+    };
+    #[cfg(feature = "tls-test-hooks")]
+    let worker = {
+        let mut worker = worker;
+        if let Some(argument) = test_chrome_certificate_error_argument {
+            worker.launch.extra_args.push(argument);
+        }
+        worker
     };
     let station_config = StationConfig::new(
         profiles_owner.root(),
@@ -238,6 +261,52 @@ async fn run(cli: Cli) -> Result<DaemonReport, DaemonError> {
     })
 }
 
+#[cfg(all(windows, feature = "tls-test-hooks"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TestChromeCertificateErrorSpkiSha256(String);
+
+#[cfg(all(windows, feature = "tls-test-hooks"))]
+impl TestChromeCertificateErrorSpkiSha256 {
+    fn parse(value: &str) -> Result<Self, TestChromeCertificateErrorSpkiSha256Error> {
+        let decoded = BASE64_STANDARD
+            .decode(value)
+            .map_err(|_| TestChromeCertificateErrorSpkiSha256Error::InvalidBase64)?;
+        if decoded.len() != 32 {
+            return Err(TestChromeCertificateErrorSpkiSha256Error::WrongDigestLength);
+        }
+        if BASE64_STANDARD.encode(decoded) != value {
+            return Err(TestChromeCertificateErrorSpkiSha256Error::NonCanonicalBase64);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    fn launch_argument(&self) -> String {
+        format!("--ignore-certificate-errors-spki-list={}", self.0)
+    }
+}
+
+#[cfg(all(windows, feature = "tls-test-hooks"))]
+fn test_chrome_certificate_error_launch_argument(
+    value: Option<&str>,
+    runtime: RuntimeArg,
+    navigation_policy: &NavigationPolicy,
+) -> Result<Option<String>, DaemonError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let exception = TestChromeCertificateErrorSpkiSha256::parse(value)?;
+    if !matches!(runtime, RuntimeArg::Chrome)
+        || !navigation_policy.is_exact()
+        || navigation_policy
+            .allowed_origins()
+            .iter()
+            .any(|origin| !origin.starts_with("https://"))
+    {
+        return Err(DaemonError::TestChromeCertificateErrorScope);
+    }
+    Ok(Some(exception.launch_argument()))
+}
+
 #[cfg(windows)]
 fn direct_route_registry(
     references: &[String],
@@ -293,6 +362,17 @@ fn print_report(report: DaemonReport) {
     );
 }
 
+#[cfg(all(windows, feature = "tls-test-hooks"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+enum TestChromeCertificateErrorSpkiSha256Error {
+    #[error("test Chrome certificate-error SPKI digest is not canonical base64")]
+    InvalidBase64,
+    #[error("test Chrome certificate-error SPKI digest must decode to exactly 32 bytes")]
+    WrongDigestLength,
+    #[error("test Chrome certificate-error SPKI digest is not canonical base64")]
+    NonCanonicalBase64,
+}
+
 #[cfg(windows)]
 #[derive(Debug, thiserror::Error)]
 enum DaemonError {
@@ -304,6 +384,12 @@ enum DaemonError {
     NoDirectRoutes,
     #[error("private peer exceptions require an exact-origin policy")]
     PrivatePeersRequireExactPolicy,
+    #[cfg(feature = "tls-test-hooks")]
+    #[error("test Chrome certificate-error SPKI exception requires exact Chrome and an exact HTTPS-only origin policy")]
+    TestChromeCertificateErrorScope,
+    #[cfg(feature = "tls-test-hooks")]
+    #[error(transparent)]
+    TestChromeCertificateErrorSpki(#[from] TestChromeCertificateErrorSpkiSha256Error),
     #[error(transparent)]
     RouteRef(#[from] RouteRefError),
     #[error(transparent)]
@@ -330,6 +416,9 @@ impl DaemonError {
         match self {
             Self::ProfilesRoot(ProfilesRootError::AlreadyOwned) => "profiles_root_owned",
             Self::ProfilesRoot(_) => "profiles_root_unavailable",
+            #[cfg(feature = "tls-test-hooks")]
+            Self::TestChromeCertificateErrorScope
+            | Self::TestChromeCertificateErrorSpki(_) => "invalid_config",
             Self::StationConfig(_)
             | Self::NoDirectRoutes
             | Self::PrivatePeersRequireExactPolicy
@@ -387,6 +476,62 @@ impl DaemonError {
             )) => "crawl_corrupt",
             Self::Server(ServerError::Crawl(_)) => "crawl_root_unavailable",
             Self::Server(ServerError::Station(_)) => "station_shutdown_failure",
+        }
+    }
+}
+
+#[cfg(all(test, windows, feature = "tls-test-hooks"))]
+mod tests {
+    use super::*;
+
+    const ZERO_SHA256_BASE64: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    #[test]
+    fn test_chrome_certificate_error_spki_requires_canonical_sha256_base64() {
+        assert_eq!(
+            TestChromeCertificateErrorSpkiSha256::parse(ZERO_SHA256_BASE64)
+                .expect("canonical 32-byte pin")
+                .launch_argument(),
+            format!("--ignore-certificate-errors-spki-list={ZERO_SHA256_BASE64}")
+        );
+        assert_eq!(
+            TestChromeCertificateErrorSpkiSha256::parse("AA=="),
+            Err(TestChromeCertificateErrorSpkiSha256Error::WrongDigestLength)
+        );
+        assert_eq!(
+            TestChromeCertificateErrorSpkiSha256::parse(
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            ),
+            Err(TestChromeCertificateErrorSpkiSha256Error::InvalidBase64)
+        );
+    }
+
+    #[test]
+    fn test_chrome_certificate_error_spki_is_scoped_to_exact_chrome_https_policy() {
+        let https = NavigationPolicy::exact_origins(["https://127.0.0.1:8443"])
+            .expect("exact HTTPS policy");
+        assert!(test_chrome_certificate_error_launch_argument(
+            Some(ZERO_SHA256_BASE64),
+            RuntimeArg::Chrome,
+            &https,
+        )
+        .expect("valid scoped pin")
+        .is_some());
+
+        let http = NavigationPolicy::exact_origins(["http://127.0.0.1:8080"])
+            .expect("exact HTTP policy");
+        for (runtime, policy) in [
+            (RuntimeArg::Edge, &https),
+            (RuntimeArg::Auto, &https),
+            (RuntimeArg::Chrome, &http),
+        ] {
+            let error = test_chrome_certificate_error_launch_argument(
+                Some(ZERO_SHA256_BASE64),
+                runtime,
+                policy,
+            )
+            .expect_err("mis-scoped pin must fail");
+            assert_eq!(error.class(), "invalid_config");
         }
     }
 }

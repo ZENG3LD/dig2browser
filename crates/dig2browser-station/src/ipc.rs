@@ -427,7 +427,7 @@ async fn run_windows_server(
                 break;
             }
         }
-        if *shutdown.borrow() {
+        if *shutdown.borrow() || remote_stop {
             break;
         }
 

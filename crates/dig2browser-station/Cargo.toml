@@ -12,8 +12,10 @@ path = "src/lib.rs"
 [features]
 default = []
 crawler-test-hooks = []
+tls-test-hooks = ["dep:base64"]
 
 [dependencies]
+base64 = { version = "0.22", optional = true }
 clap = { version = "4", features = ["derive"] }
 dig2browser = { path = "../.." }
 dig2browser-client = { path = "../dig2browser-client" }

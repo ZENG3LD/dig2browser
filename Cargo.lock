@@ -626,6 +626,7 @@ dependencies = [
 name = "dig2browser-station"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
  "dig2browser",
  "dig2browser-client",
