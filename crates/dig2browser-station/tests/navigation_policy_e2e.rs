@@ -1,7 +1,7 @@
 #![cfg(windows)]
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 #[cfg(feature = "tls-test-hooks")]
@@ -13,7 +13,6 @@ use std::time::Duration;
 #[cfg(feature = "tls-test-hooks")]
 use std::time::Instant;
 
-#[cfg(feature = "tls-test-hooks")]
 use dig2browser::identity::ProfileOwnershipGuard;
 use dig2browser_client::{
     BrowserPersona, ClientConfig, ClientError, CollectionTask, ResponseStatus,
@@ -102,6 +101,15 @@ impl ControlledOrigin {
         }))
     }
 
+    fn webrtc_probe(stun_address: SocketAddr) -> Self {
+        let page = r#"<!doctype html><html><head><title>WebRTC containment fixture</title><link rel="icon" href="data:,"></head><body><main id="webrtc-state">pending</main><script>(async()=>{const state=document.querySelector('#webrtc-state');if(typeof RTCPeerConnection!=='function'){state.textContent='api-missing';return;}const peer=new RTCPeerConnection({iceServers:[{urls:'stun:__STUN_ADDRESS__'}]});window.__dig2browserWebRtcProbe=peer;peer.createDataChannel('probe');try{const offer=await peer.createOffer();await peer.setLocalDescription(offer);state.textContent='ice-attempted:'+peer.iceGatheringState;}catch(error){state.textContent='ice-error:'+error.name;}})();</script></body></html>"#
+            .replace("__STUN_ADDRESS__", &stun_address.to_string());
+        Self::start_on("127.0.0.1", Arc::new(move |path| match path {
+            "/webrtc-probe" => ("200 OK", Vec::new(), page.clone()),
+            _ => ("404 Not Found", Vec::new(), String::new()),
+        }))
+    }
+
     fn start_on(bind_ip: &str, response: Responder) -> Self {
         let listener = TcpListener::bind((bind_ip, 0))
             .expect("bind navigation-policy controlled origin");
@@ -160,6 +168,126 @@ impl ControlledOrigin {
             .iter()
             .filter(|path| path.as_str() == expected)
             .count()
+    }
+}
+
+struct ControlledUdpReceiver {
+    address: SocketAddr,
+    datagrams: Arc<AtomicUsize>,
+    stun_datagrams: Arc<AtomicUsize>,
+    stopping: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl ControlledUdpReceiver {
+    fn start() -> Self {
+        let route_probe = UdpSocket::bind("0.0.0.0:0")
+            .expect("bind local-interface route probe");
+        route_probe
+            .connect("192.0.2.1:9")
+            .expect("select a local IPv4 interface for the STUN receiver");
+        let local_ip = route_probe
+            .local_addr()
+            .expect("read selected local interface")
+            .ip();
+        assert!(
+            !local_ip.is_loopback() && !local_ip.is_unspecified(),
+            "WebRTC egress E2E requires a non-loopback local interface"
+        );
+        let socket = UdpSocket::bind((local_ip, 0))
+            .expect("bind controlled WebRTC STUN receiver");
+        let address = socket.local_addr().expect("read STUN receiver address");
+        socket
+            .set_nonblocking(true)
+            .expect("make STUN receiver nonblocking");
+        let datagrams = Arc::new(AtomicUsize::new(0));
+        let stun_datagrams = Arc::new(AtomicUsize::new(0));
+        let stopping = Arc::new(AtomicBool::new(false));
+        let thread_datagrams = Arc::clone(&datagrams);
+        let thread_stun_datagrams = Arc::clone(&stun_datagrams);
+        let thread_stopping = Arc::clone(&stopping);
+        let thread = thread::spawn(move || {
+            let mut buffer = [0_u8; 2048];
+            while !thread_stopping.load(Ordering::Acquire) {
+                match socket.recv_from(&mut buffer) {
+                    Ok((count, _peer)) => {
+                        thread_datagrams.fetch_add(1, Ordering::AcqRel);
+                        let declared_length = if count >= 4 {
+                            usize::from(u16::from_be_bytes([buffer[2], buffer[3]]))
+                        } else {
+                            0
+                        };
+                        if count >= 20
+                            && u16::from_be_bytes([buffer[0], buffer[1]]) == 0x0001
+                            && declared_length % 4 == 0
+                            && count == 20 + declared_length
+                            && buffer[4..8] == [0x21, 0x12, 0xa4, 0x42]
+                        {
+                            thread_stun_datagrams.fetch_add(1, Ordering::AcqRel);
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("controlled STUN receiver failed: {error}"),
+                }
+            }
+        });
+        Self {
+            address,
+            datagrams,
+            stun_datagrams,
+            stopping,
+            thread: Some(thread),
+        }
+    }
+
+    fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    fn datagram_count(&self) -> usize {
+        self.datagrams.load(Ordering::Acquire)
+    }
+
+    fn stun_datagram_count(&self) -> usize {
+        self.stun_datagrams.load(Ordering::Acquire)
+    }
+
+    fn prove_ready(&self) {
+        let baseline = self.datagram_count();
+        let sender = UdpSocket::bind((self.address.ip(), 0))
+            .expect("bind controlled STUN receiver readiness sender");
+        sender
+            .send_to(b"dig2browser-udp-readiness", self.address)
+            .expect("send STUN receiver readiness datagram");
+        for _ in 0..100 {
+            if self.datagram_count() > baseline {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("controlled STUN receiver did not observe its readiness datagram");
+    }
+
+    async fn wait_for_stun(&self, timeout: Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let count = self.stun_datagram_count();
+            if count > 0 || tokio::time::Instant::now() >= deadline {
+                return count;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+}
+
+impl Drop for ControlledUdpReceiver {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -551,6 +679,81 @@ async fn stationd_chrome_spki_certificate_exception_reaches_https_through_owned_
     remove_tree(&base).await;
 }
 
+// This is a truth regression for the current browser-only mitigation. It must
+// be replaced by a zero-datagram acceptance test when OS-level isolation lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires installed Chrome; proves the known browser-only WebRTC UDP gap"]
+async fn stationd_chrome_exact_route_detects_direct_webrtc_stun_udp_gap_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let unique = uuid::Uuid::new_v4();
+    let profiles = e2e_temp_base().join(format!("dig2browser-webrtc-{unique}"));
+    let traces = e2e_temp_base().join(format!("dig2browser-webrtc-trace-{unique}"));
+    std::fs::create_dir_all(&profiles).expect("create WebRTC profiles root");
+    std::fs::create_dir_all(&traces).expect("create WebRTC trace root");
+    let udp = ControlledUdpReceiver::start();
+    udp.prove_ready();
+    let origin = ControlledOrigin::webrtc_probe(udp.address());
+    let pipe_name = format!("dig2browser-webrtc-{unique}");
+    let allowed_origin = origin.origin();
+    let mut daemon = spawn_stationd(
+        &pipe_name,
+        &profiles,
+        &traces,
+        "chrome",
+        &[&allowed_origin],
+    );
+    let client = connect(&pipe_name).await;
+    let profile_id = "webrtc-browser-containment";
+    let requested_url = origin.url("/webrtc-probe");
+
+    let result = client
+        .run_task(profile_id, webrtc_probe_task(requested_url.clone()))
+        .await
+        .expect("exact Chrome route must complete the controlled WebRTC page task");
+    assert_eq!(result.replies().len(), 4);
+    assert_eq!(result.replies()[0], TaskReply::Acknowledged);
+    assert_eq!(result.replies()[1], TaskReply::Acknowledged);
+    let TaskReply::Text(ice_state) = &result.replies()[2] else {
+        panic!("WebRTC page did not return its ICE state");
+    };
+    assert!(
+        ice_state.starts_with("ice-attempted:"),
+        "WebRTC API/ICE attempt did not actually run: {ice_state}"
+    );
+    let TaskReply::Capture(capture) = &result.replies()[3] else {
+        panic!("WebRTC task did not return an HTML capture");
+    };
+    assert_eq!(capture.requested_url, requested_url);
+    assert_eq!(capture.final_url, requested_url);
+    assert_eq!(capture.http_status, Some(200));
+    assert_eq!(capture.title, "WebRTC containment fixture");
+    assert!(
+        String::from_utf8_lossy(&capture.html).contains("webrtc-state"),
+        "WebRTC capture did not contain the controlled page marker"
+    );
+
+    let stun_datagrams = udp.wait_for_stun(Duration::from_secs(5)).await;
+    assert!(
+        stun_datagrams >= 1,
+        "Chrome no longer emitted direct STUN; replace this gap regression with a zero-datagram containment acceptance test"
+    );
+
+    client.shutdown().await.expect("request clean WebRTC station shutdown");
+    drop(client);
+    assert_webrtc_clean_exit(&mut daemon).await;
+    let released_profiles = ProfilesRootOwnership::acquire(&profiles)
+        .expect("clean WebRTC station shutdown releases profiles-root ownership");
+    let released_profile = ProfileOwnershipGuard::acquire(profiles.join(profile_id))
+        .expect("clean WebRTC station shutdown releases the browser profile");
+    drop(released_profile);
+    drop(released_profiles);
+    drop(origin);
+    drop(udp);
+
+    remove_tree(&profiles).await;
+    remove_tree(&traces).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stationd_enforces_exact_origin_url_policy_across_runtime_targets_e2e() {
     let _serial = e2e_serial_guard().await;
@@ -852,6 +1055,31 @@ fn worker_task(url: String) -> CollectionTask {
     )
 }
 
+fn webrtc_probe_task(url: String) -> CollectionTask {
+    task(
+        RuntimeKind::Chrome,
+        vec![
+            TaskStep::Navigate { url },
+            TaskStep::Wait {
+                duration: Duration::from_millis(1_500),
+            },
+            TaskStep::ReadSelectorText {
+                selector: "#webrtc-state".to_owned(),
+            },
+            TaskStep::Capture {
+                policy: TaskCapturePolicy::HtmlOnly,
+            },
+        ],
+        vec![
+            RuntimeFeature::Navigate,
+            RuntimeFeature::DomInspect,
+            RuntimeFeature::CaptureState,
+            RuntimeFeature::CaptureHtml,
+            RuntimeFeature::Lifecycle,
+        ],
+    )
+}
+
 fn task(
     runtime: RuntimeKind,
     steps: Vec<TaskStep>,
@@ -1056,6 +1284,46 @@ async fn assert_clean_exit(daemon: &mut tokio::process::Child) {
             .is_some_and(|count| count >= 1),
         "policy station did not report a denied egress connection: {stdout}"
     );
+}
+
+async fn assert_webrtc_clean_exit(daemon: &mut tokio::process::Child) {
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("WebRTC policy station exit timeout")
+        .expect("wait for WebRTC policy station");
+    assert!(status.success(), "WebRTC policy station failed: {status}");
+    let (stdout, stderr) = read_child_output(daemon).await;
+    assert!(stderr.is_empty(), "WebRTC policy station wrote stderr: {stderr}");
+    let report: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("parse WebRTC station exit report");
+    assert_eq!(report["outcome"], "clean", "unclean station report: {stdout}");
+    assert_eq!(report["stop_reason"], "remote_request");
+    assert_eq!(report["stopped_workers"], 1);
+    let accepted = report["egress_accepted_connections"]
+        .as_u64()
+        .expect("accepted WebRTC egress count");
+    assert!(accepted >= 1, "WebRTC station accepted no egress connections: {stdout}");
+    let classified: u64 = [
+        "egress_completed_connections",
+        "egress_denied_connections",
+        "egress_invalid_connections",
+        "egress_failed_connections",
+        "egress_timed_out_connections",
+        "egress_aborted_connections",
+    ]
+    .iter()
+    .map(|counter| report[*counter].as_u64().expect("classified WebRTC egress count"))
+    .sum();
+    assert_eq!(accepted, classified, "unaccounted WebRTC egress connection: {stdout}");
+    assert!(
+        report["egress_completed_connections"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "WebRTC station did not complete the controlled HTTP request: {stdout}"
+    );
+    assert_eq!(report["egress_failed_connections"], 0);
+    assert_eq!(report["egress_timed_out_connections"], 0);
+    assert_eq!(report["egress_drain_timed_out"], false);
 }
 
 #[cfg(feature = "tls-test-hooks")]

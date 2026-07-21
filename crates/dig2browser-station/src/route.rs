@@ -164,6 +164,13 @@ fn route_owned_argument(argument: &str) -> bool {
             | "--enable-quic"
             | "--disable-quic"
             | "--force-webrtc-ip-handling-policy"
+            | "--webrtc-ip-handling-policy"
+            | "--load-extension"
+            | "--disable-extensions-except"
+            | "--disable-extensions"
+            | "--enable-extensions"
+            | "--disable-background-networking"
+            | "--enable-background-networking"
     )
 }
 
@@ -251,6 +258,34 @@ mod tests {
             registry.prepare(&RouteRef::host_direct(), &worker),
             Err(RouteRegistryError::ConflictingLaunchArgument)
         );
+    }
+
+    #[test]
+    fn route_policy_rejects_consumer_browser_escape_arguments_in_both_forms() {
+        let registry = RouteRegistry::host_direct_only();
+        for name in [
+            "--load-extension",
+            "--disable-extensions-except",
+            "--disable-extensions",
+            "--enable-extensions",
+            "--disable-background-networking",
+            "--enable-background-networking",
+            "--webrtc-ip-handling-policy",
+        ] {
+            for arguments in [
+                vec![name.to_owned(), "consumer-value".to_owned()],
+                vec![format!("{name}=consumer-value")],
+            ] {
+                let mut worker = BrowserWorkerConfig::default();
+                worker.launch.extra_args.extend(arguments);
+
+                assert_eq!(
+                    registry.prepare(&RouteRef::host_direct(), &worker),
+                    Err(RouteRegistryError::ConflictingLaunchArgument),
+                    "station accepted route-owned launch argument {name}"
+                );
+            }
+        }
     }
 
     #[test]

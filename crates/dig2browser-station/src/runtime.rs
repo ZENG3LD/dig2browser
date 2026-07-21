@@ -29,6 +29,9 @@ pub trait RuntimeFactory: Send + Sync {
         false
     }
 
+    /// Whether HTTP(S) can use the station-owned proxy. This does not claim
+    /// containment for UDP or any other non-HTTP transport. The station records
+    /// its own more precise level when the runtime is registered.
     fn supports_station_egress(&self) -> bool {
         false
     }
@@ -71,10 +74,31 @@ pub trait RuntimeFactory: Send + Sync {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StationEgressSupport {
+    Unsupported,
+    HttpProxy,
+    /// Chromium receives QUIC and WebRTC mitigation switches in addition to
+    /// the HTTP proxy. This is not all-protocol or OS-level containment.
+    HttpProxyWithBrowserUdpMitigation,
+}
+
+impl StationEgressSupport {
+    fn is_supported(self) -> bool {
+        !matches!(self, Self::Unsupported)
+    }
+}
+
+#[derive(Clone)]
+struct RegisteredRuntime {
+    factory: Arc<dyn RuntimeFactory>,
+    station_egress: StationEgressSupport,
+}
+
 /// Station-owned catalog of concrete runtime adapters.
 #[derive(Clone)]
 pub struct RuntimeRegistry {
-    factories: HashMap<RuntimeKind, Arc<dyn RuntimeFactory>>,
+    factories: HashMap<RuntimeKind, RegisteredRuntime>,
     auto_order: Vec<RuntimeKind>,
 }
 
@@ -89,10 +113,18 @@ impl RuntimeRegistry {
     pub fn chromium_defaults() -> Self {
         let mut registry = Self::empty();
         registry
-            .register(ChromiumRuntimeFactory::chrome(), true)
+            .register_with_station_egress(
+                ChromiumRuntimeFactory::chrome(),
+                true,
+                ChromiumRuntimeFactory::station_egress_support(),
+            )
             .expect("built-in Chrome runtime kind must be unique");
         registry
-            .register(ChromiumRuntimeFactory::edge(), true)
+            .register_with_station_egress(
+                ChromiumRuntimeFactory::edge(),
+                true,
+                ChromiumRuntimeFactory::station_egress_support(),
+            )
             .expect("built-in Edge runtime kind must be unique");
         registry
     }
@@ -100,7 +132,11 @@ impl RuntimeRegistry {
     pub fn builtin_defaults() -> Self {
         let mut registry = Self::chromium_defaults();
         registry
-            .register(LightweightRuntimeFactory::new(), false)
+            .register_with_station_egress(
+                LightweightRuntimeFactory::new(),
+                false,
+                LightweightRuntimeFactory::station_egress_support(),
+            )
             .expect("built-in Lightweight runtime kind must be unique");
         registry
     }
@@ -113,11 +149,34 @@ impl RuntimeRegistry {
     where
         F: RuntimeFactory + 'static,
     {
+        let station_egress = if factory.supports_station_egress() {
+            StationEgressSupport::HttpProxy
+        } else {
+            StationEgressSupport::Unsupported
+        };
+        self.register_with_station_egress(factory, include_in_auto, station_egress)
+    }
+
+    fn register_with_station_egress<F>(
+        &mut self,
+        factory: F,
+        include_in_auto: bool,
+        station_egress: StationEgressSupport,
+    ) -> Result<(), RuntimeRegistryError>
+    where
+        F: RuntimeFactory + 'static,
+    {
         let kind = factory.descriptor().kind();
         if self.factories.contains_key(&kind) {
             return Err(RuntimeRegistryError::DuplicateRuntime(kind));
         }
-        self.factories.insert(kind, Arc::new(factory));
+        self.factories.insert(
+            kind,
+            RegisteredRuntime {
+                factory: Arc::new(factory),
+                station_egress,
+            },
+        );
         if include_in_auto {
             self.auto_order.push(kind);
         }
@@ -173,18 +232,22 @@ impl RuntimeRegistry {
         kind: RuntimeKind,
         requirement_sets: &[&RuntimeRequirements],
     ) -> Result<PreparedRuntime, RuntimeRegistryError> {
-        let factory = Arc::clone(
-            self.factories
-                .get(&kind)
-                .ok_or(RuntimeRegistryError::NotRegistered(kind))?,
-        );
+        let registration = self
+            .factories
+            .get(&kind)
+            .ok_or(RuntimeRegistryError::NotRegistered(kind))?;
+        let factory = Arc::clone(&registration.factory);
         let resolved = factory
             .descriptor()
             .negotiate_all(requirement_sets, None)
             .map_err(|source| RuntimeRegistryError::Incompatible { kind, source })?;
         let version = factory.probe_version()?;
         let resolved = resolved.with_version(version);
-        Ok(PreparedRuntime { factory, resolved })
+        Ok(PreparedRuntime {
+            factory,
+            resolved,
+            station_egress: registration.station_egress,
+        })
     }
 }
 
@@ -209,6 +272,7 @@ impl fmt::Debug for RuntimeRegistry {
 pub(crate) struct PreparedRuntime {
     factory: Arc<dyn RuntimeFactory>,
     resolved: ResolvedRuntime,
+    station_egress: StationEgressSupport,
 }
 
 impl PreparedRuntime {
@@ -220,8 +284,14 @@ impl PreparedRuntime {
         self.factory.supports_exact_page_request_policy()
     }
 
+    /// Whether HTTP(S) can use the station-owned proxy. Non-HTTP containment is
+    /// described separately by `station_egress_support`.
     pub(crate) fn supports_station_egress(&self) -> bool {
-        self.factory.supports_station_egress()
+        self.station_egress_support().is_supported()
+    }
+
+    pub(crate) fn station_egress_support(&self) -> StationEgressSupport {
+        self.station_egress
     }
 
     pub(crate) fn spawn(
@@ -304,6 +374,28 @@ impl ChromiumRuntimeFactory {
             preference,
         }
     }
+
+    fn station_egress_support() -> StationEgressSupport {
+        if cfg!(windows) {
+            StationEgressSupport::HttpProxyWithBrowserUdpMitigation
+        } else {
+            StationEgressSupport::Unsupported
+        }
+    }
+}
+
+fn chromium_station_egress_args(
+    endpoint: SocketAddr,
+) -> Result<[String; 4], WorkerError> {
+    if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
+        return Err(WorkerError::InvalidInput);
+    }
+    Ok([
+        format!("--proxy-server=http://{endpoint}"),
+        "--proxy-bypass-list=<-loopback>".to_owned(),
+        "--disable-quic".to_owned(),
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_owned(),
+    ])
 }
 
 impl RuntimeFactory for ChromiumRuntimeFactory {
@@ -367,22 +459,10 @@ impl RuntimeFactory for ChromiumRuntimeFactory {
         mut config: BrowserWorkerConfig,
     ) -> Result<BrowserWorker, WorkerError> {
         if let Some(endpoint) = egress_proxy {
-            if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
-                return Err(WorkerError::InvalidInput);
-            }
             config
                 .launch
                 .extra_args
-                .push(format!("--proxy-server=http://{endpoint}"));
-            config
-                .launch
-                .extra_args
-                .push("--proxy-bypass-list=<-loopback>".to_owned());
-            config.launch.extra_args.push("--disable-quic".to_owned());
-            config.launch.extra_args.push(
-                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"
-                    .to_owned(),
-            );
+                .extend(chromium_station_egress_args(endpoint)?);
         }
         self.spawn_with_navigation_policy(identity, capabilities, policy, config)
     }
@@ -397,6 +477,10 @@ impl LightweightRuntimeFactory {
         Self {
             descriptor: lightweight_runtime_descriptor(),
         }
+    }
+
+    fn station_egress_support() -> StationEgressSupport {
+        StationEgressSupport::HttpProxy
     }
 }
 
@@ -586,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn station_egress_support_is_declared_statically() {
+    fn station_egress_support_is_declared_precisely() {
         let custom = ProbeCountingFactory {
             descriptor: lightweight_runtime_descriptor(),
             probes: Arc::new(AtomicUsize::new(0)),
@@ -604,11 +688,63 @@ mod tests {
             .expect("prepare lightweight runtime");
 
         assert!(!custom.supports_station_egress());
-        assert!(LightweightRuntimeFactory::new().supports_station_egress());
+        let mut custom_registry = RuntimeRegistry::empty();
+        custom_registry
+            .register(custom, false)
+            .expect("register custom runtime");
+        let custom_prepared = custom_registry
+            .prepare(
+                RuntimeSelector::Exact(RuntimeKind::Lightweight),
+                &requirements,
+            )
+            .expect("prepare custom runtime");
+        assert_eq!(
+            custom_prepared.station_egress,
+            StationEgressSupport::Unsupported,
+        );
+        assert_eq!(
+            LightweightRuntimeFactory::station_egress_support(),
+            StationEgressSupport::HttpProxy,
+        );
         assert!(prepared.supports_station_egress());
         assert_eq!(
-            ChromiumRuntimeFactory::chrome().supports_station_egress(),
-            cfg!(windows),
+            prepared.station_egress_support(),
+            StationEgressSupport::HttpProxy,
         );
+        assert_eq!(
+            ChromiumRuntimeFactory::station_egress_support(),
+            if cfg!(windows) {
+                StationEgressSupport::HttpProxyWithBrowserUdpMitigation
+            } else {
+                StationEgressSupport::Unsupported
+            },
+        );
+    }
+
+    #[test]
+    fn chromium_station_egress_arguments_are_exact_and_bounded() {
+        let endpoint = "127.0.0.1:18080".parse().expect("loopback endpoint");
+        assert_eq!(
+            chromium_station_egress_args(endpoint).expect("valid endpoint"),
+            [
+                "--proxy-server=http://127.0.0.1:18080".to_owned(),
+                "--proxy-bypass-list=<-loopback>".to_owned(),
+                "--disable-quic".to_owned(),
+                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"
+                    .to_owned(),
+            ],
+        );
+        assert!(matches!(
+            chromium_station_egress_args(
+                "192.0.2.1:18080".parse().expect("non-loopback endpoint")
+            ),
+            Err(WorkerError::InvalidInput)
+        ));
+        assert!(matches!(
+            chromium_station_egress_args(
+                "127.0.0.1:0".parse().expect("zero-port endpoint")
+            ),
+            Err(WorkerError::InvalidInput)
+        ));
     }
 }
