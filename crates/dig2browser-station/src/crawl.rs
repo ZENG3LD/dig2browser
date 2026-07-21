@@ -24,7 +24,8 @@ use dig2browser_protocol::{
 use tokio::task::JoinHandle;
 
 use crate::collection::{
-    BeginCollection, CollectionExecution, CollectionManager, ReconciledCollection,
+    BeginCollection, CaptureReceiptPolicy, CollectionExecution, CollectionManager,
+    ReconciledCollection,
 };
 use crate::{
     BrowserStation, BrowserTask, BrowserTaskStep, IdentityRequest,
@@ -685,7 +686,7 @@ async fn execute_page(
         runtime_selector: RuntimeSelector::Auto,
         runtime_requirements: None,
         task,
-        persist_capture_receipt: true,
+        capture_receipt: CaptureReceiptPolicy::Required,
     };
     let execution = inner
         .collections

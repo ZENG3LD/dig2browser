@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 pub use dig2browser_protocol::{
     ArtifactChunk, ArtifactCommitted, ArtifactMediaType, ArtifactRef,
     ArtifactRole, BrowserPersona, CaptureCompleteness, CollectionId,
+    CollectionReceipt, CollectionReceiptArtifacts, CollectionReceiptMetadata,
     CollectionRequest, CollectionResponse, CollectionTask, CollectionTaskResult,
     CompiledPersona, ControlTransport, CrawlCounts, CrawlCursor, CrawlEvent, CrawlEventKind,
     CrawlEventPage, CrawlJobId, CrawlPhase, CrawlRequest, CrawlResponse, CrawlSpec,
@@ -28,6 +29,7 @@ pub use dig2browser_protocol::{
     MAX_ARTIFACT_CHUNK_BYTES, MAX_CRAWL_ALLOWED_ORIGINS, MAX_CRAWL_DEPTH,
     MAX_CRAWL_EVENTS, MAX_CRAWL_PAGES, MAX_CRAWL_RETRIES, MAX_CRAWL_SEEDS,
     MAX_CRAWL_URL_BYTES, MAX_TRACE_EVENTS, DEFAULT_STATION_PIPE, HOST_DIRECT,
+    PROTOCOL_VERSION,
 };
 
 const MIN_TIMEOUT: Duration = Duration::from_millis(100);
@@ -319,6 +321,18 @@ impl StationClient {
             return Err(ClientError::InvalidResponse);
         }
         Ok(chunk)
+    }
+
+    pub async fn read_collection_receipt(
+        &self,
+        collection_id: CollectionId,
+    ) -> Result<CollectionReceipt, ClientError> {
+        let collection = CollectionRequest::read_receipt(collection_id)
+            .map_err(|_| ClientError::InvalidCollectionRequest)?;
+        let request = WorkerRequest::collection(self.take_request_id(), collection)
+            .map_err(|_| ClientError::InvalidCollectionRequest)?;
+        let response = require_collection_response(&self.call(request).await?)?;
+        require_collection_receipt(response, collection_id)
     }
 
     pub async fn cancel_collection(
@@ -798,6 +812,14 @@ impl BlockingStationClient {
         ))
     }
 
+    pub fn read_collection_receipt(
+        &self,
+        collection_id: CollectionId,
+    ) -> Result<CollectionReceipt, ClientError> {
+        self.runtime
+            .block_on(self.client.read_collection_receipt(collection_id))
+    }
+
     pub fn cancel_collection(
         &self,
         collection_id: CollectionId,
@@ -1020,6 +1042,19 @@ fn require_collection_response(
         .map_err(|_| ClientError::InvalidResponse)
 }
 
+fn require_collection_receipt(
+    response: CollectionResponse,
+    collection_id: CollectionId,
+) -> Result<CollectionReceipt, ClientError> {
+    let CollectionResponse::Receipt(receipt) = response else {
+        return Err(ClientError::InvalidResponse);
+    };
+    if receipt.collection_id() != collection_id {
+        return Err(ClientError::InvalidResponse);
+    }
+    Ok(receipt)
+}
+
 fn require_crawl_response(response: &WorkerResponse) -> Result<CrawlResponse, ClientError> {
     require_ok(response)?;
     response
@@ -1240,5 +1275,51 @@ mod tests {
         )
         .expect("valid partial contract");
         assert!(runtime_satisfies_contract(&partial, &allowed_partial));
+    }
+
+    #[test]
+    fn collection_receipt_response_is_bound_to_requested_collection() {
+        let expected = CollectionId::new([1; 16]).expect("expected collection id");
+        let other = CollectionId::new([2; 16]).expect("other collection id");
+        let receipt = CollectionReceipt::new(
+            expected,
+            [3; 32],
+            CollectionReceiptMetadata {
+                completed_at_unix_ms: 1_784_500_000_020,
+                final_url: "https://example.test/final".to_owned(),
+                http_status: Some(200),
+                title: Some("Example".to_owned()),
+                ready_state: "complete".to_owned(),
+                capture_duration_ms: 20,
+                collector_version: "dig2browser-station/0.1.0".to_owned(),
+                protocol_version: dig2browser_protocol::PROTOCOL_VERSION,
+            },
+            CollectionReceiptArtifacts {
+                html: ArtifactRef::new(
+                    [4; 32],
+                    41,
+                    ArtifactMediaType::TextHtmlUtf8,
+                )
+                .expect("HTML artifact"),
+                viewport_png: Some(
+                    ArtifactRef::new([5; 32], 97, ArtifactMediaType::ImagePng)
+                        .expect("PNG artifact"),
+                ),
+            },
+        )
+        .expect("valid receipt");
+
+        assert_eq!(
+            require_collection_receipt(
+                CollectionResponse::Receipt(receipt.clone()),
+                expected,
+            )
+            .expect("matching receipt"),
+            receipt,
+        );
+        assert!(matches!(
+            require_collection_receipt(CollectionResponse::Receipt(receipt), other),
+            Err(ClientError::InvalidResponse)
+        ));
     }
 }

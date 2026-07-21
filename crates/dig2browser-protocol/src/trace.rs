@@ -1,7 +1,9 @@
 use crate::task::{decode_runtime_record, encode_runtime_record};
 use crate::{
     BrowserPersona, CollectionTask, FailureClass, ProfileClass, ProtocolError,
-    ResolvedRuntimeRecord, MAX_REQUEST_BYTES,
+    ResolvedRuntimeRecord, MAX_FINAL_URL_BYTES, MAX_HTML_BYTES, MAX_PNG_BYTES,
+    MAX_REQUEST_BYTES, MAX_TITLE_BYTES, MAX_COLLECTOR_VERSION_BYTES,
+    MAX_SELECTOR_BYTES, PROTOCOL_VERSION,
 };
 
 pub const MAX_TRACE_EVENTS: usize = 64;
@@ -359,6 +361,9 @@ pub enum CollectionRequest {
         offset: u64,
         max_bytes: u32,
     },
+    ReadReceipt {
+        collection_id: CollectionId,
+    },
     Cancel {
         collection_id: CollectionId,
     },
@@ -417,6 +422,12 @@ impl CollectionRequest {
         Ok(request)
     }
 
+    pub fn read_receipt(collection_id: CollectionId) -> Result<Self, ProtocolError> {
+        let request = Self::ReadReceipt { collection_id };
+        request.validate()?;
+        Ok(request)
+    }
+
     pub fn is_begin(&self) -> bool {
         matches!(self, Self::Begin { .. })
     }
@@ -426,6 +437,7 @@ impl CollectionRequest {
             Self::Begin { collection_id, .. }
             | Self::ReadTrace { collection_id, .. }
             | Self::ReadArtifact { collection_id, .. }
+            | Self::ReadReceipt { collection_id }
             | Self::Cancel { collection_id } => *collection_id,
         }
     }
@@ -480,6 +492,11 @@ impl CollectionRequest {
                 output.push(0);
                 output.extend_from_slice(collection_id.as_bytes());
             }
+            Self::ReadReceipt { collection_id } => {
+                output.push(5);
+                output.push(0);
+                output.extend_from_slice(collection_id.as_bytes());
+            }
         }
         if output.len() > MAX_REQUEST_BYTES {
             return Err(ProtocolError::InvalidCollectionPayload);
@@ -522,6 +539,7 @@ impl CollectionRequest {
                 input.u32()?,
             )?,
             4 => Self::cancel(input.collection_id()?)?,
+            5 => Self::read_receipt(input.collection_id()?)?,
             _ => return Err(ProtocolError::InvalidCollectionPayload),
         };
         if !input.is_empty() {
@@ -556,7 +574,7 @@ impl CollectionRequest {
                 }
                 Ok(())
             }
-            Self::Cancel { collection_id } => {
+            Self::Cancel { collection_id } | Self::ReadReceipt { collection_id } => {
                 CollectionId::new(*collection_id.as_bytes()).map(|_| ())
             }
             Self::ReadArtifact {
@@ -576,6 +594,146 @@ impl CollectionRequest {
                 Ok(())
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionReceiptMetadata {
+    pub completed_at_unix_ms: u64,
+    pub final_url: String,
+    pub http_status: Option<u16>,
+    pub title: Option<String>,
+    pub ready_state: String,
+    pub capture_duration_ms: u64,
+    pub collector_version: String,
+    pub protocol_version: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionReceiptArtifacts {
+    pub html: ArtifactRef,
+    pub viewport_png: Option<ArtifactRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionReceipt {
+    collection_id: CollectionId,
+    task_sha256: [u8; 32],
+    completed_at_unix_ms: u64,
+    final_url: String,
+    http_status: Option<u16>,
+    title: Option<String>,
+    ready_state: String,
+    capture_duration_ms: u64,
+    collector_version: String,
+    protocol_version: u16,
+    html: ArtifactRef,
+    viewport_png: Option<ArtifactRef>,
+}
+
+impl CollectionReceipt {
+    pub fn new(
+        collection_id: CollectionId,
+        task_sha256: [u8; 32],
+        metadata: CollectionReceiptMetadata,
+        artifacts: CollectionReceiptArtifacts,
+    ) -> Result<Self, ProtocolError> {
+        let receipt = Self {
+            collection_id,
+            task_sha256,
+            completed_at_unix_ms: metadata.completed_at_unix_ms,
+            final_url: metadata.final_url,
+            http_status: metadata.http_status,
+            title: metadata.title,
+            ready_state: metadata.ready_state,
+            capture_duration_ms: metadata.capture_duration_ms,
+            collector_version: metadata.collector_version,
+            protocol_version: metadata.protocol_version,
+            html: artifacts.html,
+            viewport_png: artifacts.viewport_png,
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    pub fn collection_id(&self) -> CollectionId {
+        self.collection_id
+    }
+
+    pub fn task_sha256(&self) -> &[u8; 32] {
+        &self.task_sha256
+    }
+
+    pub fn completed_at_unix_ms(&self) -> u64 {
+        self.completed_at_unix_ms
+    }
+
+    pub fn final_url(&self) -> &str {
+        &self.final_url
+    }
+
+    pub fn http_status(&self) -> Option<u16> {
+        self.http_status
+    }
+
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+
+    pub fn ready_state(&self) -> &str {
+        &self.ready_state
+    }
+
+    pub fn capture_duration_ms(&self) -> u64 {
+        self.capture_duration_ms
+    }
+
+    pub fn collector_version(&self) -> &str {
+        &self.collector_version
+    }
+
+    pub fn protocol_version(&self) -> u16 {
+        self.protocol_version
+    }
+
+    pub fn html(&self) -> &ArtifactRef {
+        &self.html
+    }
+
+    pub fn viewport_png(&self) -> Option<&ArtifactRef> {
+        self.viewport_png.as_ref()
+    }
+
+    fn validate(&self) -> Result<(), ProtocolError> {
+        CollectionId::new(*self.collection_id.as_bytes())?;
+        crate::validate_http_url(&self.final_url)
+            .map_err(|_| ProtocolError::InvalidCollectionPayload)?;
+        if self.task_sha256 == [0; 32]
+            || self.completed_at_unix_ms == 0
+            || self.final_url.len() > MAX_FINAL_URL_BYTES
+            || self.http_status.is_some_and(|status| !(100..=599).contains(&status))
+            || self.title.as_ref().is_some_and(|title| {
+                title.is_empty() || title.len() > MAX_TITLE_BYTES
+            })
+            || self.ready_state.len() > MAX_SELECTOR_BYTES
+            || self.collector_version.is_empty()
+            || self.collector_version.len() > MAX_COLLECTOR_VERSION_BYTES
+            || self.collector_version.chars().any(char::is_control)
+            || self.protocol_version != PROTOCOL_VERSION
+            || self.html.media_type() != ArtifactMediaType::TextHtmlUtf8
+            || usize::try_from(self.html.len()).ok().is_none_or(|len| {
+                len == 0 || len > MAX_HTML_BYTES
+            })
+            || self.viewport_png.as_ref().is_some_and(|artifact| {
+                artifact.media_type() != ArtifactMediaType::ImagePng
+                    || usize::try_from(artifact.len()).ok().is_none_or(|len| {
+                        len == 0 || len > MAX_PNG_BYTES
+                    })
+            })
+        {
+            return Err(ProtocolError::InvalidCollectionPayload);
+        }
+        Ok(())
     }
 }
 
@@ -699,6 +857,7 @@ pub enum CollectionResponse {
     TracePage(TracePage),
     ArtifactChunk(ArtifactChunk),
     Cancelled { collection_id: CollectionId },
+    Receipt(CollectionReceipt),
 }
 
 impl CollectionResponse {
@@ -736,6 +895,45 @@ impl CollectionResponse {
                 output.push(4);
                 output.push(0);
                 output.extend_from_slice(collection_id.as_bytes());
+            }
+            Self::Receipt(receipt) => {
+                receipt.validate()?;
+                let mut flags = 0_u8;
+                if receipt.viewport_png.is_some() {
+                    flags |= 1;
+                }
+                if receipt.title.is_some() {
+                    flags |= 2;
+                }
+                if receipt.http_status.is_some() {
+                    flags |= 4;
+                }
+                output.push(5);
+                output.push(flags);
+                output.extend_from_slice(receipt.collection_id.as_bytes());
+                output.extend_from_slice(&receipt.task_sha256);
+                output.extend_from_slice(&receipt.completed_at_unix_ms.to_le_bytes());
+                output.extend_from_slice(&receipt.http_status.unwrap_or(0).to_le_bytes());
+                output.extend_from_slice(&(receipt.final_url.len() as u32).to_le_bytes());
+                output.extend_from_slice(
+                    &(receipt.title.as_ref().map_or(0, String::len) as u32).to_le_bytes(),
+                );
+                output.extend_from_slice(&(receipt.ready_state.len() as u32).to_le_bytes());
+                output.extend_from_slice(
+                    &(receipt.collector_version.len() as u16).to_le_bytes(),
+                );
+                output.extend_from_slice(&receipt.capture_duration_ms.to_le_bytes());
+                output.extend_from_slice(&receipt.protocol_version.to_le_bytes());
+                encode_artifact_ref(&mut output, &receipt.html);
+                if let Some(viewport_png) = &receipt.viewport_png {
+                    encode_artifact_ref(&mut output, viewport_png);
+                }
+                output.extend_from_slice(receipt.final_url.as_bytes());
+                if let Some(title) = &receipt.title {
+                    output.extend_from_slice(title.as_bytes());
+                }
+                output.extend_from_slice(receipt.ready_state.as_bytes());
+                output.extend_from_slice(receipt.collector_version.as_bytes());
             }
         }
         Ok(output)
@@ -795,6 +993,74 @@ impl CollectionResponse {
             4 if flags == 0 => Self::Cancelled {
                 collection_id: input.collection_id()?,
             },
+            5 if flags & !0b111 == 0 => {
+                let collection_id = input.collection_id()?;
+                let task_sha256 = input.array_32()?;
+                let completed_at_unix_ms = input.u64()?;
+                let raw_status = input.u16()?;
+                let http_status = match (flags & 4 != 0, raw_status) {
+                    (false, 0) => None,
+                    (true, 100..=599) => Some(raw_status),
+                    _ => return Err(ProtocolError::InvalidCollectionPayload),
+                };
+                let final_url_len = usize::try_from(input.u32()?)
+                    .map_err(|_| ProtocolError::InvalidCollectionPayload)?;
+                let title_len = usize::try_from(input.u32()?)
+                    .map_err(|_| ProtocolError::InvalidCollectionPayload)?;
+                let ready_state_len = usize::try_from(input.u32()?)
+                    .map_err(|_| ProtocolError::InvalidCollectionPayload)?;
+                let collector_version_len = usize::from(input.u16()?);
+                let capture_duration_ms = input.u64()?;
+                let protocol_version = input.u16()?;
+                if final_url_len > MAX_FINAL_URL_BYTES
+                    || title_len > MAX_TITLE_BYTES
+                    || ready_state_len > MAX_SELECTOR_BYTES
+                    || collector_version_len > MAX_COLLECTOR_VERSION_BYTES
+                    || (flags & 2 == 0) != (title_len == 0)
+                {
+                    return Err(ProtocolError::InvalidCollectionPayload);
+                }
+                let html = decode_artifact_ref(&mut input)?;
+                let viewport_png = if flags & 1 != 0 {
+                    Some(decode_artifact_ref(&mut input)?)
+                } else {
+                    None
+                };
+                let final_url = std::str::from_utf8(input.bytes(final_url_len)?)
+                    .map_err(|_| ProtocolError::InvalidCollectionPayload)?
+                    .to_owned();
+                let title = if flags & 2 != 0 {
+                    Some(
+                        std::str::from_utf8(input.bytes(title_len)?)
+                            .map_err(|_| ProtocolError::InvalidCollectionPayload)?
+                            .to_owned(),
+                    )
+                } else {
+                    None
+                };
+                let ready_state = std::str::from_utf8(input.bytes(ready_state_len)?)
+                    .map_err(|_| ProtocolError::InvalidCollectionPayload)?
+                    .to_owned();
+                let collector_version =
+                    std::str::from_utf8(input.bytes(collector_version_len)?)
+                        .map_err(|_| ProtocolError::InvalidCollectionPayload)?
+                        .to_owned();
+                Self::Receipt(CollectionReceipt::new(
+                    collection_id,
+                    task_sha256,
+                    CollectionReceiptMetadata {
+                        completed_at_unix_ms,
+                        final_url,
+                        http_status,
+                        title,
+                        ready_state,
+                        capture_duration_ms,
+                        collector_version,
+                        protocol_version,
+                    },
+                    CollectionReceiptArtifacts { html, viewport_png },
+                )?)
+            }
             _ => return Err(ProtocolError::InvalidCollectionPayload),
         };
         if !input.is_empty() {
@@ -1275,6 +1541,7 @@ mod tests {
                 MAX_ARTIFACT_CHUNK_BYTES as u32,
             )
             .unwrap(),
+            CollectionRequest::read_receipt(collection_id()).unwrap(),
             CollectionRequest::cancel(collection_id()).unwrap(),
         ] {
             assert_eq!(
@@ -1320,6 +1587,39 @@ mod tests {
             CollectionResponse::decode(&response.encode().unwrap()).unwrap(),
             response
         );
+
+        let receipt = CollectionReceipt::new(
+            collection_id(),
+            [5; 32],
+            CollectionReceiptMetadata {
+                completed_at_unix_ms: 1_784_500_000_020,
+                final_url: "https://example.test/final".to_owned(),
+                http_status: Some(200),
+                title: Some("Example".to_owned()),
+                ready_state: "complete".to_owned(),
+                capture_duration_ms: 20,
+                collector_version: "dig2browser-station/0.1.0".to_owned(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+            CollectionReceiptArtifacts {
+                html: ArtifactRef::new(
+                    [6; 32],
+                    41,
+                    ArtifactMediaType::TextHtmlUtf8,
+                )
+                .unwrap(),
+                viewport_png: Some(
+                    ArtifactRef::new([7; 32], 97, ArtifactMediaType::ImagePng)
+                        .unwrap(),
+                ),
+            },
+        )
+        .expect("valid receipt");
+        let response = CollectionResponse::Receipt(receipt);
+        assert_eq!(
+            CollectionResponse::decode(&response.encode().unwrap()).unwrap(),
+            response
+        );
     }
 
     #[test]
@@ -1348,6 +1648,31 @@ mod tests {
             [1; 32],
             0,
             (MAX_ARTIFACT_CHUNK_BYTES + 1) as u32,
+        )
+        .is_err());
+
+        assert!(CollectionReceipt::new(
+            collection_id(),
+            [0; 32],
+            CollectionReceiptMetadata {
+                completed_at_unix_ms: 1,
+                final_url: "https://example.test/final".to_owned(),
+                http_status: None,
+                title: None,
+                ready_state: "complete".to_owned(),
+                capture_duration_ms: 1,
+                collector_version: "dig2browser-station/0.1.0".to_owned(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+            CollectionReceiptArtifacts {
+                html: ArtifactRef::new(
+                    [2; 32],
+                    17,
+                    ArtifactMediaType::TextHtmlUtf8,
+                )
+                .unwrap(),
+                viewport_png: None,
+            },
         )
         .is_err());
 

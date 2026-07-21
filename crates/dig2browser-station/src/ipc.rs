@@ -22,7 +22,9 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 
 use crate::{
-    collection::{BeginCollection, CollectionError, CollectionManager},
+    collection::{
+        BeginCollection, CaptureReceiptPolicy, CollectionError, CollectionManager,
+    },
     crawl::{CrawlError, CrawlManager},
     BrowserLease, BrowserStation, BrowserTask, BrowserTaskStep, IdentityRequest,
     RuntimeRegistryError, RuntimeRequirements, RuntimeSelector, StationError,
@@ -383,9 +385,7 @@ async fn run_windows_server(
         crawls.reconcile_and_recover()?;
     }
     if let Some(collections) = &collections {
-        let crawl_reconciliation_authorized =
-            crawls.is_some() && crawl_execution_authorized;
-        collections.reconcile_successor(!crawl_reconciliation_authorized)?;
+        collections.reconcile_successor()?;
     }
     if let Some(crawls) = &crawls {
         crawls.start_runners()?;
@@ -883,7 +883,7 @@ async fn collection_request(
                     runtime_selector,
                     runtime_requirements,
                     task: station_task,
-                    persist_capture_receipt: false,
+                    capture_receipt: CaptureReceiptPolicy::IfCaptured,
                 })
                 .await
                 .map(|collection_id| CollectionResponse::Accepted { collection_id })
@@ -920,6 +920,18 @@ async fn collection_request(
             collections
                 .read_artifact(*collection_id, *sha256, *offset, *max_bytes)
                 .map(CollectionResponse::ArtifactChunk)
+        }
+        CollectionRequest::ReadReceipt { collection_id } => {
+            if !permissions.durable_read {
+                return WorkerResponse::failure(
+                    request,
+                    ResponseStatus::Invalid,
+                    "durable collection reads disabled",
+                );
+            }
+            collections
+                .read_receipt(*collection_id)
+                .map(CollectionResponse::Receipt)
         }
         CollectionRequest::Cancel { collection_id } => {
             if !permissions.durable_write {
@@ -980,6 +992,7 @@ fn collection_error_response(
         }
         CollectionError::AtCapacity
         | CollectionError::AdmissionClosed
+        | CollectionError::ReceiptNotReady
         | CollectionError::TerminalPersistenceFailed
         | CollectionError::Station(
             StationError::AtCapacity
@@ -989,6 +1002,9 @@ fn collection_error_response(
         CollectionError::Ledger(
             LedgerError::ArtifactTooLarge | LedgerError::EventLimitExceeded,
         ) => (ResponseStatus::TooLarge, "collection limit exceeded"),
+        CollectionError::ReceiptUnavailable => {
+            (ResponseStatus::Invalid, "collection receipt unavailable")
+        }
         CollectionError::CorruptTrace
         | CollectionError::CorruptReceipt
         | CollectionError::ManagerStatePoisoned

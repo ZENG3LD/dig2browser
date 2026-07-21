@@ -19,6 +19,7 @@ use dig2browser_client::{
     SessionStateUpdate, StationClient, StationStatus, SupportLevel,
     TaskCapturePolicy, TaskReply, TaskRuntimeContract, TaskStep,
     TerminalOutcome, TraceCursor, TraceEvent, TraceEventKind,
+    PROTOCOL_VERSION,
 };
 use dig2browser_probe::ProbeTranscriptV1;
 use tokio::io::AsyncReadExt;
@@ -1747,8 +1748,24 @@ async fn stationd_resumes_trace_and_reconciles_hard_kill_e2e() {
     }
     assert_eq!(terminal, Some(TerminalOutcome::Succeeded));
     assert_eq!(artifacts.len(), 2);
-    for (role, artifact) in artifacts {
-        let bytes = read_complete_artifact(&client, collection_id, &artifact).await;
+    let receipt = client
+        .read_collection_receipt(collection_id)
+        .await
+        .expect("read terminal collection receipt");
+    let TraceEventKind::Started(started) = events[0].kind() else {
+        panic!("collection trace did not start with task digest");
+    };
+    assert_eq!(receipt.collection_id(), collection_id);
+    assert_eq!(receipt.task_sha256(), started.task_sha256());
+    assert!(receipt.final_url().starts_with(&fixture.url("/durable-trace")));
+    assert_eq!(receipt.http_status(), Some(200));
+    assert_eq!(receipt.title(), Some("durable-trace"));
+    assert_eq!(receipt.ready_state(), "complete");
+    assert!(receipt.completed_at_unix_ms() > 0);
+    assert_eq!(receipt.protocol_version(), PROTOCOL_VERSION);
+    assert!(receipt.collector_version().starts_with("dig2browser-station/"));
+    for (role, artifact) in &artifacts {
+        let bytes = read_complete_artifact(&client, collection_id, artifact).await;
         assert_eq!(u64::try_from(bytes.len()).unwrap(), artifact.len());
         assert_eq!(
             dig2browser::digest::sha256_bytes(&bytes),
@@ -1756,11 +1773,13 @@ async fn stationd_resumes_trace_and_reconciles_hard_kill_e2e() {
         );
         match role {
             ArtifactRole::Html => {
+                assert_eq!(receipt.html(), artifact);
                 assert_eq!(artifact.media_type(), ArtifactMediaType::TextHtmlUtf8);
                 assert!(String::from_utf8_lossy(&bytes)
                     .contains("data-daemon-e2e=\"durable-trace\""));
             }
             ArtifactRole::ViewportPng => {
+                assert_eq!(receipt.viewport_png(), Some(artifact));
                 assert_eq!(artifact.media_type(), ArtifactMediaType::ImagePng);
                 assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
             }
@@ -1810,6 +1829,13 @@ async fn stationd_resumes_trace_and_reconciles_hard_kill_e2e() {
         cancelled.last().map(TraceEvent::kind),
         Some(TraceEventKind::Terminal(trace))
             if trace.outcome() == TerminalOutcome::Cancelled
+    ));
+    assert!(matches!(
+        client.read_collection_receipt(cancelled_id).await,
+        Err(ClientError::Remote {
+            status: ResponseStatus::Invalid,
+            ..
+        })
     ));
 
     let interrupted_id = CollectionId::new(*uuid::Uuid::new_v4().as_bytes())

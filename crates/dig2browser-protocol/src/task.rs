@@ -24,12 +24,12 @@ const TASK_SCHEMA_VERSION_V2: u16 = 2;
 const MAX_RUNTIME_FEATURES: usize = 16;
 const MAX_RUNTIME_LIMITATIONS: usize = 8;
 const MAX_RUNTIME_VERSION_BYTES: usize = 128;
-const MAX_SELECTOR_BYTES: usize = 4_096;
+pub const MAX_SELECTOR_BYTES: usize = 4_096;
 const MAX_KEY_BYTES: usize = 64;
 const MAX_TEXT_BYTES: usize = 64 * 1024;
 const MAX_SCRIPT_BYTES: usize = 64 * 1024;
 const MAX_SCRIPT_RESULT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_COLLECTOR_VERSION_BYTES: usize = 128;
+pub const MAX_COLLECTOR_VERSION_BYTES: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

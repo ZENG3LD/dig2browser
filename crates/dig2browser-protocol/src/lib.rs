@@ -27,10 +27,12 @@ pub use task::{
     CaptureCompleteness, CollectionTask, CollectionTaskResult, EvidenceCapture,
     ResolvedRuntimeRecord, TaskCapturePolicy, TaskReply, TaskRuntimeContract,
     TaskStep, MAX_TASK_RESULT_BYTES, MAX_TASK_STEPS, MAX_TASK_WAIT,
+    MAX_COLLECTOR_VERSION_BYTES, MAX_SELECTOR_BYTES,
 };
 pub use trace::{
     ArtifactChunk, ArtifactCommitted, ArtifactMediaType, ArtifactRef,
-    ArtifactRole, CollectionId, CollectionRequest, CollectionResponse,
+    ArtifactRole, CollectionId, CollectionReceipt, CollectionReceiptArtifacts,
+    CollectionReceiptMetadata, CollectionRequest, CollectionResponse,
     InterruptedReason, StartedTrace, StepOutcome, StepSummary, TerminalOutcome,
     TerminalTrace, TraceCursor, TraceEvent, TraceEventKind, TracePage,
     MAX_ARTIFACT_CHUNK_BYTES, MAX_TRACE_EVENTS, MAX_TRACE_STEP_SUMMARIES,

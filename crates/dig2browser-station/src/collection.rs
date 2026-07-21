@@ -9,10 +9,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use dig2browser::agentic::{AgentReply, CapabilitySet, CaptureArtifact};
 use dig2browser_protocol::{
     ArtifactChunk, ArtifactMediaType, ArtifactRef, ArtifactRole, CollectionId,
+    CollectionReceipt, CollectionReceiptArtifacts, CollectionReceiptMetadata,
     FailureClass, InterruptedReason, ResolvedRuntimeRecord, StartedTrace,
-    StepOutcome, StepSummary, TerminalOutcome, TerminalTrace, TraceCursor,
-    TraceEventKind, TracePage, MAX_ARTIFACT_CHUNK_BYTES, MAX_CRAWL_URL_BYTES,
-    MAX_HTML_BYTES, MAX_TRACE_EVENTS,
+    StepOutcome, StepSummary, TerminalOutcome, TerminalTrace,
+    TraceCursor, TraceEventKind, TracePage, MAX_ARTIFACT_CHUNK_BYTES,
+    MAX_COLLECTOR_VERSION_BYTES, MAX_FINAL_URL_BYTES, MAX_HTML_BYTES,
+    MAX_PNG_BYTES, MAX_SELECTOR_BYTES, MAX_TITLE_BYTES, MAX_TRACE_EVENTS,
+    PROTOCOL_VERSION,
 };
 use dig2browser_trace::{LedgerError, TraceLedger};
 use tokio::sync::Mutex;
@@ -26,8 +29,9 @@ use crate::{
 const MAX_ACTIVE_COLLECTIONS: usize = 256;
 const RECEIPT_DIRECTORY: &str = ".dig2browser-crawl-receipts";
 const RECEIPT_MAGIC: [u8; 4] = *b"D2CR";
-const RECEIPT_VERSION: u16 = 1;
-const MAX_RECEIPT_URL_BYTES: usize = MAX_CRAWL_URL_BYTES;
+const RECEIPT_VERSION: u16 = 2;
+const LEGACY_RECEIPT_VERSION: u16 = 1;
+const MAX_RECEIPT_URL_BYTES: usize = MAX_FINAL_URL_BYTES;
 static RECEIPT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
@@ -58,7 +62,13 @@ pub(crate) struct BeginCollection {
     pub runtime_selector: RuntimeSelector,
     pub runtime_requirements: Option<RuntimeRequirements>,
     pub task: BrowserTask,
-    pub persist_capture_receipt: bool,
+    pub capture_receipt: CaptureReceiptPolicy,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CaptureReceiptPolicy {
+    IfCaptured,
+    Required,
 }
 
 pub(crate) enum CollectionExecution {
@@ -95,10 +105,28 @@ impl ReconciledCollection {
 struct CaptureReceipt {
     task_sha256: [u8; 32],
     terminal_at_ms: u64,
+    capture_completed_at_ms: u64,
     final_url: String,
     http_status: Option<u16>,
+    title: Option<String>,
+    ready_state: String,
+    capture_duration_ms: u64,
+    collector_version: String,
+    protocol_version: u16,
     html: ArtifactRef,
+    viewport_png: Option<ArtifactRef>,
     steps: Vec<StepSummary>,
+}
+
+struct ReceiptCapture {
+    completed_at_ms: u64,
+    final_url: String,
+    http_status: Option<u16>,
+    title: Option<String>,
+    ready_state: String,
+    duration_ms: u64,
+    html: ArtifactRef,
+    viewport_png: Option<ArtifactRef>,
 }
 
 impl CollectionManager {
@@ -123,30 +151,22 @@ impl CollectionManager {
         })
     }
 
-    pub(crate) fn reconcile_successor(
-        &self,
-        preserve_receipt_backed: bool,
-    ) -> Result<(), CollectionError> {
+    pub(crate) fn reconcile_successor(&self) -> Result<(), CollectionError> {
         let incomplete = self.with_ledger(|ledger| ledger.incomplete_collection_ids())?;
-        let mut preserve = Vec::new();
-        if preserve_receipt_backed {
-            for collection_id in incomplete {
-                let Some(receipt) = read_capture_receipt(
-                    &self.inner.receipt_root,
-                    collection_id,
-                )? else {
-                    continue;
-                };
-                if self.started_digest(collection_id)? != receipt.task_sha256 {
-                    return Err(CollectionError::CorruptReceipt);
-                }
-                verify_receipt_artifact(self, collection_id, &receipt.html)?;
-                preserve.push(collection_id);
+        for collection_id in &incomplete {
+            let Some(receipt) = read_capture_receipt(
+                &self.inner.receipt_root,
+                *collection_id,
+            )? else {
+                continue;
+            };
+            if self.started_digest(*collection_id)? != receipt.task_sha256 {
+                return Err(CollectionError::CorruptReceipt);
             }
+            self.reconcile_completed(*collection_id, receipt.task_sha256)?
+                .ok_or(CollectionError::CorruptReceipt)?;
         }
-        self.with_ledger(|ledger| {
-            ledger.reconcile_at(unix_time_ms(), &preserve)
-        })?;
+        self.with_ledger(|ledger| ledger.reconcile_at(unix_time_ms(), &[]))?;
         self.inner.accepting.store(true, Ordering::Release);
         Ok(())
     }
@@ -212,7 +232,7 @@ impl CollectionManager {
         let background_cancelled = Arc::clone(&cancelled);
         let collection_id = collection.collection_id;
         let task_sha256 = collection.task_sha256;
-        let persist_capture_receipt = collection.persist_capture_receipt;
+        let capture_receipt = collection.capture_receipt;
         let join = tokio::spawn(async move {
             run_collection(
                 background,
@@ -221,7 +241,7 @@ impl CollectionManager {
                 lease,
                 collection.task,
                 background_cancelled,
-                persist_capture_receipt,
+                capture_receipt,
             )
             .await;
         });
@@ -300,7 +320,7 @@ impl CollectionManager {
                     collection.collection_id,
                     collection.task_sha256,
                     result.as_ref(),
-                    collection.persist_capture_receipt,
+                    collection.capture_receipt,
                 )
             }
             Err(_) => Err(CollectionError::LedgerPoisoned),
@@ -348,6 +368,7 @@ impl CollectionManager {
 
         let mut cursor = TraceCursor::START;
         let mut terminal = None;
+        let mut last_timestamp = 0_u64;
         loop {
             let page = self.read_trace(
                 collection_id,
@@ -355,6 +376,7 @@ impl CollectionManager {
                 u8::try_from(MAX_TRACE_EVENTS).unwrap_or(u8::MAX),
             )?;
             for event in page.events() {
+                last_timestamp = last_timestamp.max(event.timestamp_unix_ms());
                 if let TraceEventKind::Terminal(existing) = event.kind() {
                     terminal = Some(existing.outcome());
                 }
@@ -368,6 +390,9 @@ impl CollectionManager {
             cursor = page.next_cursor();
         }
         verify_receipt_artifact(self, collection_id, &receipt.html)?;
+        if let Some(viewport_png) = &receipt.viewport_png {
+            verify_receipt_artifact(self, collection_id, viewport_png)?;
+        }
         match terminal {
             Some(TerminalOutcome::Succeeded) => {}
             Some(_) => return Err(CollectionError::CorruptTrace),
@@ -379,7 +404,7 @@ impl CollectionManager {
                 self.with_ledger(|ledger| {
                     ledger.finish_collection(
                         collection_id,
-                        receipt.terminal_at_ms,
+                        receipt.terminal_at_ms.max(last_timestamp),
                         terminal,
                     )
                 })?;
@@ -401,6 +426,47 @@ impl CollectionManager {
     ) -> Result<TracePage, CollectionError> {
         self.require_collection_healthy(collection_id)?;
         self.with_ledger(|ledger| ledger.read_trace(collection_id, cursor, limit))
+    }
+
+    pub(crate) fn read_receipt(
+        &self,
+        collection_id: CollectionId,
+    ) -> Result<CollectionReceipt, CollectionError> {
+        self.require_collection_healthy(collection_id)?;
+        let task_sha256 = self.started_digest(collection_id)?;
+        match self.terminal_outcome(collection_id)? {
+            None => return Err(CollectionError::ReceiptNotReady),
+            Some(TerminalOutcome::Succeeded) => {}
+            Some(_) => return Err(CollectionError::ReceiptUnavailable),
+        }
+        let receipt = read_capture_receipt(&self.inner.receipt_root, collection_id)?
+            .ok_or(CollectionError::ReceiptUnavailable)?;
+        if receipt.task_sha256 != task_sha256 {
+            return Err(CollectionError::CorruptReceipt);
+        }
+        verify_receipt_artifact(self, collection_id, &receipt.html)?;
+        if let Some(viewport_png) = &receipt.viewport_png {
+            verify_receipt_artifact(self, collection_id, viewport_png)?;
+        }
+        CollectionReceipt::new(
+            collection_id,
+            receipt.task_sha256,
+            CollectionReceiptMetadata {
+                completed_at_unix_ms: receipt.capture_completed_at_ms,
+                final_url: receipt.final_url,
+                http_status: receipt.http_status,
+                title: receipt.title,
+                ready_state: receipt.ready_state,
+                capture_duration_ms: receipt.capture_duration_ms,
+                collector_version: receipt.collector_version,
+                protocol_version: receipt.protocol_version,
+            },
+            CollectionReceiptArtifacts {
+                html: receipt.html,
+                viewport_png: receipt.viewport_png,
+            },
+        )
+        .map_err(CollectionError::from)
     }
 
     pub(crate) fn read_artifact(
@@ -509,6 +575,29 @@ impl CollectionManager {
         Ok(*started.task_sha256())
     }
 
+    fn terminal_outcome(
+        &self,
+        collection_id: CollectionId,
+    ) -> Result<Option<TerminalOutcome>, CollectionError> {
+        let mut cursor = TraceCursor::START;
+        loop {
+            let page = self.read_trace(
+                collection_id,
+                cursor,
+                u8::try_from(MAX_TRACE_EVENTS).unwrap_or(u8::MAX),
+            )?;
+            for event in page.events() {
+                if let TraceEventKind::Terminal(terminal) = event.kind() {
+                    return Ok(Some(terminal.outcome()));
+                }
+            }
+            if page.is_complete() || page.next_cursor() == cursor {
+                return Ok(None);
+            }
+            cursor = page.next_cursor();
+        }
+    }
+
     fn require_collection_healthy(
         &self,
         collection_id: CollectionId,
@@ -570,7 +659,7 @@ async fn run_collection(
     lease: BrowserLease,
     task: BrowserTask,
     cancelled: Arc<AtomicBool>,
-    persist_capture_receipt: bool,
+    capture_receipt: CaptureReceiptPolicy,
 ) {
     let result = lease.run_task_with_control(&task, &cancelled).await;
     let persisted = match inner.ledger.lock() {
@@ -580,7 +669,7 @@ async fn run_collection(
             collection_id,
             task_sha256,
             result.as_ref(),
-            persist_capture_receipt,
+            capture_receipt,
         ),
         Err(_) => Err(CollectionError::LedgerPoisoned),
     };
@@ -598,7 +687,7 @@ fn persist_collection_result(
     collection_id: CollectionId,
     task_sha256: [u8; 32],
     result: Result<&BrowserTaskResult, &StationError>,
-    persist_capture_receipt: bool,
+    capture_receipt: CaptureReceiptPolicy,
 ) -> Result<(), CollectionError> {
     match result {
         Ok(result) => {
@@ -636,6 +725,14 @@ fn persist_collection_result(
                         );
                     }
                 };
+                let Some(step) = steps.get(index).copied() else {
+                    return finish_failed(
+                        ledger,
+                        collection_id,
+                        FailureClass::Protocol,
+                        steps,
+                    );
+                };
                 let committed = match reply {
                     AgentReply::Capture(CaptureArtifact::HtmlOnly { state, html }) => {
                         ledger.commit_artifact(
@@ -646,11 +743,16 @@ fn persist_collection_result(
                             ArtifactMediaType::TextHtmlUtf8,
                             html.as_bytes(),
                         ).map(|artifact| {
-                            receipt_capture = Some((
-                                state.url.clone(),
-                                state.http_status,
-                                artifact,
-                            ));
+                            receipt_capture = Some(ReceiptCapture {
+                                completed_at_ms: step.completed_at_unix_ms(),
+                                final_url: state.url.clone(),
+                                http_status: state.http_status,
+                                title: (!state.title.is_empty()).then(|| state.title.clone()),
+                                ready_state: state.ready_state.clone(),
+                                duration_ms: step.duration_ms(),
+                                html: artifact,
+                                viewport_png: None,
+                            });
                         })
                     }
                     AgentReply::Capture(CaptureArtifact::EvidenceViewport {
@@ -666,12 +768,7 @@ fn persist_collection_result(
                             ArtifactMediaType::TextHtmlUtf8,
                             html.as_bytes(),
                         );
-                        html_artifact.and_then(|artifact| {
-                            receipt_capture = Some((
-                                state.url.clone(),
-                                state.http_status,
-                                artifact,
-                            ));
+                        html_artifact.and_then(|html| {
                             ledger.commit_artifact(
                                 collection_id,
                                 unix_time_ms(),
@@ -680,8 +777,20 @@ fn persist_collection_result(
                                 ArtifactMediaType::ImagePng,
                                 png,
                             )
+                            .map(|viewport_png| {
+                                receipt_capture = Some(ReceiptCapture {
+                                    completed_at_ms: step.completed_at_unix_ms(),
+                                    final_url: state.url.clone(),
+                                    http_status: state.http_status,
+                                    title: (!state.title.is_empty())
+                                        .then(|| state.title.clone()),
+                                    ready_state: state.ready_state.clone(),
+                                    duration_ms: step.duration_ms(),
+                                    html,
+                                    viewport_png: Some(viewport_png),
+                                });
+                            })
                         })
-                        .map(|_| ())
                     }
                     _ => Ok(()),
                 };
@@ -695,8 +804,20 @@ fn persist_collection_result(
                 }
             }
             let terminal_at_ms = unix_time_ms();
-            if persist_capture_receipt {
-                let Some((final_url, http_status, html)) = receipt_capture else {
+            {
+                let Some(capture) = receipt_capture else {
+                    if capture_receipt == CaptureReceiptPolicy::IfCaptured {
+                        let terminal = TerminalTrace::new(
+                            TerminalOutcome::Succeeded,
+                            steps,
+                        )?;
+                        ledger.finish_collection(
+                            collection_id,
+                            terminal_at_ms,
+                            terminal,
+                        )?;
+                        return Ok(());
+                    }
                     return finish_failed(
                         ledger,
                         collection_id,
@@ -707,9 +828,19 @@ fn persist_collection_result(
                 let receipt = CaptureReceipt {
                     task_sha256,
                     terminal_at_ms,
-                    final_url,
-                    http_status,
-                    html,
+                    capture_completed_at_ms: capture.completed_at_ms,
+                    final_url: capture.final_url,
+                    http_status: capture.http_status,
+                    title: capture.title,
+                    ready_state: capture.ready_state,
+                    capture_duration_ms: capture.duration_ms,
+                    collector_version: format!(
+                        "dig2browser-station/{}",
+                        env!("CARGO_PKG_VERSION"),
+                    ),
+                    protocol_version: PROTOCOL_VERSION,
+                    html: capture.html,
+                    viewport_png: capture.viewport_png,
                     steps: steps.clone(),
                 };
                 if let Err(error) = write_capture_receipt(
@@ -834,7 +965,11 @@ fn verify_receipt_artifact(
 ) -> Result<(), CollectionError> {
     let capacity = usize::try_from(artifact.len())
         .map_err(|_| CollectionError::CorruptReceipt)?;
-    if capacity == 0 || capacity > MAX_HTML_BYTES {
+    let max_len = match artifact.media_type() {
+        ArtifactMediaType::TextHtmlUtf8 => MAX_HTML_BYTES,
+        ArtifactMediaType::ImagePng => MAX_PNG_BYTES,
+    };
+    if capacity == 0 || capacity > max_len {
         return Err(CollectionError::CorruptReceipt);
     }
     let mut bytes = Vec::with_capacity(capacity);
@@ -878,7 +1013,8 @@ fn read_capture_receipt(
     let metadata = file.metadata()?;
     let max_len = u64::try_from(MAX_RECEIPT_URL_BYTES)
         .unwrap_or(u64::MAX)
-        .saturating_add(4 * 1024);
+        .saturating_add(u64::try_from(MAX_TITLE_BYTES).unwrap_or(u64::MAX))
+        .saturating_add(8 * 1024);
     if metadata.len() == 0 || metadata.len() > max_len {
         return Err(CollectionError::CorruptReceipt);
     }
@@ -893,7 +1029,45 @@ fn read_capture_receipt(
     {
         return Err(CollectionError::CorruptReceipt);
     }
-    decode_capture_receipt(&bytes).map(Some)
+    let receipt = decode_capture_receipt(&bytes)?;
+    validate_receipt_contract(collection_id, &receipt)?;
+    Ok(Some(receipt))
+}
+
+fn validate_receipt_contract(
+    collection_id: CollectionId,
+    receipt: &CaptureReceipt,
+) -> Result<(), CollectionError> {
+    let collector_version = if receipt.collector_version.is_empty() {
+        "dig2browser-station/legacy"
+    } else {
+        receipt.collector_version.as_str()
+    };
+    let protocol_version = if receipt.protocol_version == 0 {
+        PROTOCOL_VERSION
+    } else {
+        receipt.protocol_version
+    };
+    CollectionReceipt::new(
+        collection_id,
+        receipt.task_sha256,
+        CollectionReceiptMetadata {
+            completed_at_unix_ms: receipt.capture_completed_at_ms,
+            final_url: receipt.final_url.clone(),
+            http_status: receipt.http_status,
+            title: receipt.title.clone(),
+            ready_state: receipt.ready_state.clone(),
+            capture_duration_ms: receipt.capture_duration_ms,
+            collector_version: collector_version.to_owned(),
+            protocol_version,
+        },
+        CollectionReceiptArtifacts {
+            html: receipt.html.clone(),
+            viewport_png: receipt.viewport_png.clone(),
+        },
+    )
+    .map(|_| ())
+    .map_err(|_| CollectionError::CorruptReceipt)
 }
 
 fn encode_capture_receipt(receipt: &CaptureReceipt) -> Result<Vec<u8>, CollectionError> {
@@ -904,6 +1078,24 @@ fn encode_capture_receipt(receipt: &CaptureReceipt) -> Result<Vec<u8>, Collectio
         || usize::try_from(receipt.html.len()).ok().is_none_or(|len| {
             len == 0 || len > MAX_HTML_BYTES
         })
+        || receipt.task_sha256 == [0; 32]
+        || receipt.terminal_at_ms == 0
+        || receipt.capture_completed_at_ms == 0
+        || receipt.http_status.is_some_and(|status| !(100..=599).contains(&status))
+        || receipt.title.as_ref().is_some_and(|title| {
+            title.is_empty() || title.len() > MAX_TITLE_BYTES
+        })
+        || receipt.ready_state.len() > MAX_SELECTOR_BYTES
+        || receipt.collector_version.is_empty()
+        || receipt.collector_version.len() > MAX_COLLECTOR_VERSION_BYTES
+        || receipt.collector_version.chars().any(char::is_control)
+        || receipt.protocol_version != PROTOCOL_VERSION
+        || receipt.viewport_png.as_ref().is_some_and(|artifact| {
+            artifact.media_type() != ArtifactMediaType::ImagePng
+                || usize::try_from(artifact.len()).ok().is_none_or(|len| {
+                    len == 0 || len > MAX_PNG_BYTES
+                })
+        })
     {
         return Err(CollectionError::CorruptReceipt);
     }
@@ -911,7 +1103,17 @@ fn encode_capture_receipt(receipt: &CaptureReceipt) -> Result<Vec<u8>, Collectio
         .map_err(|_| CollectionError::CorruptReceipt)?;
     let step_count = u8::try_from(receipt.steps.len())
         .map_err(|_| CollectionError::CorruptReceipt)?;
-    let mut bytes = Vec::with_capacity(96 + receipt.final_url.len() + receipt.steps.len() * 17);
+    let title_len = receipt.title.as_ref().map_or(0, String::len);
+    let title_len = u32::try_from(title_len)
+        .map_err(|_| CollectionError::CorruptReceipt)?;
+    let ready_state_len = u32::try_from(receipt.ready_state.len())
+        .map_err(|_| CollectionError::CorruptReceipt)?;
+    let collector_version_len = u16::try_from(receipt.collector_version.len())
+        .map_err(|_| CollectionError::CorruptReceipt)?;
+    let mut bytes = Vec::with_capacity(
+        160 + receipt.final_url.len() + usize::try_from(title_len).unwrap_or(0)
+            + receipt.steps.len() * 17,
+    );
     bytes.extend_from_slice(&RECEIPT_MAGIC);
     bytes.extend_from_slice(&RECEIPT_VERSION.to_le_bytes());
     bytes.extend_from_slice(&receipt.task_sha256);
@@ -939,6 +1141,22 @@ fn encode_capture_receipt(receipt: &CaptureReceipt) -> Result<Vec<u8>, Collectio
         bytes.extend_from_slice(&step.completed_at_unix_ms().to_le_bytes());
         bytes.extend_from_slice(&step.duration_ms().to_le_bytes());
     }
+    bytes.extend_from_slice(&receipt.capture_completed_at_ms.to_le_bytes());
+    bytes.extend_from_slice(&receipt.capture_duration_ms.to_le_bytes());
+    bytes.extend_from_slice(&receipt.protocol_version.to_le_bytes());
+    bytes.extend_from_slice(&title_len.to_le_bytes());
+    bytes.extend_from_slice(&ready_state_len.to_le_bytes());
+    bytes.extend_from_slice(&collector_version_len.to_le_bytes());
+    if let Some(title) = &receipt.title {
+        bytes.extend_from_slice(title.as_bytes());
+    }
+    bytes.extend_from_slice(receipt.ready_state.as_bytes());
+    bytes.extend_from_slice(receipt.collector_version.as_bytes());
+    bytes.push(u8::from(receipt.viewport_png.is_some()));
+    if let Some(viewport_png) = &receipt.viewport_png {
+        bytes.extend_from_slice(viewport_png.sha256());
+        bytes.extend_from_slice(&viewport_png.len().to_le_bytes());
+    }
     let checksum = dig2browser::digest::sha256_bytes(&bytes);
     bytes.extend_from_slice(&checksum);
     Ok(bytes)
@@ -954,7 +1172,11 @@ fn decode_capture_receipt(bytes: &[u8]) -> Result<CaptureReceipt, CollectionErro
         return Err(CollectionError::CorruptReceipt);
     }
     let mut input = ReceiptInput::new(payload);
-    if input.take(4)? != RECEIPT_MAGIC || input.u16()? != RECEIPT_VERSION {
+    if input.take(4)? != RECEIPT_MAGIC {
+        return Err(CollectionError::CorruptReceipt);
+    }
+    let version = input.u16()?;
+    if version != LEGACY_RECEIPT_VERSION && version != RECEIPT_VERSION {
         return Err(CollectionError::CorruptReceipt);
     }
     let task_sha256 = input.array()?;
@@ -1000,17 +1222,97 @@ fn decode_capture_receipt(bytes: &[u8]) -> Result<CaptureReceipt, CollectionErro
             StepOutcome::Succeeded,
         )?);
     }
+    let (
+        capture_completed_at_ms,
+        capture_duration_ms,
+        protocol_version,
+        title,
+        ready_state,
+        collector_version,
+        viewport_png,
+    ) =
+        if version == LEGACY_RECEIPT_VERSION {
+            (
+                terminal_at_ms,
+                0,
+                0,
+                None,
+                String::new(),
+                String::new(),
+                None,
+            )
+        } else {
+            let capture_completed_at_ms = input.u64()?;
+            let capture_duration_ms = input.u64()?;
+            let protocol_version = input.u16()?;
+            let title_len = usize::try_from(input.u32()?)
+                .map_err(|_| CollectionError::CorruptReceipt)?;
+            let ready_state_len = usize::try_from(input.u32()?)
+                .map_err(|_| CollectionError::CorruptReceipt)?;
+            let collector_version_len = usize::from(input.u16()?);
+            if title_len > MAX_TITLE_BYTES
+                || ready_state_len > MAX_SELECTOR_BYTES
+                || collector_version_len > MAX_COLLECTOR_VERSION_BYTES
+            {
+                return Err(CollectionError::CorruptReceipt);
+            }
+            let title = if title_len == 0 {
+                None
+            } else {
+                Some(
+                    std::str::from_utf8(input.take(title_len)?)
+                        .map_err(|_| CollectionError::CorruptReceipt)?
+                    .to_owned(),
+                )
+            };
+            let ready_state = std::str::from_utf8(input.take(ready_state_len)?)
+                .map_err(|_| CollectionError::CorruptReceipt)?
+                .to_owned();
+            let collector_version =
+                std::str::from_utf8(input.take(collector_version_len)?)
+                    .map_err(|_| CollectionError::CorruptReceipt)?
+                    .to_owned();
+            let viewport_png = match input.u8()? {
+                0 => None,
+                1 => Some(ArtifactRef::new(
+                    input.array()?,
+                    input.u64()?,
+                    ArtifactMediaType::ImagePng,
+                )?),
+                _ => return Err(CollectionError::CorruptReceipt),
+            };
+            (
+                capture_completed_at_ms,
+                capture_duration_ms,
+                protocol_version,
+                title,
+                ready_state,
+                collector_version,
+                viewport_png,
+            )
+        };
     if !input.is_empty() {
         return Err(CollectionError::CorruptReceipt);
     }
-    Ok(CaptureReceipt {
+    let receipt = CaptureReceipt {
         task_sha256,
         terminal_at_ms,
+        capture_completed_at_ms,
         final_url,
         http_status,
+        title,
+        ready_state,
+        capture_duration_ms,
+        collector_version,
+        protocol_version,
         html,
+        viewport_png,
         steps,
-    })
+    };
+    if version == RECEIPT_VERSION {
+        encode_capture_receipt(&receipt)?;
+    }
+    Ok(receipt)
 }
 
 fn capture_receipt_path(root: &Path, collection_id: CollectionId) -> PathBuf {
@@ -1161,6 +1463,10 @@ pub enum CollectionError {
     CorruptTrace,
     #[error("collection capture receipt is corrupt")]
     CorruptReceipt,
+    #[error("collection receipt is not ready")]
+    ReceiptNotReady,
+    #[error("collection did not produce a successful capture receipt")]
+    ReceiptUnavailable,
     #[error("collection terminal state could not be persisted")]
     TerminalPersistenceFailed,
     #[error("collection manager state is poisoned")]
