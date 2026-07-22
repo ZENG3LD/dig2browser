@@ -1,4 +1,8 @@
 #[cfg(windows)]
+#[path = "dig2browser_stationd/windows_wfp_provider.rs"]
+mod windows_wfp_provider;
+
+#[cfg(windows)]
 use std::io;
 #[cfg(windows)]
 use std::net::{IpAddr, SocketAddr};
@@ -18,10 +22,7 @@ use dig2browser::agentic::{
     BrowserWorkerConfig, NavigationPolicy, NavigationPolicyError,
 };
 #[cfg(windows)]
-use dig2browser::{
-    BrowserProcessIsolation, WindowsBrowserRuntimeMirror, WindowsRuntimeMirrorError,
-    WindowsRuntimeMirrorScope,
-};
+use dig2browser::BrowserProcessIsolation;
 #[cfg(windows)]
 use dig2browser_core::{RouteRef, RouteRefError};
 #[cfg(windows)]
@@ -39,9 +40,8 @@ use dig2browser_station::containment::{
 };
 #[cfg(windows)]
 use dig2browser_station::windows_wfp_broker::{
-    acquire_windows_wfp_lease, BrokerBrowser, WindowsWfpBrokerError,
-    WindowsWfpBrokerCapability, WindowsWfpBrokerRejectCode, WindowsWfpLease,
-    WindowsWfpLeaseLoss,
+    BrokerBrowser, WindowsWfpBrokerCapability, WindowsWfpBrokerError,
+    WindowsWfpBrokerRejectCode, WindowsWfpLeaseLoss,
 };
 #[cfg(windows)]
 use dig2browser_station::{
@@ -49,6 +49,10 @@ use dig2browser_station::{
     EgressPeerPolicy, EgressPeerPolicyError, EgressProxy, EgressReport,
     EgressRouteError, ProfilesRootError, ProfilesRootOwnership, RouteDescriptor,
     RouteRegistry, RouteRegistryError, RuntimeKind, RuntimeSelector, StationConfig,
+};
+#[cfg(windows)]
+use windows_wfp_provider::{
+    WindowsWfpContainment, WindowsWfpProvider, WindowsWfpProviderError,
 };
 
 #[cfg(windows)]
@@ -323,7 +327,13 @@ async fn run(cli: Cli) -> Result<DaemonReport, DaemonError> {
         cli.windows_wfp_broker_pipe.as_deref(),
     )
     .await?;
-    let containment_assurance = windows_containment.assurance;
+    let containment_assurance = windows_containment
+        .as_ref()
+        .map(WindowsWfpContainment::assurance);
+    let process_isolation = windows_containment
+        .as_ref()
+        .map(WindowsWfpContainment::process_isolation)
+        .unwrap_or(BrowserProcessIsolation::Native);
     let service_result = async {
         let route_registry = route_registry(
             &cli.direct_route_refs,
@@ -379,7 +389,7 @@ async fn run(cli: Cli) -> Result<DaemonReport, DaemonError> {
         .with_runtime_selector(cli.runtime.selector())
         .with_route_registry(route_registry)
         .with_navigation_policy(navigation_policy)
-        .with_process_isolation(windows_containment.process_isolation.clone())
+        .with_process_isolation(process_isolation)
         .with_worker_config(worker);
         let mut server_config = ServerConfig::new(
             cli.pipe_name,
@@ -419,10 +429,10 @@ async fn run(cli: Cli) -> Result<DaemonReport, DaemonError> {
             shutdown_rx,
         );
         tokio::pin!(service);
-        if let Some(lease) = windows_containment.lease.as_ref() {
+        if let Some(containment) = windows_containment.as_ref() {
             tokio::select! {
                 result = &mut service => result,
-                loss = lease.wait_for_unexpected_loss() => {
+                loss = containment.wait_for_unexpected_loss() => {
                     let _ = emergency_station.emergency_shutdown().await;
                     shutdown_tx.send_replace(true);
                     let _ = service.await;
@@ -439,7 +449,10 @@ async fn run(cli: Cli) -> Result<DaemonReport, DaemonError> {
         report
     });
     let containment_result = if service_result.is_ok() {
-        windows_containment.close_and_remove().await
+        match windows_containment {
+            Some(containment) => containment.close().await.map_err(DaemonError::from),
+            None => Ok(()),
+        }
     } else {
         // A failed station shutdown does not prove that every contained
         // process has exited. Dropping the client lease disconnects from the
@@ -464,9 +477,9 @@ async fn prepare_windows_containment(
     profiles_root: &std::path::Path,
     egress_proxy: Option<SocketAddr>,
     broker_pipe: Option<&str>,
-) -> Result<PreparedWindowsContainment, DaemonError> {
+) -> Result<Option<WindowsWfpContainment>, DaemonError> {
     if matches!(mode, WindowsContainmentArg::Off) {
-        return Ok(PreparedWindowsContainment::native());
+        return Ok(None);
     }
     if !navigation_policy.is_exact()
         || !matches!(runtime, RuntimeArg::Chrome | RuntimeArg::Edge)
@@ -493,36 +506,17 @@ async fn prepare_windows_containment(
             retain_on_provider_crash: true,
         },
     )?;
-    let assurance = request.require_assurance(ContainmentAssurance {
-        subject_scope: NetworkSubjectScope::KnownExecutableSet,
-        station_instance_exclusive: true,
-        coverage: NetworkCoverage {
-            raw_ip: true,
-            ..NetworkCoverage::attributed_inet()
-        },
-        provider_crash: ProviderCrashBehavior::EnforcementRetained,
-    })?;
-    let scope = WindowsRuntimeMirrorScope::for_profiles_root(profiles_root);
     let broker_capability = WindowsWfpBrokerCapability::read_from(
         std::io::stdin().lock(),
     )
     .map_err(DaemonError::WindowsWfpCapabilityStdin)?;
-    let acquisition = acquire_windows_wfp_lease(
-        broker_pipe,
+    let provider = WindowsWfpProvider::new(
+        broker_pipe.to_owned(),
         browser,
-        scope,
-        endpoint,
+        profiles_root,
         broker_capability,
-    )
-    .await?;
-    let (lease, mirror) = acquisition.into_parts();
-    let binary = mirror.browser_binary().clone();
-    Ok(PreparedWindowsContainment {
-        process_isolation: BrowserProcessIsolation::WindowsRuntimeMirror(binary),
-        lease: Some(lease),
-        mirror: Some(mirror),
-        assurance: Some(assurance),
-    })
+    );
+    Ok(Some(provider.acquire(&request).await?))
 }
 
 #[cfg(all(windows, feature = "containment-test-hooks"))]
@@ -550,36 +544,6 @@ fn containment_test_close_delay_argument(
     Ok(Some(format!(
         "--dig2browser-internal-test-cdp-close-delay-ms={delay_millis}"
     )))
-}
-
-#[cfg(windows)]
-struct PreparedWindowsContainment {
-    process_isolation: BrowserProcessIsolation,
-    lease: Option<WindowsWfpLease>,
-    mirror: Option<WindowsBrowserRuntimeMirror>,
-    assurance: Option<ContainmentAssurance>,
-}
-
-#[cfg(windows)]
-impl PreparedWindowsContainment {
-    fn native() -> Self {
-        Self {
-            process_isolation: BrowserProcessIsolation::Native,
-            lease: None,
-            mirror: None,
-            assurance: None,
-        }
-    }
-
-    async fn close_and_remove(self) -> Result<(), DaemonError> {
-        if let Some(lease) = self.lease {
-            lease.close().await?;
-        }
-        if let Some(mirror) = self.mirror {
-            mirror.remove()?;
-        }
-        Ok(())
-    }
 }
 
 #[cfg(windows)]
@@ -859,9 +823,7 @@ enum DaemonError {
     #[error(transparent)]
     BrowserDetect(#[from] dig2browser::detect::DetectError),
     #[error(transparent)]
-    WindowsRuntimeMirror(#[from] WindowsRuntimeMirrorError),
-    #[error(transparent)]
-    WindowsWfpBroker(#[from] WindowsWfpBrokerError),
+    WindowsWfpProvider(#[from] WindowsWfpProviderError),
     #[error("cannot read required Windows containment capability from stdin")]
     WindowsWfpCapabilityStdin(#[source] io::Error),
     #[error("Windows WFP broker lease was lost: {0}")]
@@ -901,20 +863,30 @@ impl DaemonError {
         match self {
             Self::ProfilesRoot(ProfilesRootError::AlreadyOwned) => "profiles_root_owned",
             Self::ProfilesRoot(_) => "profiles_root_unavailable",
-            Self::BrowserDetect(_) | Self::WindowsRuntimeMirror(_) => {
+            Self::BrowserDetect(_)
+            | Self::WindowsWfpProvider(WindowsWfpProviderError::Mirror(_)) => {
                 "containment_unavailable"
             }
-            Self::WindowsWfpBroker(WindowsWfpBrokerError::Rejected {
+            Self::WindowsWfpProvider(WindowsWfpProviderError::Broker(
+                WindowsWfpBrokerError::Rejected {
                 code: WindowsWfpBrokerRejectCode::InvalidProxy
                     | WindowsWfpBrokerRejectCode::InvalidScope
                     | WindowsWfpBrokerRejectCode::InvalidMirror
                     | WindowsWfpBrokerRejectCode::Protocol,
                 ..
-            })
-            | Self::WindowsWfpBroker(WindowsWfpBrokerError::InvalidPipeName) => {
+                },
+            ))
+            | Self::WindowsWfpProvider(WindowsWfpProviderError::Broker(
+                WindowsWfpBrokerError::InvalidPipeName,
+            ))
+            | Self::WindowsWfpProvider(
+                WindowsWfpProviderError::UnsupportedRequest(_)
+                    | WindowsWfpProviderError::Contract(_),
+            ) => {
                 "invalid_config"
             }
-            Self::WindowsWfpBroker(_) | Self::WindowsWfpCapabilityStdin(_) => {
+            Self::WindowsWfpProvider(WindowsWfpProviderError::Broker(_))
+            | Self::WindowsWfpCapabilityStdin(_) => {
                 "containment_unavailable"
             }
             Self::WindowsWfpLeaseLost(_) => "containment_lost",
