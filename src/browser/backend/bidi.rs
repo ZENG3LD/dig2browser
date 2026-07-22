@@ -715,6 +715,7 @@ fn quarantine_profile_after_unconfirmed_outcome(
 
 struct TeardownOutcome {
     process_termination_confirmed: bool,
+    webdriver_delete_confirmed: bool,
     result: Result<(), BrowserError>,
 }
 
@@ -725,14 +726,17 @@ fn reconcile_teardown_results(
     match (transport_result, webdriver_result) {
         (Ok(()), Ok(())) => TeardownOutcome {
             process_termination_confirmed: true,
+            webdriver_delete_confirmed: true,
             result: Ok(()),
         },
         (Err(transport_error), Ok(())) => TeardownOutcome {
             process_termination_confirmed: true,
+            webdriver_delete_confirmed: true,
             result: Err(transport_error),
         },
         (Ok(()), Err(webdriver_error)) => TeardownOutcome {
             process_termination_confirmed: false,
+            webdriver_delete_confirmed: false,
             result: Err(webdriver_error),
         },
         (Err(transport_error), Err(webdriver_error)) => {
@@ -741,9 +745,21 @@ fn reconcile_teardown_results(
             );
             TeardownOutcome {
                 process_termination_confirmed: false,
+                webdriver_delete_confirmed: false,
                 result: Err(webdriver_error),
             }
         }
+    }
+}
+
+fn accept_transport_error_after_confirmed_owned_termination(
+    outcome: &mut TeardownOutcome,
+) {
+    if outcome.process_termination_confirmed
+        && outcome.webdriver_delete_confirmed
+        && outcome.result.is_err()
+    {
+        outcome.result = Ok(());
     }
 }
 
@@ -944,6 +960,31 @@ mod lifecycle_tests {
         assert!(server.join().unwrap());
         assert!(outcome.process_termination_confirmed);
         assert!(matches!(outcome.result, Err(BrowserError::BiDi(_))));
+    }
+
+    #[test]
+    fn confirmed_delete_and_owned_termination_accept_transport_teardown_error() {
+        let mut closed = reconcile_teardown_results(
+            Err(BrowserError::BiDi(
+                crate::bidi::BiDiError::ConnectionClosed,
+            )),
+            Ok(()),
+        );
+        closed.process_termination_confirmed = true;
+        accept_transport_error_after_confirmed_owned_termination(&mut closed);
+        assert!(closed.result.is_ok());
+
+        let mut delete_failed = reconcile_teardown_results(
+            Err(BrowserError::BiDi(
+                crate::bidi::BiDiError::ConnectionClosed,
+            )),
+            Err(BrowserError::Other("WebDriver DELETE failed".into())),
+        );
+        delete_failed.process_termination_confirmed = true;
+        accept_transport_error_after_confirmed_owned_termination(
+            &mut delete_failed,
+        );
+        assert!(delete_failed.result.is_err());
     }
 
     #[test]
@@ -1150,7 +1191,12 @@ impl BrowserBackend for BiDiBrowserBackend {
                 )
                 .await
                 {
-                    Ok(()) => outcome.process_termination_confirmed = true,
+                    Ok(()) => {
+                        outcome.process_termination_confirmed = true;
+                        accept_transport_error_after_confirmed_owned_termination(
+                            &mut outcome,
+                        );
+                    }
                     Err(error) => {
                         outcome.process_termination_confirmed = false;
                         outcome.result = Err(error);

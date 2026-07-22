@@ -243,9 +243,14 @@ async fn run_route_matrix(
     let (stdout, stderr) = read_child_output(&mut daemon).await;
     assert!(
         status.success(),
-        "{runtime_name} route matrix station failed: {status}; stdout={stdout}; stderr={stderr}"
+        "{runtime_name} {} route matrix station failed: {status}; stdout={stdout}; stderr={stderr}",
+        scope.as_str(),
     );
-    assert!(stderr.is_empty(), "{runtime_name} route matrix stderr: {stderr}");
+    assert!(
+        stderr.is_empty(),
+        "{runtime_name} {} route matrix stderr: {stderr}",
+        scope.as_str(),
+    );
     remove_tree(&root).await;
 }
 
