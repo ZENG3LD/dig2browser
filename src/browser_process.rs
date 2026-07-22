@@ -66,6 +66,14 @@ impl BrowserProcess {
     pub(crate) fn resume(&mut self) -> io::Result<()> {
         self.process.resume()
     }
+
+    pub(crate) fn id(&self) -> Option<u32> {
+        #[cfg(windows)]
+        return self.process.id();
+
+        #[cfg(not(windows))]
+        self.process.id()
+    }
 }
 
 #[cfg(windows)]
@@ -102,6 +110,147 @@ impl WindowsProcess {
             Self::Native(process) => process.resume(),
             Self::Tokio(_) => Ok(()),
         }
+    }
+
+    fn id(&self) -> Option<u32> {
+        match self {
+            Self::Native(process) => Some(process.id()),
+            Self::Tokio(process) => process.id(),
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) struct SpawnedWindowsChildProcess {
+    pub(crate) process: BrowserProcess,
+    pub(crate) stdout: tokio::fs::File,
+    pub(crate) stderr: tokio::fs::File,
+}
+
+#[cfg(windows)]
+pub(crate) fn spawn_windows_child_suspended(
+    executable: &std::path::Path,
+    args: &[String],
+) -> io::Result<SpawnedWindowsChildProcess> {
+    use windows::Win32::Foundation::BOOL;
+    use windows::Win32::System::Threading::{
+        CreateProcessW, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+        STARTUPINFOEXW, CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT,
+    };
+    use windows::core::{PCWSTR, PWSTR};
+
+    let (stdout_input, stdout_output) = create_inherited_pipe(true)?;
+    let (stderr_input, stderr_output) = create_inherited_pipe(true)?;
+    let null_input = open_inherited_null(false)?;
+    let inherited = [stdout_output.raw(), stderr_output.raw(), null_input.raw()];
+    let attributes = ProcessAttributeList::with_inherited_handles(&inherited)?;
+    let mut startup = STARTUPINFOEXW::default();
+    startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = null_input.raw();
+    startup.StartupInfo.hStdOutput = stdout_output.raw();
+    startup.StartupInfo.hStdError = stderr_output.raw();
+    startup.lpAttributeList = attributes.raw();
+
+    let executable_wide = nul_terminated(executable.as_os_str())?;
+    let mut command_line = build_command_line(executable.as_os_str(), args)?;
+    let mut process_info = PROCESS_INFORMATION::default();
+    // SAFETY: every pointer references live storage and inheritance is limited
+    // to the three explicit standard-stream handles.
+    unsafe {
+        CreateProcessW(
+            PCWSTR(executable_wide.as_ptr()),
+            PWSTR(command_line.as_mut_ptr()),
+            None,
+            None,
+            BOOL(1),
+            CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT,
+            None,
+            PCWSTR::null(),
+            &startup.StartupInfo,
+            &mut process_info,
+        )
+    }
+    .map_err(windows_error)?;
+
+    drop(stdout_output);
+    drop(stderr_output);
+    let process = OwnedWindowsProcess {
+        process: OwnedWindowsHandle::new(process_info.hProcess),
+        thread: Some(OwnedWindowsHandle::new(process_info.hThread)),
+        resumed: false,
+    };
+    #[cfg(feature = "geckodriver-test-hooks")]
+    publish_suspended_geckodriver_for_test(&process)?;
+    Ok(SpawnedWindowsChildProcess {
+        process: BrowserProcess::from_windows(process),
+        stdout: into_tokio_file(stdout_input),
+        stderr: into_tokio_file(stderr_input),
+    })
+}
+
+#[cfg(all(windows, feature = "geckodriver-test-hooks"))]
+fn publish_suspended_geckodriver_for_test(
+    process: &OwnedWindowsProcess,
+) -> io::Result<()> {
+    use std::io::Write;
+
+    const REPORT_ENV: &str = "DIG2BROWSER_TEST_GECKODRIVER_REPORT_PATH";
+    const BARRIER_ENV: &str = "DIG2BROWSER_TEST_GECKODRIVER_RESUME_BARRIER_PATH";
+    const BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+    let (report, barrier) = match (
+        std::env::var_os(REPORT_ENV),
+        std::env::var_os(BARRIER_ENV),
+    ) {
+        (None, None) => return Ok(()),
+        (Some(report), Some(barrier)) => (report, barrier),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{REPORT_ENV} and {BARRIER_ENV} must be set together"),
+            ));
+        }
+    };
+    let report = std::path::PathBuf::from(report);
+    let barrier = std::path::PathBuf::from(barrier);
+    let mut publishing_name = report.as_os_str().to_os_string();
+    publishing_name.push(".publishing");
+    let publishing = std::path::PathBuf::from(publishing_name);
+    let pid = process.id();
+    if pid == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let creation_filetime = process.creation_filetime()?;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&publishing)?;
+    writeln!(output, "{pid} {creation_filetime}")?;
+    output.sync_all()?;
+    drop(output);
+    std::fs::rename(&publishing, &report)?;
+
+    let started = std::time::Instant::now();
+    loop {
+        match std::fs::metadata(&barrier) {
+            Ok(metadata) if metadata.is_file() => return Ok(()),
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "geckodriver test resume barrier is not a file",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        if started.elapsed() >= BARRIER_TIMEOUT {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out waiting for geckodriver test resume barrier",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
 
@@ -227,6 +376,43 @@ struct OwnedWindowsProcess {
 
 #[cfg(windows)]
 impl OwnedWindowsProcess {
+    fn id(&self) -> u32 {
+        use windows::Win32::System::Threading::GetProcessId;
+
+        // SAFETY: the process handle remains valid for this wrapper's life.
+        unsafe { GetProcessId(self.process.raw()) }
+    }
+
+    #[cfg(feature = "geckodriver-test-hooks")]
+    fn creation_filetime(&self) -> io::Result<u64> {
+        use windows::Win32::Foundation::FILETIME;
+        use windows::Win32::System::Threading::GetProcessTimes;
+
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        // SAFETY: the process handle remains valid for this wrapper's life.
+        unsafe {
+            GetProcessTimes(
+                self.process.raw(),
+                &mut creation,
+                &mut exit,
+                &mut kernel,
+                &mut user,
+            )
+        }
+        .map_err(windows_error)?;
+        let value =
+            ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
+        if value == 0 {
+            return Err(io::Error::other(
+                "Windows returned an invalid process creation FILETIME",
+            ));
+        }
+        Ok(value)
+    }
+
     fn resume(&mut self) -> io::Result<()> {
         use windows::Win32::System::Threading::ResumeThread;
 

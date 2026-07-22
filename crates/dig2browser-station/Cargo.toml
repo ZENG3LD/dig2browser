@@ -11,7 +11,10 @@ path = "src/lib.rs"
 
 [features]
 default = []
+containment-test-hooks = ["dig2browser/containment-test-hooks"]
 crawler-test-hooks = []
+geckodriver-test-hooks = ["dig2browser/geckodriver-test-hooks"]
+runtime-test-hooks = ["dig2browser/runtime-test-hooks"]
 tls-test-hooks = ["dep:base64"]
 
 [dependencies]
@@ -24,12 +27,26 @@ dig2browser-crawler = { path = "../dig2browser-crawler" }
 dig2browser-protocol = { path = "../dig2browser-protocol" }
 dig2browser-runtime-lightweight = { path = "../dig2browser-runtime-lightweight" }
 dig2browser-trace = { path = "../dig2browser-trace" }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Pipes",
+    "Win32_System_Rpc",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
 
 [dev-dependencies]
 dig2browser-client = { path = "../dig2browser-client" }
 dig2browser-probe = { path = "../dig2browser-probe" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
-uuid = { version = "1", features = ["v4"] }

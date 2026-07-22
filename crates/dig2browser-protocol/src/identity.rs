@@ -406,6 +406,7 @@ fn preset_to_wire(preset: PersonaPreset) -> u8 {
         PersonaPreset::ChromeWindowsDesktopV1 => 2,
         PersonaPreset::EdgeWindowsDesktopV1 => 3,
         PersonaPreset::ChromeAndroidPixel7MobileWebV1 => 4,
+        PersonaPreset::FirefoxWindowsDesktopV1 => 5,
     }
 }
 
@@ -415,6 +416,7 @@ fn preset_from_wire(value: u8) -> Result<PersonaPreset, ProtocolError> {
         2 => Ok(PersonaPreset::ChromeWindowsDesktopV1),
         3 => Ok(PersonaPreset::EdgeWindowsDesktopV1),
         4 => Ok(PersonaPreset::ChromeAndroidPixel7MobileWebV1),
+        5 => Ok(PersonaPreset::FirefoxWindowsDesktopV1),
         _ => Err(ProtocolError::InvalidIdentityPayload),
     }
 }
@@ -506,6 +508,23 @@ mod tests {
         assert_eq!(decoded.preset(), Some(PersonaPreset::ChromeAndroidPixel7MobileWebV1));
         assert_eq!(decoded.route_ref(), Some(&route_ref));
         assert!(decoded.is_compiled());
+
+        let firefox_route = RouteRef::new("Firefox_01.west")
+            .expect("Firefox route reference");
+        let firefox = BrowserPersona::compiled(
+            PersonaPreset::FirefoxWindowsDesktopV1,
+            firefox_route.clone(),
+        )
+        .expect("compiled Firefox persona");
+        let encoded = firefox.encode().expect("encode Firefox persona");
+        let metadata_offset = encoded.len() - firefox_route.as_str().len() - 2;
+        assert_eq!(encoded[metadata_offset], 5);
+        let (decoded, consumed) = BrowserPersona::decode(&encoded)
+            .expect("decode compiled Firefox persona");
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, firefox);
+        assert_eq!(decoded.preset(), Some(PersonaPreset::FirefoxWindowsDesktopV1));
+        assert_eq!(decoded.route_ref(), Some(&firefox_route));
     }
 
     #[test]

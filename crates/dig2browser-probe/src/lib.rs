@@ -555,6 +555,16 @@ fn validate_user_agent(
                 && is_windows_x64_chromium(user_agent)
                 && has_product_token(user_agent, "Edg/")
         }
+        PersonaPreset::FirefoxWindowsDesktopV1 => {
+            runtime_kind == RuntimeKind::Firefox
+                && user_agent.contains("Windows NT ")
+                && has_word(user_agent, "Win64")
+                && has_word(user_agent, "x64")
+                && has_product_token(user_agent, "Firefox/")
+                && has_product_token(user_agent, "Gecko/")
+                && !has_product_token(user_agent, "Chrome/")
+                && !contains_edge_product(user_agent)
+        }
         PersonaPreset::ChromiumDesktopPrivacyCohortV1 => {
             is_windows_x64_chromium(user_agent)
                 && match runtime_kind {

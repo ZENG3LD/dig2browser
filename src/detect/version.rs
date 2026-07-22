@@ -70,8 +70,31 @@ fn parse_version_4(s: &str) -> Option<[u32; 4]> {
 
 #[cfg(target_os = "windows")]
 fn registry_version(kind: BrowserKind) -> Option<String> {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegGetValueW, RegOpenCurrentUser, HKEY, KEY_QUERY_VALUE,
+        REG_SZ, REG_VALUE_TYPE, RRF_RT_REG_SZ,
+    };
+
+    struct OwnedRegistryKey(HKEY);
+
+    impl Drop for OwnedRegistryKey {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = RegCloseKey(self.0);
+            }
+        }
+    }
+
+    fn wide(value: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(value)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
 
     // Registry path and value for BLBeacon
     let subkey: &str = match kind {
@@ -82,49 +105,62 @@ fn registry_version(kind: BrowserKind) -> Option<String> {
         BrowserKind::Firefox => return None,
     };
 
-    // Use windows-sys / raw registry API via the `windows` crate features.
-    // Win32_System_Registry is not in our feature set, so we fall back to
-    // std::process::Command on `reg query` which is universally available
-    // and avoids adding a new windows feature.
-    let output = std::process::Command::new("reg")
-        .args([
-            "query",
-            &format!("HKCU\\{}", subkey),
-            "/v",
-            "version",
-        ])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
+    // Use RegOpenCurrentUser rather than the cached HKEY_CURRENT_USER alias so
+    // an impersonating broker reads the pipe peer's hive. This path must never
+    // spawn an external utility from an elevated process.
+    let mut current_user = HKEY::default();
+    if unsafe { RegOpenCurrentUser(KEY_QUERY_VALUE.0, &mut current_user) }
+        != ERROR_SUCCESS
+    {
         return None;
     }
-
-    // reg query output looks like:
-    //     version    REG_SZ    125.0.2535.92
-    let stdout = OsString::from_wide(
-        &output
-            .stdout
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect::<Vec<_>>(),
-    );
-    // stdout is likely plain UTF-8 on modern Windows; try that first.
-    let text = String::from_utf8(output.stdout).ok()?;
-    parse_reg_query_version(&text)
-        .or_else(|| parse_reg_query_version(&stdout.to_string_lossy()))
-}
-
-/// Extract the version token from `reg query` output.
-fn parse_reg_query_version(text: &str) -> Option<String> {
-    // Line format: `    version    REG_SZ    125.0.2535.92`
-    for line in text.lines() {
-        if line.contains("REG_SZ") {
-            let token = line.split_whitespace().last()?;
-            if parse_version_4(token).is_some() {
-                return Some(token.to_owned());
-            }
-        }
+    let current_user = OwnedRegistryKey(current_user);
+    let subkey = wide(subkey);
+    let value_name = wide("version");
+    let mut value_type = REG_VALUE_TYPE::default();
+    let mut byte_len = 0_u32;
+    let status = unsafe {
+        RegGetValueW(
+            current_user.0,
+            PCWSTR(subkey.as_ptr()),
+            PCWSTR(value_name.as_ptr()),
+            RRF_RT_REG_SZ,
+            Some(&mut value_type),
+            None,
+            Some(&mut byte_len),
+        )
+    };
+    if status != ERROR_SUCCESS
+        || value_type != REG_SZ
+        || !(2..=256).contains(&byte_len)
+        || byte_len & 1 != 0
+    {
+        return None;
     }
-    None
+    let mut value = vec![0_u16; byte_len as usize / 2];
+    let status = unsafe {
+        RegGetValueW(
+            current_user.0,
+            PCWSTR(subkey.as_ptr()),
+            PCWSTR(value_name.as_ptr()),
+            RRF_RT_REG_SZ,
+            Some(&mut value_type),
+            Some(value.as_mut_ptr().cast()),
+            Some(&mut byte_len),
+        )
+    };
+    if status != ERROR_SUCCESS || value_type != REG_SZ || byte_len & 1 != 0 {
+        return None;
+    }
+    let returned_units = (byte_len as usize / 2).min(value.len());
+    value.truncate(returned_units);
+    if value.last() == Some(&0) {
+        value.pop();
+    }
+    let version = String::from_utf16(&value).ok()?;
+    let parsed = parse_version_4(&version)?;
+    Some(format!(
+        "{}.{}.{}.{}",
+        parsed[0], parsed[1], parsed[2], parsed[3]
+    ))
 }

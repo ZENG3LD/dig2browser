@@ -3,6 +3,7 @@ use futures::future::BoxFuture;
 use crate::browser::{DevToolsEvent, NetworkEvent, PageDevTools, StealthBrowser, StealthPage};
 use crate::detect::{BrowserPreference, BrowserProfile, LaunchConfig};
 use crate::identity::{BrowserBackend, DevicePersona, IdentityProfile};
+use crate::process_isolation::BrowserProcessIsolation;
 use crate::stealth::StealthConfig;
 
 use super::contract::{CaptureArtifact, CapturePolicy, DocumentState, RuntimeFailureKind};
@@ -56,6 +57,7 @@ pub struct RealBrowserRuntime {
     stealth: StealthConfig,
     mobile_layout: Option<MobileLayout>,
     navigation_policy: NavigationPolicy,
+    process_isolation: BrowserProcessIsolation,
     browser: Option<StealthBrowser>,
     page: Option<StealthPage>,
     devtools: Option<PageDevTools>,
@@ -81,14 +83,36 @@ impl RealBrowserRuntime {
 
     pub fn new_with_navigation_policy(
         identity: IdentityProfile,
+        launch: LaunchConfig,
+        stealth: StealthConfig,
+        mobile_layout: Option<MobileLayout>,
+        navigation_policy: NavigationPolicy,
+    ) -> RuntimeResult<Self> {
+        Self::new_with_navigation_policy_and_process_isolation(
+            identity,
+            launch,
+            stealth,
+            mobile_layout,
+            navigation_policy,
+            BrowserProcessIsolation::Native,
+        )
+    }
+
+    pub fn new_with_navigation_policy_and_process_isolation(
+        identity: IdentityProfile,
         mut launch: LaunchConfig,
         mut stealth: StealthConfig,
         mobile_layout: Option<MobileLayout>,
         navigation_policy: NavigationPolicy,
+        process_isolation: BrowserProcessIsolation,
     ) -> RuntimeResult<Self> {
-        if identity.backend() != BrowserBackend::Chromium
-            || launch.browser_pref == BrowserPreference::Firefox
-        {
+        let backend_matches = match launch.browser_pref {
+            BrowserPreference::Firefox => identity.backend() == BrowserBackend::Firefox,
+            BrowserPreference::Auto
+            | BrowserPreference::ChromeOnly
+            | BrowserPreference::EdgeOnly => identity.backend() == BrowserBackend::Chromium,
+        };
+        if !backend_matches {
             return Err(RuntimeError::new(RuntimeFailureKind::Launch));
         }
         match (identity.device(), mobile_layout.is_some()) {
@@ -112,6 +136,7 @@ impl RealBrowserRuntime {
             stealth,
             mobile_layout,
             navigation_policy,
+            process_isolation,
             browser: None,
             page: None,
             devtools: None,
@@ -126,12 +151,16 @@ impl RealBrowserRuntime {
         }
         self.launch.profile = BrowserProfile::Persistent(self.identity.profile_dir().to_path_buf());
 
-        let browser = StealthBrowser::launch_with(self.launch.clone(), self.stealth.clone())
-            .await
-            .map_err(|error| {
-                tracing::debug!(%error, "browser runtime launch failed");
-                RuntimeError::new(RuntimeFailureKind::Launch)
-            })?;
+        let browser = StealthBrowser::launch_with_process_isolation(
+            self.launch.clone(),
+            self.stealth.clone(),
+            self.process_isolation.clone(),
+        )
+        .await
+        .map_err(|error| {
+            tracing::debug!(%error, "browser runtime launch failed");
+            RuntimeError::new(RuntimeFailureKind::Launch)
+        })?;
         let page = match browser.new_blank_page().await {
             Ok(page) => page,
             Err(error) => {
@@ -190,14 +219,11 @@ impl RealBrowserRuntime {
         self.devtools.take();
         self.document_http_status = None;
         self.navigation_count = 0;
-        let close_result = if let Some(browser) = self.browser.take() {
-            browser
-                .close()
-                .await
-                .map_err(|_| RuntimeError::new(RuntimeFailureKind::Shutdown))
-        } else {
-            Ok(())
-        };
+        self.release_current_browser().await?;
+        self.start_inner().await
+    }
+
+    async fn release_current_browser(&mut self) -> RuntimeResult<()> {
         let policy_result = match &self.page {
             Some(page) => page
                 .clear_page_request_policy()
@@ -206,32 +232,21 @@ impl RealBrowserRuntime {
             None => Ok(()),
         };
         self.page.take();
-        close_result?;
-        policy_result?;
-        self.start_inner().await
+        let close_result = if let Some(browser) = self.browser.take() {
+            browser
+                .close()
+                .await
+                .map_err(|_| RuntimeError::new(RuntimeFailureKind::Shutdown))
+        } else {
+            Ok(())
+        };
+        policy_result.and(close_result)
     }
 
     async fn close_inner(&mut self) -> RuntimeResult<()> {
         self.devtools.take();
         self.document_http_status = None;
-        let close_result = if let Some(browser) = self.browser.take() {
-            browser
-                .close()
-                .await
-                .map_err(|_| RuntimeError::new(RuntimeFailureKind::Shutdown))
-        } else {
-            Ok(())
-        };
-        let policy_result = match &self.page {
-            Some(page) => page
-                .clear_page_request_policy()
-                .await
-                .map_err(|_| RuntimeError::new(RuntimeFailureKind::Shutdown)),
-            None => Ok(()),
-        };
-        self.page.take();
-        policy_result?;
-        close_result
+        self.release_current_browser().await
     }
 
     fn page(&self) -> RuntimeResult<&StealthPage> {
@@ -456,7 +471,10 @@ impl BrowserRuntime for RealBrowserRuntime {
                         .page()?
                         .html()
                         .await
-                        .map_err(|_| RuntimeError::new(RuntimeFailureKind::Capture))?;
+                        .map_err(|error| {
+                            report_test_capture_failure("html", &error);
+                            RuntimeError::new(RuntimeFailureKind::Capture)
+                        })?;
                     Ok(CaptureArtifact::HtmlOnly { state, html })
                 }
                 CapturePolicy::EvidenceViewport => {
@@ -464,18 +482,34 @@ impl BrowserRuntime for RealBrowserRuntime {
                         .page()?
                         .html()
                         .await
-                        .map_err(|_| RuntimeError::new(RuntimeFailureKind::Capture))?;
+                        .map_err(|error| {
+                            report_test_capture_failure("html", &error);
+                            RuntimeError::new(RuntimeFailureKind::Capture)
+                        })?;
                     let png = self
                         .page()?
                         .screenshot()
                         .await
-                        .map_err(|_| RuntimeError::new(RuntimeFailureKind::Capture))?;
+                        .map_err(|error| {
+                            report_test_capture_failure("screenshot", &error);
+                            RuntimeError::new(RuntimeFailureKind::Capture)
+                        })?;
                     Ok(CaptureArtifact::EvidenceViewport { state, html, png })
                 }
             }
         })
     }
 }
+
+#[cfg(feature = "runtime-test-hooks")]
+fn report_test_capture_failure(stage: &str, error: &dyn std::fmt::Display) {
+    if std::env::var_os("DIG2BROWSER_TEST_CAPTURE_DIAGNOSTICS").is_some() {
+        eprintln!("dig2browser_test_capture_failure stage={stage} error={error}");
+    }
+}
+
+#[cfg(not(feature = "runtime-test-hooks"))]
+fn report_test_capture_failure(_stage: &str, _error: &dyn std::fmt::Display) {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeError {

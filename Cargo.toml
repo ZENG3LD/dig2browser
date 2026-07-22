@@ -47,6 +47,12 @@ path = "src/bin/dig2_wasm_test.rs"
 name = "dig2browser"
 path = "src/lib.rs"
 
+[features]
+default = []
+containment-test-hooks = []
+geckodriver-test-hooks = []
+runtime-test-hooks = []
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
@@ -81,9 +87,12 @@ windows = { version = "0.58", features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_Networking_WinSock",
     "Win32_Storage_FileSystem",
+    "Win32_System_Com",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_JobObjects",
     "Win32_System_Memory",
     "Win32_System_Pipes",
+    "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_UI_Shell",
 ] }

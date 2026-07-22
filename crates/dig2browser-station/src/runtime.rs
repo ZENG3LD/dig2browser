@@ -11,6 +11,7 @@ use dig2browser::detect::{
     BrowserPreference, detect_browser, version::browser_version,
 };
 use dig2browser::identity::IdentityProfile;
+use dig2browser::BrowserProcessIsolation;
 use dig2browser_core::{
     ControlTransport, EngineFamily, FeatureSupport, NegotiationError,
     ResolvedRuntime, RuntimeDescriptor, RuntimeFeature, RuntimeKind,
@@ -72,6 +73,27 @@ pub trait RuntimeFactory: Send + Sync {
         }
         self.spawn_with_navigation_policy(identity, capabilities, policy, config)
     }
+
+    fn spawn_with_station_egress_and_process_isolation(
+        &self,
+        identity: IdentityProfile,
+        capabilities: CapabilitySet,
+        policy: NavigationPolicy,
+        egress_proxy: Option<SocketAddr>,
+        process_isolation: BrowserProcessIsolation,
+        config: BrowserWorkerConfig,
+    ) -> Result<BrowserWorker, WorkerError> {
+        if !process_isolation.is_native() {
+            return Err(WorkerError::InvalidInput);
+        }
+        self.spawn_with_station_egress(
+            identity,
+            capabilities,
+            policy,
+            egress_proxy,
+            config,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +153,9 @@ impl RuntimeRegistry {
 
     pub fn builtin_defaults() -> Self {
         let mut registry = Self::chromium_defaults();
+        registry
+            .register(FirefoxRuntimeFactory::new(), true)
+            .expect("built-in Firefox runtime kind must be unique");
         registry
             .register_with_station_egress(
                 LightweightRuntimeFactory::new(),
@@ -300,13 +325,15 @@ impl PreparedRuntime {
         capabilities: CapabilitySet,
         policy: NavigationPolicy,
         egress_proxy: Option<SocketAddr>,
+        process_isolation: BrowserProcessIsolation,
         config: BrowserWorkerConfig,
     ) -> Result<BrowserWorker, WorkerError> {
-        self.factory.spawn_with_station_egress(
+        self.factory.spawn_with_station_egress_and_process_isolation(
             identity,
             capabilities,
             policy,
             egress_proxy,
+            process_isolation,
             config,
         )
     }
@@ -386,16 +413,35 @@ impl ChromiumRuntimeFactory {
 
 fn chromium_station_egress_args(
     endpoint: SocketAddr,
-) -> Result<[String; 4], WorkerError> {
+    mitigate_direct_webrtc_udp: bool,
+) -> Result<Vec<String>, WorkerError> {
     if !endpoint.ip().is_loopback() || endpoint.port() == 0 {
         return Err(WorkerError::InvalidInput);
     }
-    Ok([
+    let mut arguments = vec![
         format!("--proxy-server=http://{endpoint}"),
         "--proxy-bypass-list=<-loopback>".to_owned(),
         "--disable-quic".to_owned(),
-        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_owned(),
-    ])
+    ];
+    if mitigate_direct_webrtc_udp {
+        arguments.push(
+            "--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_owned(),
+        );
+    }
+    Ok(arguments)
+}
+
+#[cfg(feature = "containment-test-hooks")]
+fn mitigate_direct_webrtc_udp() -> bool {
+    !matches!(
+        std::env::var("DIG2BROWSER_TEST_ALLOW_DIRECT_WEBRTC_UDP").as_deref(),
+        Ok("1")
+    )
+}
+
+#[cfg(not(feature = "containment-test-hooks"))]
+fn mitigate_direct_webrtc_udp() -> bool {
+    true
 }
 
 impl RuntimeFactory for ChromiumRuntimeFactory {
@@ -462,9 +508,146 @@ impl RuntimeFactory for ChromiumRuntimeFactory {
             config
                 .launch
                 .extra_args
-                .extend(chromium_station_egress_args(endpoint)?);
+                .extend(chromium_station_egress_args(
+                    endpoint,
+                    mitigate_direct_webrtc_udp(),
+                )?);
         }
         self.spawn_with_navigation_policy(identity, capabilities, policy, config)
+    }
+
+    fn spawn_with_station_egress_and_process_isolation(
+        &self,
+        identity: IdentityProfile,
+        capabilities: CapabilitySet,
+        policy: NavigationPolicy,
+        egress_proxy: Option<SocketAddr>,
+        process_isolation: BrowserProcessIsolation,
+        mut config: BrowserWorkerConfig,
+    ) -> Result<BrowserWorker, WorkerError> {
+        if let Some(endpoint) = egress_proxy {
+            config
+                .launch
+                .extra_args
+                .extend(chromium_station_egress_args(
+                    endpoint,
+                    mitigate_direct_webrtc_udp(),
+                )?);
+        }
+        config.launch.browser_pref = self.preference;
+        config.stealth.user_agent.clear();
+        BrowserWorker::spawn_with_navigation_policy_and_process_isolation(
+            identity,
+            capabilities,
+            config,
+            policy,
+            process_isolation,
+        )
+    }
+}
+
+struct FirefoxRuntimeFactory {
+    descriptor: RuntimeDescriptor,
+}
+
+impl FirefoxRuntimeFactory {
+    fn new() -> Self {
+        let native = [
+            RuntimeFeature::DomInspect,
+            RuntimeFeature::DomInteract,
+            RuntimeFeature::ScriptEvaluate,
+            RuntimeFeature::Navigate,
+            RuntimeFeature::CaptureState,
+            RuntimeFeature::CaptureHtml,
+            RuntimeFeature::CaptureViewportPng,
+            RuntimeFeature::Lifecycle,
+            RuntimeFeature::PersistentProfile,
+            RuntimeFeature::HeadfulAuthentication,
+            RuntimeFeature::DesktopWeb,
+        ];
+        let mut features = native
+            .into_iter()
+            .map(|feature| FeatureSupport::new(feature, SupportLevel::Native, Vec::new()))
+            .collect::<Vec<_>>();
+        for feature in [
+            RuntimeFeature::PointerInput,
+            RuntimeFeature::KeyboardInput,
+            RuntimeFeature::ScrollInput,
+        ] {
+            features.push(FeatureSupport::new(
+                feature,
+                SupportLevel::Partial,
+                vec![RuntimeLimitation::NoInteractiveDom],
+            ));
+        }
+        let mobile_limitations = vec![
+            RuntimeLimitation::NoNativeMobileApis,
+            RuntimeLimitation::NoCarrierState,
+            RuntimeLimitation::NoHardwareAttestation,
+            RuntimeLimitation::NoPersonaEmulation,
+        ];
+        features.push(FeatureSupport::new(
+            RuntimeFeature::MobileWebEmulation,
+            SupportLevel::Unsupported,
+            mobile_limitations.clone(),
+        ));
+        features.push(FeatureSupport::new(
+            RuntimeFeature::NativeMobileDevice,
+            SupportLevel::Unsupported,
+            mobile_limitations,
+        ));
+        Self {
+            descriptor: RuntimeDescriptor::new(
+                RuntimeKind::Firefox,
+                EngineFamily::Gecko,
+                ControlTransport::WebDriverBidi,
+                features,
+            )
+            .expect("built-in Firefox descriptor must not duplicate features"),
+        }
+    }
+}
+
+impl RuntimeFactory for FirefoxRuntimeFactory {
+    fn descriptor(&self) -> &RuntimeDescriptor {
+        &self.descriptor
+    }
+
+    fn probe_version(&self) -> Result<Option<String>, RuntimeRegistryError> {
+        detect_browser(BrowserPreference::Firefox)
+            .map_err(|_| RuntimeRegistryError::Unavailable(RuntimeKind::Firefox))?;
+        Ok(None)
+    }
+
+    fn spawn(
+        &self,
+        identity: IdentityProfile,
+        capabilities: CapabilitySet,
+        mut config: BrowserWorkerConfig,
+    ) -> Result<BrowserWorker, WorkerError> {
+        config.launch.browser_pref = BrowserPreference::Firefox;
+        config.stealth.user_agent.clear();
+        BrowserWorker::spawn(identity, capabilities, config)
+    }
+
+    fn spawn_with_navigation_policy(
+        &self,
+        identity: IdentityProfile,
+        capabilities: CapabilitySet,
+        policy: NavigationPolicy,
+        mut config: BrowserWorkerConfig,
+    ) -> Result<BrowserWorker, WorkerError> {
+        if policy.is_exact() {
+            return Err(WorkerError::InvalidInput);
+        }
+        config.launch.browser_pref = BrowserPreference::Firefox;
+        config.stealth.user_agent.clear();
+        BrowserWorker::spawn_with_navigation_policy(
+            identity,
+            capabilities,
+            config,
+            policy,
+        )
     }
 }
 
@@ -725,8 +908,8 @@ mod tests {
     fn chromium_station_egress_arguments_are_exact_and_bounded() {
         let endpoint = "127.0.0.1:18080".parse().expect("loopback endpoint");
         assert_eq!(
-            chromium_station_egress_args(endpoint).expect("valid endpoint"),
-            [
+            chromium_station_egress_args(endpoint, true).expect("valid endpoint"),
+            vec![
                 "--proxy-server=http://127.0.0.1:18080".to_owned(),
                 "--proxy-bypass-list=<-loopback>".to_owned(),
                 "--disable-quic".to_owned(),
@@ -736,15 +919,31 @@ mod tests {
         );
         assert!(matches!(
             chromium_station_egress_args(
-                "192.0.2.1:18080".parse().expect("non-loopback endpoint")
+                "192.0.2.1:18080".parse().expect("non-loopback endpoint"),
+                true,
             ),
             Err(WorkerError::InvalidInput)
         ));
         assert!(matches!(
             chromium_station_egress_args(
-                "127.0.0.1:0".parse().expect("zero-port endpoint")
+                "127.0.0.1:0".parse().expect("zero-port endpoint"),
+                true,
             ),
             Err(WorkerError::InvalidInput)
         ));
+    }
+
+    #[cfg(feature = "containment-test-hooks")]
+    #[test]
+    fn containment_test_hook_can_remove_only_the_webrtc_udp_mitigation() {
+        let arguments = chromium_station_egress_args(
+            "127.0.0.1:18080".parse().expect("loopback endpoint"),
+            false,
+        )
+        .expect("valid endpoint");
+        assert!(arguments.iter().any(|argument| argument == "--disable-quic"));
+        assert!(!arguments.iter().any(|argument| {
+            argument.starts_with("--force-webrtc-ip-handling-policy=")
+        }));
     }
 }

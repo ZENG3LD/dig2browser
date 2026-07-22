@@ -12,6 +12,7 @@ pub enum IdentityClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BrowserBackend {
     Chromium,
+    Firefox,
     Lightweight,
 }
 

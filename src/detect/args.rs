@@ -1,6 +1,8 @@
 //! Browser launch argument builder.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::detect::binary::BrowserPreference;
 use crate::detect::DetectError;
@@ -29,6 +31,20 @@ pub enum BrowserProfile {
     Persistent(PathBuf),
 }
 
+/// Browser-level outbound proxy selection.
+///
+/// This configures the browser runtime only. Process-level containment is a
+/// separate boundary and must not be inferred from this setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserProxy {
+    /// Use the browser's direct connection mode.
+    Direct,
+    /// Route HTTP and HTTPS traffic through an HTTP proxy.
+    Http(SocketAddr),
+    /// Route browser traffic through a SOCKS5 proxy.
+    Socks5(SocketAddr),
+}
+
 /// Configuration for launching a browser process.
 #[derive(Debug, Clone)]
 pub struct LaunchConfig {
@@ -37,6 +53,9 @@ pub struct LaunchConfig {
     pub profile: BrowserProfile,
     pub debug_port: Option<u16>,
     pub extra_args: Vec<String>,
+    /// Browser-owned outbound proxy selection. `None` preserves caller-supplied
+    /// proxy arguments for backwards compatibility.
+    pub browser_proxy: Option<BrowserProxy>,
     pub browser_pref: BrowserPreference,
     /// Renderer sandbox policy. Defaults to [`RendererSandboxMode::Enabled`].
     pub renderer_sandbox: RendererSandboxMode,
@@ -46,6 +65,11 @@ pub struct LaunchConfig {
     /// GeckoDriver URL. Only used when `browser_pref = Firefox`.
     /// Default: `"http://localhost:4444"`.
     pub geckodriver_url: String,
+    /// Station-owned GeckoDriver executable. When set, one isolated driver is
+    /// launched for this browser worker and `geckodriver_url` is ignored.
+    pub geckodriver_binary: Option<PathBuf>,
+    /// Maximum time to wait for an owned GeckoDriver listener.
+    pub geckodriver_startup_timeout: Duration,
 }
 
 impl Default for LaunchConfig {
@@ -56,10 +80,13 @@ impl Default for LaunchConfig {
             profile: BrowserProfile::Ephemeral,
             debug_port: None,
             extra_args: Vec::new(),
+            browser_proxy: None,
             browser_pref: BrowserPreference::Auto,
             renderer_sandbox: RendererSandboxMode::Enabled,
             restart_after_pages: 500,
             geckodriver_url: "http://localhost:4444".into(),
+            geckodriver_binary: None,
+            geckodriver_startup_timeout: Duration::from_secs(15),
         }
     }
 }
@@ -100,13 +127,13 @@ impl LaunchConfig {
         args.push("--disable-infobars".into());
         args.push("--disable-extensions".into());
         args.push("--disable-background-networking".into());
+        args.push("--disable-background-mode".into());
         args.push("--no-first-run".into());
         args.push("--disable-sync".into());
         args.push("--disable-default-apps".into());
-        // Do NOT use --disable-gpu: it exposes headless mode via WebGPU/WebGL absence.
-        // Use ANGLE (hardware-accelerated via D3D11) — same as real Chrome on Windows.
-        // SwiftShader is too slow for heavy WebGL SPAs like 2GIS maps.
-        args.push("--use-angle=d3d11".into());
+        // Keep GPU support enabled, but let Chromium select its native ANGLE
+        // backend. A forced backend disables Chromium's compatibility fallback
+        // and can make an otherwise healthy installed browser fail at GPU init.
         if self.renderer_sandbox == RendererSandboxMode::CompatibilityDisabled {
             args.push("--no-sandbox".into());
         }
@@ -129,6 +156,22 @@ impl LaunchConfig {
         // Caller-provided flags are useful for feature and proxy tuning, but
         // lifecycle/profile/security ownership remains with dig2browser.
         args.extend(sanitized_extra_args(&self.extra_args));
+
+        // Typed route selection is station-owned and intentionally follows
+        // caller-provided flags so consumer args cannot replace it by order.
+        if let Some(browser_proxy) = self.browser_proxy {
+            match browser_proxy {
+                BrowserProxy::Direct => args.push("--no-proxy-server".into()),
+                BrowserProxy::Http(endpoint) => {
+                    args.push(format!("--proxy-server=http://{endpoint}"));
+                    add_proxied_runtime_args(&mut args);
+                }
+                BrowserProxy::Socks5(endpoint) => {
+                    args.push(format!("--proxy-server=socks5://{endpoint}"));
+                    add_proxied_runtime_args(&mut args);
+                }
+            }
+        }
 
         // Keep protected arguments last as a second line of defence against
         // Chromium's last-flag-wins parsing.
@@ -177,6 +220,12 @@ impl LaunchConfig {
             .map(|addr| addr.port())
             .unwrap_or(9222) // fallback
     }
+}
+
+fn add_proxied_runtime_args(args: &mut Vec<String>) {
+    args.push("--proxy-bypass-list=<-loopback>".into());
+    args.push("--disable-quic".into());
+    args.push("--force-webrtc-ip-handling-policy=disable_non_proxied_udp".into());
 }
 
 fn is_protected_argument(argument: &str) -> bool {
@@ -295,6 +344,73 @@ mod tests {
         assert!(args
             .iter()
             .any(|argument| argument == "--proxy-server=http://127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn browser_launch_disables_background_process_lifecycle() {
+        let args = LaunchConfig::default().build_args(Path::new("profile"), 9_222, None);
+        assert!(args
+            .iter()
+            .any(|argument| argument == "--disable-background-mode"));
+    }
+
+    #[test]
+    fn typed_http_proxy_follows_and_overrides_consumer_route_flags() {
+        let config = LaunchConfig {
+            extra_args: vec![
+                "--no-proxy-server".into(),
+                "--proxy-server=socks5://127.0.0.1:19050".into(),
+                "--proxy-bypass-list=*".into(),
+            ],
+            browser_proxy: Some(BrowserProxy::Http("127.0.0.1:28080".parse().unwrap())),
+            ..LaunchConfig::default()
+        };
+        let args = config.build_args(Path::new("profile"), 9_222, None);
+
+        let owned_proxy_index = args
+            .iter()
+            .position(|argument| argument == "--proxy-server=http://127.0.0.1:28080")
+            .unwrap();
+        let consumer_proxy_index = args
+            .iter()
+            .position(|argument| argument == "--proxy-server=socks5://127.0.0.1:19050")
+            .unwrap();
+        let owned_bypass_index = args
+            .iter()
+            .position(|argument| argument == "--proxy-bypass-list=<-loopback>")
+            .unwrap();
+        let consumer_bypass_index = args
+            .iter()
+            .position(|argument| argument == "--proxy-bypass-list=*")
+            .unwrap();
+
+        assert!(owned_proxy_index > consumer_proxy_index);
+        assert!(owned_bypass_index > consumer_bypass_index);
+        assert!(args.iter().any(|argument| argument == "--disable-quic"));
+        assert!(args.iter().any(|argument| {
+            argument == "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"
+        }));
+    }
+
+    #[test]
+    fn typed_direct_and_socks5_render_owned_chromium_routes() {
+        let direct = LaunchConfig {
+            extra_args: vec!["--proxy-server=http://127.0.0.1:18080".into()],
+            browser_proxy: Some(BrowserProxy::Direct),
+            ..LaunchConfig::default()
+        }
+        .build_args(Path::new("profile"), 9_222, None);
+        assert!(direct.iter().rposition(|argument| argument == "--no-proxy-server")
+            > direct.iter().rposition(|argument| argument.starts_with("--proxy-server=")));
+
+        let socks = LaunchConfig {
+            browser_proxy: Some(BrowserProxy::Socks5("127.0.0.1:19050".parse().unwrap())),
+            ..LaunchConfig::default()
+        }
+        .build_args(Path::new("profile"), 9_222, None);
+        assert!(socks
+            .iter()
+            .any(|argument| argument == "--proxy-server=socks5://127.0.0.1:19050"));
     }
 
     #[cfg(windows)]

@@ -12,9 +12,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use dig2browser::identity::ProfileOwnershipGuard;
 use dig2browser_client::{
     ArtifactMediaType, ArtifactRef, ArtifactRole, BrowserPersona, ClientConfig,
-    ClientError, CollectionId, CollectionTask, FailureClass, ControlTransport,
-    EngineFamily, IdentitySessionStatus, InterruptedReason, MobilePersonaConfig,
-    PersonaPreset, ProfileClass, ResponseStatus, RouteRef, RuntimeFeature, RuntimeKind,
+    ClientError, CollectionId, CollectionTask, ControlTransport, CrawlCursor,
+    CrawlEvent, CrawlEventKind, CrawlJobId, CrawlPhase, CrawlSpec, EngineFamily, FailureClass,
+    IdentitySessionStatus, InterruptedReason, MobilePersonaConfig, PersonaPreset,
+    ProfileClass, ResponseStatus, RouteRef, RuntimeFeature, RuntimeKind,
     RuntimeRequirements, RuntimeSelector, SessionHealthProbe, SessionPhase,
     SessionStateUpdate, StationClient, StationStatus, SupportLevel,
     TaskCapturePolicy, TaskReply, TaskRuntimeContract, TaskStep,
@@ -22,6 +23,10 @@ use dig2browser_client::{
     PROTOCOL_VERSION,
 };
 use dig2browser_probe::ProbeTranscriptV1;
+use dig2browser_station::{
+    BrowserStation, IdentityRequest as StationIdentityRequest, ProfilesRootOwnership,
+    StationConfig,
+};
 use tokio::io::AsyncReadExt;
 
 struct FixtureServer {
@@ -63,6 +68,10 @@ impl FixtureServer {
 
     fn url(&self, path: &str) -> String {
         format!("http://localhost:{}{}", self.address.port(), path)
+    }
+
+    fn origin(&self) -> String {
+        format!("http://localhost:{}", self.address.port())
     }
 }
 
@@ -111,25 +120,45 @@ fn serve_connection(mut stream: TcpStream) -> std::io::Result<()> {
             line.to_ascii_lowercase().starts_with("cookie:")
                 && line.contains("dig2browser_auth_e2e=cookie-secret")
         }) {
-            "auth-check-ok"
+            "auth-check-ok".to_owned()
         } else {
-            "auth-check-missing"
+            "auth-check-missing".to_owned()
         }
+    } else if requested_marker == "matrix-cookie-check" {
+        match request_cookie_value(&request, "dig2browser_matrix_e2e") {
+            Some(value) => format!("matrix-cookie-present-{value}"),
+            None => "matrix-cookie-empty".to_owned(),
+        }
+    } else if let Some(value) = requested_marker.strip_prefix("matrix-cookie-set-") {
+        format!("matrix-cookie-set-{value}")
     } else {
-        requested_marker
+        requested_marker.to_owned()
     };
     if marker == "force-close" {
         return Ok(());
     }
     let script = if requested_marker == "auth-bootstrap" {
-        "<script>localStorage.setItem('dig2browser_auth_e2e','present');document.cookie='dig2browser_auth_e2e=cookie-secret; Path=/; Max-Age=3600'</script>".to_owned()
+        "<script>localStorage.setItem('dig2browser_auth_e2e','present');document.cookie='dig2browser_auth_e2e=cookie-secret; Path=/; Max-Age=3600';setTimeout(()=>location.href='/auth-check',50)</script>".to_owned()
+    } else if requested_marker == "auth-check" {
+        format!(
+            "<script>if(localStorage.getItem('dig2browser_auth_roundtrip')===null){{localStorage.setItem('dig2browser_auth_roundtrip',{})}}</script>",
+            if marker == "auth-check-ok" { "'ok'" } else { "'missing'" }
+        )
     } else if requested_marker == "persona-probe" {
         persona_probe_script(&request)
     } else {
         String::new()
     };
+    let links = requested_marker
+        .strip_prefix("matrix-crawl-seed-")
+        .map(|runtime| {
+            format!(
+                "<a href=\"/matrix-crawl-page-2-{runtime}\" data-crawl-next>next</a>"
+            )
+        })
+        .unwrap_or_default();
     let body = format!(
-        "<!doctype html><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{marker}</title><main data-daemon-e2e=\"{marker}\">{marker}</main>{}{script}",
+        "<!doctype html><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{marker}</title><main data-daemon-e2e=\"{marker}\">{marker}</main>{}{links}{script}",
         match requested_marker {
             "session-ready" => "<section data-session-ready></section>",
             "session-reauth" => "<form data-session-reauth></form>",
@@ -138,15 +167,27 @@ fn serve_connection(mut stream: TcpStream) -> std::io::Result<()> {
         }
     );
     let cookie = if requested_marker == "auth-bootstrap" {
-        "Set-Cookie: dig2browser_auth_e2e=cookie-secret; Path=/; Max-Age=3600\r\n"
+        "Set-Cookie: dig2browser_auth_e2e=cookie-secret; Path=/; Max-Age=3600; HttpOnly; SameSite=Lax\r\n".to_owned()
+    } else if let Some(value) = requested_marker.strip_prefix("matrix-cookie-set-") {
+        format!(
+            "Set-Cookie: dig2browser_matrix_e2e={value}; Path=/; Max-Age=3600; HttpOnly; SameSite=Lax\r\n"
+        )
     } else {
-        ""
+        String::new()
     };
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n{cookie}Content-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(response.as_bytes())
+}
+
+fn request_cookie_value(request: &str, expected_name: &str) -> Option<String> {
+    let cookie_header = request_header(request, "cookie");
+    cookie_header.split(';').find_map(|pair| {
+        let (name, value) = pair.trim().split_once('=')?;
+        (name == expected_name).then(|| value.to_owned())
+    })
 }
 
 fn persona_probe_script(request: &str) -> String {
@@ -636,6 +677,462 @@ async fn stationd_explicit_chrome_and_edge_runtime_selection_e2e() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires GECKODRIVER pointing to the reviewed geckodriver executable"]
+async fn stationd_explicit_firefox_runtime_selection_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+    let geckodriver = std::env::var_os("GECKODRIVER")
+        .map(PathBuf::from)
+        .expect("GECKODRIVER is configured");
+    assert!(geckodriver.is_file(), "GECKODRIVER is not a file");
+
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-stationd-firefox-e2e-{unique}");
+    let profiles = e2e_temp_base().join(format!(
+        "dig2browser-stationd-firefox-e2e-{unique}"
+    ));
+    std::fs::create_dir_all(&profiles).expect("create Firefox profiles root");
+    let mut daemon = spawn_stationd_for_firefox(
+        stationd,
+        &pipe_name,
+        &profiles,
+        &geckodriver,
+    );
+
+    let client = StationClient::connect(
+        ClientConfig::new(
+            &pipe_name,
+            Duration::from_secs(15),
+            Duration::from_secs(90),
+        )
+        .expect("valid Firefox client config"),
+    )
+    .await
+    .expect("connect Firefox station client");
+    let marker = "explicit-firefox-runtime";
+    let url = fixture.url(&format!("/{marker}"));
+    let runtime_contract = TaskRuntimeContract::new(
+        RuntimeSelector::Exact(RuntimeKind::Firefox),
+        RuntimeRequirements::new(Vec::new(), false)
+            .expect("valid Firefox runtime requirements"),
+    )
+    .expect("valid Firefox runtime contract");
+    let task = CollectionTask::new_with_runtime(
+        vec![
+            TaskStep::Navigate { url: url.clone() },
+            TaskStep::Evaluate {
+                script: "navigator.userAgent".to_owned(),
+            },
+            TaskStep::Capture {
+                policy: TaskCapturePolicy::EvidenceViewport,
+            },
+        ],
+        runtime_contract,
+    )
+    .expect("valid Firefox task");
+    let result = client
+        .run_task("explicit-firefox-profile", task)
+        .await
+        .expect("run task through Firefox runtime");
+
+    let resolved = result.runtime().expect("Firefox runtime evidence");
+    assert_eq!(resolved.kind(), RuntimeKind::Firefox);
+    assert_eq!(resolved.engine(), EngineFamily::Gecko);
+    assert_eq!(resolved.control(), ControlTransport::WebDriverBidi);
+    for feature in [
+        RuntimeFeature::ScriptEvaluate,
+        RuntimeFeature::Navigate,
+        RuntimeFeature::CaptureState,
+        RuntimeFeature::CaptureHtml,
+        RuntimeFeature::CaptureViewportPng,
+        RuntimeFeature::Lifecycle,
+        RuntimeFeature::PersistentProfile,
+        RuntimeFeature::DesktopWeb,
+    ] {
+        assert!(
+            resolved.granted().iter().any(|support| {
+                support.feature() == feature
+                    && support.level() == SupportLevel::Native
+            }),
+            "Firefox did not record granted feature {feature:?}"
+        );
+    }
+    let TaskReply::ScriptJson(user_agent_json) = &result.replies()[1] else {
+        panic!("Firefox task did not return user agent JSON");
+    };
+    assert!(user_agent_json.contains("Firefox/"));
+    assert!(!user_agent_json.contains("Chrome/"));
+    let TaskReply::Capture(capture) = &result.replies()[2] else {
+        panic!("Firefox task did not return evidence capture");
+    };
+    assert_eq!(capture.requested_url, url);
+    assert_eq!(capture.final_url, url);
+    assert_eq!(capture.http_status, Some(200));
+    assert_eq!(capture.title, marker);
+    assert_eq!(&capture.png[..8], b"\x89PNG\r\n\x1a\n");
+
+    client.shutdown().await.expect("request Firefox station drain");
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("Firefox station exit timeout")
+        .expect("wait for Firefox station");
+    assert!(status.success(), "Firefox station failed: {status}");
+    let (_, stderr) = read_child_output(&mut daemon).await;
+    assert!(stderr.is_empty(), "Firefox station wrote stderr: {stderr}");
+    remove_tree(&profiles).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires installed Chrome"]
+async fn stationd_chrome_product_matrix_cookie_auth_restart_e2e() {
+    let _serial = e2e_serial_guard().await;
+    run_stationd_browser_product_matrix("chrome", RuntimeKind::Chrome, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires installed Edge"]
+async fn stationd_edge_product_matrix_cookie_auth_restart_e2e() {
+    let _serial = e2e_serial_guard().await;
+    run_stationd_browser_product_matrix("edge", RuntimeKind::Edge, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires GECKODRIVER and installed Firefox"]
+async fn stationd_firefox_product_matrix_cookie_auth_restart_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let geckodriver = std::env::var_os("GECKODRIVER")
+        .map(PathBuf::from)
+        .expect("GECKODRIVER is configured");
+    assert!(geckodriver.is_file(), "GECKODRIVER is not a file");
+    run_stationd_browser_product_matrix(
+        "firefox",
+        RuntimeKind::Firefox,
+        Some(&geckodriver),
+    )
+    .await;
+}
+
+async fn run_stationd_browser_product_matrix(
+    runtime: &str,
+    runtime_kind: RuntimeKind,
+    geckodriver: Option<&Path>,
+) {
+        let fixture = FixtureServer::start();
+        let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+        let unique = uuid::Uuid::new_v4();
+        let pipe_name = format!("dig2browser-product-matrix-{runtime}-{unique}");
+        let root = e2e_temp_base().join(format!(
+            "dig2browser-product-matrix-{runtime}-{unique}"
+        ));
+        let profiles = root.join("profiles");
+        let traces = root.join("traces");
+        let crawls = root.join("crawls");
+        for path in [&profiles, &traces, &crawls] {
+            std::fs::create_dir_all(path).expect("create product matrix durable root");
+        }
+        let mut daemon = spawn_stationd_for_product_matrix(
+            stationd,
+            &pipe_name,
+            &profiles,
+            &traces,
+            &crawls,
+            runtime,
+            geckodriver,
+        );
+        let client = StationClient::connect(
+            ClientConfig::new(
+                &pipe_name,
+                Duration::from_secs(15),
+                Duration::from_secs(90),
+            )
+            .expect("valid product matrix client config"),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("connect {runtime} product matrix: {error}"));
+
+        let profile_a = format!("matrix-{runtime}-a");
+        let set_url = fixture.url(&format!("/matrix-cookie-set-{runtime}"));
+        let first = client
+            .run_task(
+                &profile_a,
+                matrix_task(
+                    runtime_kind,
+                    vec![
+                        TaskStep::Navigate {
+                            url: set_url.clone(),
+                        },
+                        TaskStep::Evaluate {
+                            script: "document.title".to_owned(),
+                        },
+                        TaskStep::Evaluate {
+                            script: "performance.timeOrigin".to_owned(),
+                        },
+                        TaskStep::Capture {
+                            policy: TaskCapturePolicy::EvidenceViewport,
+                        },
+                    ],
+                ),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{runtime} cookie seed task failed: {error}"));
+        assert_eq!(
+            first.runtime().expect("matrix runtime evidence").kind(),
+            runtime_kind
+        );
+        assert_eq!(
+            first.replies()[1],
+            TaskReply::ScriptJson(format!("\"matrix-cookie-set-{runtime}\""))
+        );
+        let first_time_origin = script_json_number(&first.replies()[2]);
+        let TaskReply::Capture(first_capture) = &first.replies()[3] else {
+            panic!("{runtime} seed task did not capture evidence");
+        };
+        assert_eq!(first_capture.title, format!("matrix-cookie-set-{runtime}"));
+        assert_eq!(&first_capture.png[..8], b"\x89PNG\r\n\x1a\n");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let check_url = fixture.url("/matrix-cookie-check");
+        let successor = client
+            .run_task(
+                &profile_a,
+                matrix_task(
+                    runtime_kind,
+                    vec![
+                        TaskStep::Navigate {
+                            url: check_url.clone(),
+                        },
+                        TaskStep::Evaluate {
+                            script: "performance.timeOrigin".to_owned(),
+                        },
+                        TaskStep::Capture {
+                            policy: TaskCapturePolicy::EvidenceViewport,
+                        },
+                    ],
+                ),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{runtime} restart cookie task failed: {error}"));
+        let successor_time_origin = script_json_number(&successor.replies()[1]);
+        assert_ne!(
+            first_time_origin, successor_time_origin,
+            "{runtime} did not rotate the browser before the successor navigation"
+        );
+        let TaskReply::Capture(successor_capture) = &successor.replies()[2] else {
+            panic!("{runtime} successor task did not capture evidence");
+        };
+        assert_eq!(
+            successor_capture.title,
+            format!("matrix-cookie-present-{runtime}")
+        );
+
+        let isolated = client
+            .run_task(
+                &format!("matrix-{runtime}-b"),
+                matrix_task(
+                    runtime_kind,
+                    vec![
+                        TaskStep::Navigate {
+                            url: check_url.clone(),
+                        },
+                        TaskStep::Capture {
+                            policy: TaskCapturePolicy::EvidenceViewport,
+                        },
+                    ],
+                ),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{runtime} isolation task failed: {error}"));
+        let TaskReply::Capture(isolated_capture) = &isolated.replies()[1] else {
+            panic!("{runtime} isolation task did not capture evidence");
+        };
+        assert_eq!(isolated_capture.title, "matrix-cookie-empty");
+
+        let auth_profile = format!("matrix-{runtime}-auth");
+        let persona = BrowserPersona::desktop_default();
+        client
+            .begin_auth_session(
+                &auth_profile,
+                persona.clone(),
+                fixture.url("/auth-bootstrap"),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{runtime} auth begin failed: {error}"));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        client
+            .finish_auth_session(&auth_profile)
+            .await
+            .unwrap_or_else(|error| panic!("{runtime} auth finish failed: {error}"));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let authenticated = client
+            .run_task_with_identity(
+                &auth_profile,
+                ProfileClass::Authenticated,
+                persona,
+                matrix_task(
+                    runtime_kind,
+                    vec![
+                        TaskStep::Navigate {
+                            url: fixture.url("/auth-check"),
+                        },
+                        TaskStep::Evaluate {
+                            script: "localStorage.getItem('dig2browser_auth_e2e')"
+                                .to_owned(),
+                        },
+                        TaskStep::Evaluate {
+                            script: "localStorage.getItem('dig2browser_auth_roundtrip')"
+                                .to_owned(),
+                        },
+                        TaskStep::Capture {
+                            policy: TaskCapturePolicy::EvidenceViewport,
+                        },
+                    ],
+                ),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{runtime} authenticated reuse failed: {error}"));
+        assert_eq!(
+            authenticated.replies()[1],
+            TaskReply::ScriptJson("\"present\"".to_owned())
+        );
+        assert_eq!(
+            authenticated.replies()[2],
+            TaskReply::ScriptJson("\"ok\"".to_owned())
+        );
+        let TaskReply::Capture(auth_capture) = &authenticated.replies()[3] else {
+            panic!("{runtime} authenticated task did not capture evidence");
+        };
+        assert_eq!(auth_capture.title, "auth-check-ok");
+        assert!(!format!("{:?}", authenticated.replies()).contains("cookie-secret"));
+
+        let crawl_url = fixture.url(&format!("/matrix-crawl-seed-{runtime}"));
+        let crawl_page_2_url = fixture.url(&format!("/matrix-crawl-page-2-{runtime}"));
+        let crawl_id = client
+            .begin_crawl(
+                &profile_a,
+                CrawlSpec::new(
+                    vec![crawl_url.clone()],
+                    vec![fixture.origin()],
+                    2,
+                    1,
+                    0,
+                )
+                .expect("valid product matrix crawl spec"),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{runtime} crawl begin failed: {error}"));
+        let crawl_events = wait_for_complete_product_crawl(&client, crawl_id).await;
+        assert_eq!(
+            client
+                .crawl_status(crawl_id)
+                .await
+                .expect("read product matrix crawl status")
+                .phase(),
+            CrawlPhase::Succeeded,
+        );
+        let crawl_pages = crawl_events
+            .iter()
+            .filter(|event| event.kind() == CrawlEventKind::PageSucceeded)
+            .collect::<Vec<_>>();
+        assert_eq!(crawl_pages.len(), 2, "{runtime} crawl did not follow its link");
+        assert_eq!(
+            crawl_events
+                .iter()
+                .filter(|event| event.kind() == CrawlEventKind::JobSucceeded)
+                .count(),
+            1,
+        );
+        for (url, marker) in [
+            (&crawl_url, format!("matrix-crawl-seed-{runtime}")),
+            (&crawl_page_2_url, format!("matrix-crawl-page-2-{runtime}")),
+        ] {
+            let crawl_page = crawl_pages
+                .iter()
+                .find(|event| event.canonical_url() == Some(url.as_str()))
+                .unwrap_or_else(|| panic!("{runtime} crawl omitted {url}"));
+            assert_eq!(crawl_page.http_status(), Some(200));
+            assert_eq!(crawl_page.attempt(), 1);
+            let page = crawl_page
+                .page()
+                .expect("successful product matrix crawl page artifact");
+            let html = read_complete_artifact(&client, page.collection_id(), page.html()).await;
+            assert!(
+                String::from_utf8_lossy(&html)
+                    .contains(&format!("data-daemon-e2e=\"{marker}\"")),
+                "{runtime} crawl artifact did not contain controlled fixture evidence",
+            );
+            let trace = wait_for_complete_trace(&client, page.collection_id()).await;
+            let started = trace
+                .iter()
+                .find_map(|event| match event.kind() {
+                    TraceEventKind::Started(started) => Some(started),
+                    _ => None,
+                })
+                .expect("crawler collection trace includes runtime evidence");
+            assert_eq!(started.runtime().kind(), runtime_kind);
+        }
+
+        client
+            .shutdown()
+            .await
+            .unwrap_or_else(|error| panic!("shutdown {runtime} product matrix: {error}"));
+        let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+            .await
+            .unwrap_or_else(|_| panic!("{runtime} product matrix exit timeout"))
+            .expect("wait for product matrix station");
+        assert!(status.success(), "{runtime} product matrix station failed: {status}");
+        let (_, stderr) = read_child_output(&mut daemon).await;
+        assert!(stderr.is_empty(), "{runtime} product matrix stderr: {stderr}");
+        remove_tree(&root).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_process_station_chrome_auth_cookie_reuse_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let unique = uuid::Uuid::new_v4();
+    let profiles = e2e_temp_base().join(format!(
+        "dig2browser-in-process-auth-e2e-{unique}"
+    ));
+    let profiles_owner = ProfilesRootOwnership::acquire(&profiles)
+        .expect("own in-process auth profiles root");
+    let config = StationConfig::new(profiles_owner.root(), 2, 2)
+        .expect("valid in-process auth station config")
+        .with_runtime_selector(RuntimeSelector::Exact(RuntimeKind::Chrome));
+    let station = BrowserStation::new(config);
+    let identity = StationIdentityRequest::authenticated_persona(
+        "in-process-auth-profile",
+        BrowserPersona::desktop_default(),
+    );
+    station
+        .begin_auth_session(identity.clone(), fixture.url("/auth-bootstrap"))
+        .await
+        .expect("begin in-process auth session");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    station
+        .finish_auth_session(identity.id())
+        .await
+        .expect("finish in-process auth session");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let status = station
+        .check_auth_session(
+            identity,
+            SessionHealthProbe {
+                url: fixture.url("/auth-check"),
+                ready_selector: "[data-daemon-e2e='auth-check-ok']".to_owned(),
+                reauth_selector: "[data-daemon-e2e='auth-check-missing']".to_owned(),
+                ready_ttl_seconds: 60,
+            },
+        )
+        .await
+        .expect("check in-process auth session");
+    assert_eq!(status.phase, SessionPhase::Ready);
+    station.shutdown().await.expect("shutdown in-process auth station");
+    drop(profiles_owner);
+    remove_tree(&profiles).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stationd_compiles_personas_binds_routes_and_validates_probe_e2e() {
     let _serial = e2e_serial_guard().await;
     let fixture = FixtureServer::start();
@@ -1086,10 +1583,14 @@ async fn stationd_headful_auth_reuses_profile_without_exporting_secrets_e2e() {
     std::fs::create_dir_all(&profiles).expect("create headful auth E2E profiles root");
     let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
     let auth_cli = env!("CARGO_BIN_EXE_dig2browser-auth");
-    let mut daemon = spawn_stationd_with_headful_auth(
+    let mut daemon = spawn_stationd_with_runtime_permissions(
         stationd,
         &pipe_name,
         &profiles,
+        Some("chrome"),
+        true,
+        true,
+        true,
     );
     let client = StationClient::connect(
         ClientConfig::new(
@@ -1155,7 +1656,7 @@ async fn stationd_headful_auth_reuses_profile_without_exporting_secrets_e2e() {
         })
     ));
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let finish = run_auth_cli(
         auth_cli,
@@ -1203,6 +1704,7 @@ async fn stationd_headful_auth_reuses_profile_without_exporting_secrets_e2e() {
     };
     assert_eq!(capture.requested_url, fixture.url("/auth-check"));
     assert_eq!(capture.final_url, fixture.url("/auth-check"));
+    assert_eq!(capture.title, "auth-check-ok");
     assert!(!format!("{:?}", result.replies()).contains("cookie-secret"));
 
     let ready_url = fixture.url("/session-ready");
@@ -2178,6 +2680,31 @@ async fn wait_for_complete_trace(
     }
 }
 
+async fn wait_for_complete_product_crawl(
+    client: &StationClient,
+    job_id: CrawlJobId,
+) -> Vec<CrawlEvent> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let mut cursor = CrawlCursor::START;
+    let mut events = Vec::new();
+    loop {
+        let page = client
+            .read_crawl_events(job_id, cursor, 64)
+            .await
+            .expect("poll product matrix crawl events");
+        events.extend_from_slice(page.events());
+        cursor = page.next_cursor();
+        if page.is_complete() {
+            return events;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "product matrix crawl did not reach terminal state: {events:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 async fn read_complete_artifact(
     client: &StationClient,
     collection_id: CollectionId,
@@ -2322,7 +2849,7 @@ fn spawn_stationd_with_trace(
         "--runtime",
         "chrome",
         "--max-resident",
-        "2",
+        "1",
         "--max-in-flight",
         "4",
         "--max-connections",
@@ -2363,6 +2890,137 @@ fn spawn_stationd_for_runtime(
     )
 }
 
+fn spawn_stationd_for_firefox(
+    stationd: &str,
+    pipe_name: &str,
+    profiles: &Path,
+    geckodriver: &Path,
+) -> tokio::process::Child {
+    let mut command = tokio::process::Command::new(stationd);
+    command.env_remove("GECKODRIVER");
+    command.args([
+        "--pipe-name",
+        pipe_name,
+        "--profiles-root",
+        profiles.to_str().expect("profiles path is UTF-8"),
+        "--runtime",
+        "firefox",
+        "--geckodriver-path",
+        geckodriver.to_str().expect("geckodriver path is UTF-8"),
+        "--max-resident",
+        "2",
+        "--max-in-flight",
+        "4",
+        "--max-connections",
+        "8",
+        "--timeout-seconds",
+        "90",
+        "--drain-seconds",
+        "15",
+        "--allow-remote-shutdown",
+        "--allow-interactive-tasks",
+        "--allow-scripted-tasks",
+    ]);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn Firefox station daemon")
+}
+
+fn spawn_stationd_for_product_matrix(
+    stationd: &str,
+    pipe_name: &str,
+    profiles: &Path,
+    traces: &Path,
+    crawls: &Path,
+    runtime: &str,
+    geckodriver: Option<&Path>,
+) -> tokio::process::Child {
+    let mut command = tokio::process::Command::new(stationd);
+    #[cfg(feature = "runtime-test-hooks")]
+    command.env("DIG2BROWSER_TEST_CAPTURE_DIAGNOSTICS", "1");
+    let max_resident = if runtime == "firefox" { "1" } else { "4" };
+    command.args([
+        "--pipe-name",
+        pipe_name,
+        "--profiles-root",
+        profiles.to_str().expect("profiles path is UTF-8"),
+        "--trace-root",
+        traces.to_str().expect("trace path is UTF-8"),
+        "--crawl-root",
+        crawls.to_str().expect("crawl path is UTF-8"),
+        "--runtime",
+        runtime,
+        "--restart-after-pages",
+        "1",
+        "--max-resident",
+        max_resident,
+        "--max-in-flight",
+        "4",
+        "--max-connections",
+        "8",
+        "--timeout-seconds",
+        "90",
+        "--drain-seconds",
+        "15",
+        "--allow-remote-shutdown",
+        "--allow-interactive-tasks",
+        "--allow-scripted-tasks",
+        "--allow-headful-auth",
+        "--allow-session-health",
+        "--allow-identity-status",
+        "--allow-session-state-updates",
+        "--allow-durable-read",
+        "--allow-durable-write",
+        "--allow-crawl-read",
+        "--allow-crawl-write",
+    ]);
+    if let Some(geckodriver) = geckodriver {
+        command.env_remove("GECKODRIVER");
+        command.args([
+            "--geckodriver-path",
+            geckodriver.to_str().expect("geckodriver path is UTF-8"),
+        ]);
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr({
+            #[cfg(feature = "runtime-test-hooks")]
+            {
+                Stdio::inherit()
+            }
+            #[cfg(not(feature = "runtime-test-hooks"))]
+            {
+                Stdio::piped()
+            }
+        })
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn product matrix station daemon")
+}
+
+fn matrix_task(runtime: RuntimeKind, steps: Vec<TaskStep>) -> CollectionTask {
+    let contract = TaskRuntimeContract::new(
+        RuntimeSelector::Exact(runtime),
+        RuntimeRequirements::new(Vec::new(), false)
+            .expect("valid matrix runtime requirements"),
+    )
+    .expect("valid matrix runtime contract");
+    CollectionTask::new_with_runtime(steps, contract)
+        .expect("valid matrix collection task")
+}
+
+fn script_json_number(reply: &TaskReply) -> f64 {
+    let TaskReply::ScriptJson(value) = reply else {
+        panic!("matrix task did not return script JSON: {reply:?}");
+    };
+    serde_json::from_str(value).expect("matrix script JSON is numeric")
+}
+
 fn spawn_stationd_for_runtime_with_routes(
     stationd: &str,
     pipe_name: &str,
@@ -2399,14 +3057,6 @@ fn spawn_stationd_with_task_permissions(
         false,
         false,
     )
-}
-
-fn spawn_stationd_with_headful_auth(
-    stationd: &str,
-    pipe_name: &str,
-    profiles: &Path,
-) -> tokio::process::Child {
-    spawn_stationd_with_permissions(stationd, pipe_name, profiles, true, true, true)
 }
 
 fn spawn_stationd_with_permissions(

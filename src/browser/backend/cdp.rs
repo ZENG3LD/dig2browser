@@ -9,6 +9,8 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
 };
+#[cfg(windows)]
+use std::sync::Mutex as StdMutex;
 
 use base64::Engine;
 use futures::future::BoxFuture;
@@ -27,6 +29,7 @@ use crate::detect::args::BrowserProfile;
 use crate::detect::version::browser_version;
 use crate::detect::{LaunchConfig, detect_browser};
 use crate::identity::ProfileOwnershipGuard;
+use crate::process_isolation::BrowserProcessIsolation;
 use crate::browser_process::BrowserProcess;
 #[cfg(windows)]
 use crate::browser_process::PreparedWindowsCdpProcess;
@@ -60,7 +63,13 @@ pub(crate) struct CdpBrowserBackend {
     profile_ephemeral: bool,
     /// Exclusive owner token for persistent profiles.
     _profile_guard: Option<ProfileOwnershipGuard>,
+    #[cfg(feature = "containment-test-hooks")]
+    test_close_delay: Option<std::time::Duration>,
 }
+
+#[cfg(feature = "containment-test-hooks")]
+const INTERNAL_TEST_CLOSE_DELAY_PREFIX: &str =
+    "--dig2browser-internal-test-cdp-close-delay-ms=";
 
 struct CdpDiscovery {
     ws_url: String,
@@ -70,6 +79,49 @@ struct CdpDiscovery {
 struct EphemeralProfileCleanup {
     path: std::path::PathBuf,
     armed: bool,
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct BoundedStderrCapture {
+    bytes: Arc<StdMutex<Vec<u8>>>,
+}
+
+#[cfg(windows)]
+impl BoundedStderrCapture {
+    const MAX_BYTES: usize = 64 * 1024;
+
+    fn new() -> Self {
+        Self {
+            bytes: Arc::new(StdMutex::new(Vec::new())),
+        }
+    }
+
+    fn append(&self, chunk: &[u8]) {
+        let Ok(mut bytes) = self.bytes.lock() else {
+            return;
+        };
+        if chunk.len() >= Self::MAX_BYTES {
+            bytes.clear();
+            bytes.extend_from_slice(&chunk[chunk.len() - Self::MAX_BYTES..]);
+            return;
+        }
+        let overflow = bytes
+            .len()
+            .saturating_add(chunk.len())
+            .saturating_sub(Self::MAX_BYTES);
+        if overflow != 0 {
+            bytes.drain(..overflow);
+        }
+        bytes.extend_from_slice(chunk);
+    }
+
+    fn snapshot(&self) -> String {
+        self.bytes
+            .lock()
+            .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
+            .unwrap_or_default()
+    }
 }
 
 impl EphemeralProfileCleanup {
@@ -123,10 +175,53 @@ impl Drop for CdpBrowserBackend {
 
 impl CdpBrowserBackend {
     /// Spawn a Chrome/Edge process and connect through the owned CDP transport.
+    #[cfg(test)]
     pub(crate) async fn launch(
         launch: &LaunchConfig,
         stealth: &StealthConfig,
     ) -> Result<Self, BrowserError> {
+        Self::launch_with_process_isolation(
+            launch,
+            stealth,
+            &BrowserProcessIsolation::Native,
+        )
+        .await
+    }
+
+    pub(crate) async fn launch_with_process_isolation(
+        launch: &LaunchConfig,
+        stealth: &StealthConfig,
+        process_isolation: &BrowserProcessIsolation,
+    ) -> Result<Self, BrowserError> {
+        #[cfg(feature = "containment-test-hooks")]
+        let (launch, test_close_delay) = {
+            let mut launch = launch.clone();
+            let test_close_delay = take_containment_test_close_delay(&mut launch)?;
+            (launch, test_close_delay)
+        };
+        #[cfg(not(feature = "containment-test-hooks"))]
+        let launch = launch.clone();
+        let launch = &launch;
+        #[cfg(not(windows))]
+        if !process_isolation.is_native() {
+            return Err(BrowserError::Launch(
+                "outer process isolation is unavailable on this platform".into(),
+            ));
+        }
+        #[cfg(windows)]
+        let binary = match process_isolation.browser_binary() {
+            Some(binary) => {
+                if !browser_kind_matches_preference(binary.kind, launch.browser_pref) {
+                    return Err(BrowserError::Launch(format!(
+                        "runtime mirror kind {:?} does not match browser preference {:?}",
+                        binary.kind, launch.browser_pref
+                    )));
+                }
+                binary.clone()
+            }
+            None => detect_browser(launch.browser_pref)?,
+        };
+        #[cfg(not(windows))]
         let binary = detect_browser(launch.browser_pref)?;
         let installed_version = browser_version(&binary);
         let (profile_dir, profile_ephemeral) = launch.profile.resolve()?;
@@ -148,6 +243,11 @@ impl CdpBrowserBackend {
         #[cfg(windows)]
         let (client, child, stderr_task, browser_product) = {
             if let Some(port) = launch.debug_port {
+                if !process_isolation.is_native() {
+                        return Err(BrowserError::Launch(
+                            "a station-owned runtime mirror requires the owned CDP pipe transport".into(),
+                        ));
+                }
                 let args = launch.build_args(&profile_dir, port, locale);
                 debug!(
                     "Launching CDP browser: {} with {} args on explicit port {}",
@@ -243,7 +343,8 @@ impl CdpBrowserBackend {
                         "could not resume contained browser process: {error}"
                     )));
                 }
-                let stderr_task = Self::spawn_stderr_logger(spawned.stderr);
+                let (mut stderr_task, stderr_capture) =
+                    Self::spawn_stderr_logger(spawned.stderr);
                 let client = match CdpClient::connect_pipe(
                     spawned.cdp_reader,
                     spawned.cdp_writer,
@@ -252,10 +353,17 @@ impl CdpBrowserBackend {
                 {
                     Ok(client) => client,
                     Err(error) => {
-                        stderr_task.abort();
+                        let stderr = Self::finish_stderr_capture(
+                            &mut stderr_task,
+                            &stderr_capture,
+                        )
+                        .await;
+                        let status = Self::process_status_context(&mut spawned.process).await;
                         let _ = process_tree.terminate_now();
                         let _ = spawned.process.start_kill();
-                        return Err(BrowserError::Connect(error.to_string()));
+                        return Err(BrowserError::Connect(
+                            Self::with_launch_context(error.to_string(), stderr, status),
+                        ));
                     }
                 };
                 let root = client.root_session();
@@ -267,17 +375,33 @@ impl CdpBrowserBackend {
                 {
                     Ok(Ok(version)) => version,
                     Ok(Err(error)) => {
-                        stderr_task.abort();
-                        let _ = process_tree.terminate_now();
-                        let _ = spawned.process.start_kill();
-                        return Err(BrowserError::Connect(error.to_string()));
-                    }
-                    Err(_) => {
-                        stderr_task.abort();
+                        let stderr = Self::finish_stderr_capture(
+                            &mut stderr_task,
+                            &stderr_capture,
+                        )
+                        .await;
+                        let status = Self::process_status_context(&mut spawned.process).await;
                         let _ = process_tree.terminate_now();
                         let _ = spawned.process.start_kill();
                         return Err(BrowserError::Connect(
-                            "timed out waiting for the CDP pipe".to_owned(),
+                            Self::with_launch_context(error.to_string(), stderr, status),
+                        ));
+                    }
+                    Err(_) => {
+                        let stderr = Self::finish_stderr_capture(
+                            &mut stderr_task,
+                            &stderr_capture,
+                        )
+                        .await;
+                        let status = Self::process_status_context(&mut spawned.process).await;
+                        let _ = process_tree.terminate_now();
+                        let _ = spawned.process.start_kill();
+                        return Err(BrowserError::Connect(
+                            Self::with_launch_context(
+                                "timed out waiting for the CDP pipe".to_owned(),
+                                stderr,
+                                status,
+                            ),
                         ));
                     }
                 };
@@ -357,6 +481,8 @@ impl CdpBrowserBackend {
             profile_dir,
             profile_ephemeral,
             _profile_guard: profile_guard,
+            #[cfg(feature = "containment-test-hooks")]
+            test_close_delay,
         };
         profile_cleanup.disarm();
         Ok(backend)
@@ -390,6 +516,8 @@ impl CdpBrowserBackend {
             profile_dir: std::path::PathBuf::new(),
             profile_ephemeral: false,
             _profile_guard: None,
+            #[cfg(feature = "containment-test-hooks")]
+            test_close_delay: None,
         })
     }
 
@@ -447,13 +575,18 @@ impl CdpBrowserBackend {
     }
 
     #[cfg(windows)]
-    fn spawn_stderr_logger(mut stderr: tokio::fs::File) -> JoinHandle<()> {
-        tokio::spawn(async move {
+    fn spawn_stderr_logger(
+        mut stderr: tokio::fs::File,
+    ) -> (JoinHandle<()>, BoundedStderrCapture) {
+        let capture = BoundedStderrCapture::new();
+        let task_capture = capture.clone();
+        let task = tokio::spawn(async move {
             let mut buffer = [0_u8; 8 * 1024];
             loop {
                 match stderr.read(&mut buffer).await {
                     Ok(0) => break,
                     Ok(count) => {
+                        task_capture.append(&buffer[..count]);
                         let chunk = String::from_utf8_lossy(&buffer[..count]);
                         debug!("browser stderr: {chunk}");
                     }
@@ -463,7 +596,45 @@ impl CdpBrowserBackend {
                     }
                 }
             }
-        })
+        });
+        (task, capture)
+    }
+
+    #[cfg(windows)]
+    async fn finish_stderr_capture(
+        task: &mut JoinHandle<()>,
+        capture: &BoundedStderrCapture,
+    ) -> String {
+        if tokio::time::timeout(std::time::Duration::from_millis(250), &mut *task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
+        capture.snapshot()
+    }
+
+    #[cfg(windows)]
+    async fn process_status_context(process: &mut BrowserProcess) -> String {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            process.wait(),
+        )
+        .await
+        {
+            Ok(Ok(status)) => status.to_string(),
+            Ok(Err(error)) => format!("status unavailable: {error}"),
+            Err(_) => "still running after pipe closure".to_owned(),
+        }
+    }
+
+    #[cfg(windows)]
+    fn with_launch_context(message: String, stderr: String, status: String) -> String {
+        if stderr.is_empty() {
+            format!("{message}; browser process: {status}")
+        } else {
+            format!("{message}; browser process: {status}; browser stderr: {stderr}")
+        }
     }
 
     /// Poll the owned browser's loopback DevTools endpoint while retaining
@@ -694,6 +865,121 @@ async fn remove_profile_dir_with_retry(path: &std::path::Path) -> Result<(), Bro
     unreachable!("profile cleanup attempts are non-zero")
 }
 
+#[cfg(feature = "containment-test-hooks")]
+fn take_containment_test_close_delay(
+    launch: &mut LaunchConfig,
+) -> Result<Option<std::time::Duration>, BrowserError> {
+    let mut retained = Vec::with_capacity(launch.extra_args.len());
+    let mut delay = None;
+    for argument in std::mem::take(&mut launch.extra_args) {
+        let Some(value) = argument.strip_prefix(INTERNAL_TEST_CLOSE_DELAY_PREFIX) else {
+            retained.push(argument);
+            continue;
+        };
+        if delay.is_some() {
+            return Err(BrowserError::Launch(
+                "duplicate internal containment close-delay argument".into(),
+            ));
+        }
+        let millis = value.parse::<u64>().map_err(|_| {
+            BrowserError::Launch(
+                "invalid internal containment close-delay argument".into(),
+            )
+        })?;
+        if !(1..=60_000).contains(&millis) {
+            return Err(BrowserError::Launch(
+                "internal containment close delay is outside test bounds".into(),
+            ));
+        }
+        delay = Some(std::time::Duration::from_millis(millis));
+    }
+    launch.extra_args = retained;
+    Ok(delay)
+}
+
+#[cfg(windows)]
+fn browser_kind_matches_preference(
+    kind: crate::detect::BrowserKind,
+    preference: crate::detect::BrowserPreference,
+) -> bool {
+    use crate::detect::{BrowserKind, BrowserPreference};
+    match preference {
+        BrowserPreference::Auto => matches!(
+            kind,
+            BrowserKind::Chrome | BrowserKind::Edge | BrowserKind::Chromium
+        ),
+        BrowserPreference::ChromeOnly => kind == BrowserKind::Chrome,
+        BrowserPreference::EdgeOnly => kind == BrowserKind::Edge,
+        BrowserPreference::Firefox => false,
+    }
+}
+
+#[cfg(all(test, windows))]
+mod runtime_mirror_kind_tests {
+    use super::browser_kind_matches_preference;
+    use crate::detect::{BrowserKind, BrowserPreference};
+
+    #[test]
+    fn runtime_mirror_kind_must_match_the_selected_backend() {
+        assert!(browser_kind_matches_preference(
+            BrowserKind::Chrome,
+            BrowserPreference::ChromeOnly
+        ));
+        assert!(browser_kind_matches_preference(
+            BrowserKind::Edge,
+            BrowserPreference::EdgeOnly
+        ));
+        assert!(!browser_kind_matches_preference(
+            BrowserKind::Chrome,
+            BrowserPreference::EdgeOnly
+        ));
+        assert!(!browser_kind_matches_preference(
+            BrowserKind::Edge,
+            BrowserPreference::ChromeOnly
+        ));
+        assert!(!browser_kind_matches_preference(
+            BrowserKind::Firefox,
+            BrowserPreference::Auto
+        ));
+    }
+}
+
+#[cfg(all(test, feature = "containment-test-hooks"))]
+mod containment_test_hook_tests {
+    use super::{
+        take_containment_test_close_delay, INTERNAL_TEST_CLOSE_DELAY_PREFIX,
+    };
+    use crate::detect::LaunchConfig;
+
+    #[test]
+    fn close_delay_hook_is_bounded_and_removed_before_browser_launch() {
+        let mut launch = LaunchConfig::default();
+        launch.extra_args = vec![
+            "--ordinary-browser-argument".to_owned(),
+            format!("{INTERNAL_TEST_CLOSE_DELAY_PREFIX}30000"),
+        ];
+        let delay = take_containment_test_close_delay(&mut launch)
+            .expect("valid close-delay hook");
+        assert_eq!(delay, Some(std::time::Duration::from_secs(30)));
+        assert_eq!(launch.extra_args, ["--ordinary-browser-argument"]);
+
+        for invalid in ["", "0", "60001", "not-a-number"] {
+            let mut launch = LaunchConfig::default();
+            launch.extra_args = vec![format!(
+                "{INTERNAL_TEST_CLOSE_DELAY_PREFIX}{invalid}"
+            )];
+            assert!(take_containment_test_close_delay(&mut launch).is_err());
+        }
+
+        let mut launch = LaunchConfig::default();
+        launch.extra_args = vec![
+            format!("{INTERNAL_TEST_CLOSE_DELAY_PREFIX}1"),
+            format!("{INTERNAL_TEST_CLOSE_DELAY_PREFIX}2"),
+        ];
+        assert!(take_containment_test_close_delay(&mut launch).is_err());
+    }
+}
+
 impl BrowserBackend for CdpBrowserBackend {
     fn as_any_cdp(&self) -> Option<&CdpBrowserBackend> {
         Some(self)
@@ -719,13 +1005,37 @@ impl BrowserBackend for CdpBrowserBackend {
     fn close<'a>(mut self: Box<Self>) -> BoxFuture<'a, Result<(), BrowserError>> {
         Box::pin(async move {
             self.browser_closing.store(true, Ordering::Release);
+            #[cfg(feature = "containment-test-hooks")]
+            if let Some(delay) = self.test_close_delay {
+                tokio::time::sleep(delay).await;
+            }
+            let edge_normal_exit_attempted = self.launch.browser_pref
+                == crate::detect::BrowserPreference::EdgeOnly;
+            if edge_normal_exit_attempted {
+                let _ = self.root.create_target("edge://quit").await;
+            }
+            let mut child_exited = false;
+            if edge_normal_exit_attempted {
+                if let Some(ref mut child) = self._child {
+                    child_exited = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        child.wait(),
+                    )
+                    .await
+                    .is_ok();
+                }
+            }
             // Ask the browser to close gracefully via CDP.
-            let graceful_close = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                self.root.call("Browser.close", None),
-            )
-            .await;
-            let graceful_close_confirmed = matches!(graceful_close, Ok(Ok(_)));
+            let graceful_close_confirmed = if child_exited {
+                true
+            } else {
+                let graceful_close = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    self.root.call("Browser.close", None),
+                )
+                .await;
+                matches!(graceful_close, Ok(Ok(_)))
+            };
             if self.exact_policy_claimed.load(Ordering::Acquire)
                 && !graceful_close_confirmed
             {
@@ -738,18 +1048,21 @@ impl BrowserBackend for CdpBrowserBackend {
             // Let Chromium drain its process tree before forcing the owned root
             // process down. This avoids leaving profile files open on Windows.
             if let Some(ref mut child) = self._child {
-                if tokio::time::timeout(std::time::Duration::from_secs(3), child.wait())
-                    .await
-                    .is_err()
-                {
+                let child_wait_timed_out = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    child.wait(),
+                )
+                .await
+                .is_err();
+                if child_wait_timed_out {
                     let _ = child.kill().await;
                 }
             }
             if let Some(process_tree) = self._process_tree.as_ref() {
-                if !process_tree
+                let process_tree_empty = process_tree
                     .wait_until_empty(std::time::Duration::from_secs(2))
-                    .await?
-                {
+                    .await?;
+                if !process_tree_empty {
                     process_tree
                         .terminate_and_wait(std::time::Duration::from_secs(3))
                         .await?;

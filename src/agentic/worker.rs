@@ -1,9 +1,11 @@
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
 use crate::detect::LaunchConfig;
 use crate::identity::IdentityProfile;
+use crate::process_isolation::BrowserProcessIsolation;
 use crate::stealth::StealthConfig;
 
 use super::contract::{
@@ -22,6 +24,8 @@ const MAX_SCRIPT_RESULT_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
 const MIN_COMMAND_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_COMMAND_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const EMERGENCY_CLOSE_TIMEOUT: Duration = Duration::from_secs(12);
+const EMERGENCY_ACTOR_EXIT_TIMEOUT: Duration = Duration::from_secs(13);
 
 #[derive(Debug, Clone)]
 pub struct BrowserWorkerConfig {
@@ -50,7 +54,15 @@ pub struct BrowserWorker {
     commands: mpsc::Sender<Envelope>,
     snapshot: watch::Receiver<BrowserSnapshot>,
     stopped: watch::Receiver<bool>,
+    actor: Arc<ActorControl>,
     navigation_policy: NavigationPolicy,
+}
+
+struct ActorControl {
+    abort: tokio::task::AbortHandle,
+    emergency: watch::Sender<bool>,
+    join: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    finished: watch::Receiver<bool>,
 }
 
 impl BrowserWorker {
@@ -73,14 +85,31 @@ impl BrowserWorker {
         config: BrowserWorkerConfig,
         navigation_policy: NavigationPolicy,
     ) -> Result<Self, WorkerError> {
+        Self::spawn_with_navigation_policy_and_process_isolation(
+            identity,
+            capabilities,
+            config,
+            navigation_policy,
+            BrowserProcessIsolation::Native,
+        )
+    }
+
+    pub fn spawn_with_navigation_policy_and_process_isolation(
+        identity: IdentityProfile,
+        capabilities: CapabilitySet,
+        config: BrowserWorkerConfig,
+        navigation_policy: NavigationPolicy,
+        process_isolation: BrowserProcessIsolation,
+    ) -> Result<Self, WorkerError> {
         validate_queue_capacity(config.queue_capacity)?;
         validate_command_timeout(config.command_timeout)?;
-        let runtime = RealBrowserRuntime::new_with_navigation_policy(
+        let runtime = RealBrowserRuntime::new_with_navigation_policy_and_process_isolation(
             identity.clone(),
             config.launch,
             config.stealth,
             config.mobile_layout,
             navigation_policy.clone(),
+            process_isolation,
         )?;
         Self::spawn_with_runtime_and_timeout_and_navigation_policy(
             identity,
@@ -147,19 +176,35 @@ impl BrowserWorker {
         let (commands, receiver) = mpsc::channel(queue_capacity);
         let (snapshot_tx, snapshot) = watch::channel(initial.clone());
         let (stopped_tx, stopped) = watch::channel(false);
-        tokio::spawn(run_actor(
-            Box::new(runtime),
-            capabilities,
-            receiver,
-            snapshot_tx,
-            initial,
-            command_timeout,
-            stopped_tx,
-        ));
+        let (emergency_tx, emergency_rx) = watch::channel(false);
+        let (finished_tx, finished) = watch::channel(false);
+        let actor = tokio::spawn(async move {
+            run_actor(
+                Box::new(runtime),
+                ActorContext {
+                    capabilities,
+                    commands: receiver,
+                    snapshots: snapshot_tx,
+                    snapshot: initial,
+                    command_timeout,
+                    stopped: stopped_tx,
+                    emergency: emergency_rx,
+                },
+            )
+            .await;
+            finished_tx.send_replace(true);
+        });
+        let actor = Arc::new(ActorControl {
+            abort: actor.abort_handle(),
+            emergency: emergency_tx,
+            join: Mutex::new(Some(actor)),
+            finished,
+        });
         Ok(Self {
             commands,
             snapshot,
             stopped,
+            actor,
             navigation_policy,
         })
     }
@@ -206,13 +251,50 @@ impl BrowserWorker {
 
     pub async fn shutdown(&self) -> Result<(), WorkerError> {
         if *self.stopped.borrow() {
-            return Ok(());
+            self.wait_actor_finished().await;
+            return match self.snapshot().last_failure {
+                Some(kind) => Err(WorkerError::Runtime(RuntimeError::new(kind))),
+                None => Ok(()),
+            };
         }
         let command_result = self.execute(AgentCommand::Shutdown).await.map(|_| ());
         let stopped_result = self.wait_stopped().await;
+        self.wait_actor_finished().await;
         match (command_result, stopped_result) {
             (Err(error), _) | (Ok(()), Err(error)) => Err(error),
             (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    /// Interrupt the current actor operation and start its bounded emergency
+    /// runtime close. `wait_aborted` applies a final task abort if that close
+    /// path does not finish within its hard deadline.
+    pub fn abort_now(&self) {
+        self.actor.emergency.send_replace(true);
+    }
+
+    /// Wait until emergency close has dropped the runtime, with a hard actor
+    /// cancellation fallback so containment-loss handling cannot hang.
+    pub async fn wait_aborted(&self) {
+        let mut finished = self.actor.finished.clone();
+        let notified = tokio::time::timeout(EMERGENCY_ACTOR_EXIT_TIMEOUT, async {
+            while !*finished.borrow() {
+                if finished.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await;
+        if notified.is_err() {
+            self.actor.abort.abort();
+        }
+        self.wait_actor_finished().await;
+    }
+
+    async fn wait_actor_finished(&self) {
+        let mut join = self.actor.join.lock().await;
+        if let Some(join) = join.take() {
+            let _ = join.await;
         }
     }
 
@@ -235,42 +317,98 @@ struct Envelope {
     reply: oneshot::Sender<Result<AgentReply, WorkerError>>,
 }
 
-async fn run_actor(
-    mut runtime: Box<dyn BrowserRuntime>,
+struct ActorContext {
     capabilities: CapabilitySet,
-    mut commands: mpsc::Receiver<Envelope>,
+    commands: mpsc::Receiver<Envelope>,
     snapshots: watch::Sender<BrowserSnapshot>,
-    mut snapshot: BrowserSnapshot,
+    snapshot: BrowserSnapshot,
     command_timeout: Duration,
     stopped: watch::Sender<bool>,
+    emergency: watch::Receiver<bool>,
+}
+
+async fn run_actor(
+    mut runtime: Box<dyn BrowserRuntime>,
+    context: ActorContext,
 ) {
-    match tokio::time::timeout(command_timeout, runtime.start()).await {
+    let ActorContext {
+        capabilities,
+        mut commands,
+        snapshots,
+        mut snapshot,
+        command_timeout,
+        stopped,
+        mut emergency,
+    } = context;
+    let start_result = tokio::select! {
+        biased;
+        _ = wait_for_emergency(&mut emergency) => {
+            snapshot.last_failure = Some(RuntimeFailureKind::Shutdown);
+            emergency_close_runtime(
+                &mut *runtime,
+                &mut snapshot,
+                &snapshots,
+                command_timeout,
+            ).await;
+            drop(runtime);
+            stopped.send_replace(true);
+            return;
+        }
+        result = tokio::time::timeout(command_timeout, runtime.start()) => result,
+    };
+    let startup_unconfirmed = match start_result {
         Ok(Ok(())) => {
             snapshot.lifecycle = WorkerLifecycle::Ready;
             snapshot.last_failure = None;
+            false
         }
-        Ok(Err(error)) => mark_degraded(&mut snapshot, error),
-        Err(_) => mark_timeout_degraded(&mut snapshot),
-    }
+        Ok(Err(error)) => {
+            mark_degraded(&mut snapshot, error);
+            true
+        }
+        Err(_) => {
+            mark_timeout_degraded(&mut snapshot);
+            true
+        }
+    };
     snapshots.send_replace(snapshot.clone());
 
     let mut shutdown_attempted = false;
-    while let Some(envelope) = commands.recv().await {
+    let mut emergency_requested = false;
+    loop {
+        let envelope = tokio::select! {
+            biased;
+            _ = wait_for_emergency(&mut emergency) => {
+                emergency_requested = true;
+                break;
+            }
+            envelope = commands.recv() => match envelope {
+                Some(envelope) => envelope,
+                None => break,
+            },
+        };
         let is_shutdown = matches!(envelope.command, AgentCommand::Shutdown);
         shutdown_attempted |= is_shutdown
             && capabilities.contains(envelope.command.required_capability());
-        let result = match tokio::time::timeout(
-            command_timeout,
-            handle_command(
-                &mut *runtime,
-                &capabilities,
-                &mut snapshot,
-                &snapshots,
-                envelope.command,
-            ),
-        )
-        .await
-        {
+        let command_result = tokio::select! {
+            biased;
+            _ = wait_for_emergency(&mut emergency) => {
+                emergency_requested = true;
+                break;
+            }
+            result = tokio::time::timeout(
+                command_timeout,
+                handle_command(
+                    &mut *runtime,
+                    &capabilities,
+                    &mut snapshot,
+                    &snapshots,
+                    startup_unconfirmed,
+                    envelope.command,
+                ),
+            ) => result,
+        };
+        let result = match command_result {
             Ok(result) => result,
             Err(_) => {
                 mark_timeout_degraded(&mut snapshot);
@@ -284,7 +422,15 @@ async fn run_actor(
         }
     }
 
-    if snapshot.lifecycle != WorkerLifecycle::Stopped {
+    if emergency_requested {
+        emergency_close_runtime(
+            &mut *runtime,
+            &mut snapshot,
+            &snapshots,
+            command_timeout,
+        )
+        .await;
+    } else if snapshot.lifecycle != WorkerLifecycle::Stopped {
         snapshot.lifecycle = WorkerLifecycle::ShuttingDown;
         snapshots.send_replace(snapshot.clone());
         if !shutdown_attempted {
@@ -302,11 +448,42 @@ async fn run_actor(
     stopped.send_replace(true);
 }
 
+async fn wait_for_emergency(emergency: &mut watch::Receiver<bool>) {
+    loop {
+        if *emergency.borrow() {
+            return;
+        }
+        if emergency.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+async fn emergency_close_runtime(
+    runtime: &mut dyn BrowserRuntime,
+    snapshot: &mut BrowserSnapshot,
+    snapshots: &watch::Sender<BrowserSnapshot>,
+    command_timeout: Duration,
+) {
+    snapshot.lifecycle = WorkerLifecycle::ShuttingDown;
+    snapshots.send_replace(snapshot.clone());
+    let timeout = command_timeout.min(EMERGENCY_CLOSE_TIMEOUT);
+    match tokio::time::timeout(timeout, runtime.close()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => snapshot.last_failure = Some(error.kind()),
+        Err(_) => snapshot.last_failure = Some(RuntimeFailureKind::Timeout),
+    }
+    snapshot.lifecycle = WorkerLifecycle::Stopped;
+    snapshot.current_origin = None;
+    snapshots.send_replace(snapshot.clone());
+}
+
 async fn handle_command(
     runtime: &mut dyn BrowserRuntime,
     capabilities: &CapabilitySet,
     snapshot: &mut BrowserSnapshot,
     snapshots: &watch::Sender<BrowserSnapshot>,
+    startup_unconfirmed: bool,
     command: AgentCommand,
 ) -> Result<AgentReply, WorkerError> {
     let required = command.required_capability();
@@ -317,6 +494,9 @@ async fn handle_command(
     if snapshot.lifecycle == WorkerLifecycle::Degraded
         && !matches!(command, AgentCommand::Restart | AgentCommand::Shutdown)
     {
+        return Err(WorkerError::Unavailable);
+    }
+    if startup_unconfirmed && matches!(command, AgentCommand::Restart) {
         return Err(WorkerError::Unavailable);
     }
 
@@ -430,7 +610,11 @@ async fn handle_command(
             let close_result = runtime.close().await;
             snapshot.lifecycle = WorkerLifecycle::Stopped;
             snapshot.current_origin = None;
-            if let Err(error) = close_result {
+            let shutdown_failure = close_result.err().or_else(|| {
+                startup_unconfirmed
+                    .then(|| RuntimeError::new(RuntimeFailureKind::Shutdown))
+            });
+            if let Some(error) = shutdown_failure {
                 snapshot.last_failure = Some(error.kind());
                 snapshots.send_replace(snapshot.clone());
                 return Err(WorkerError::Runtime(error));
@@ -642,7 +826,9 @@ mod tests {
         starts: u32,
         restarts: u32,
         closes: u32,
+        drops: u32,
         navigations: Vec<String>,
+        start_delay: Option<Duration>,
         fail_navigation: bool,
         restart_needed: bool,
         navigation_delay: Option<Duration>,
@@ -654,10 +840,25 @@ mod tests {
         state: Arc<Mutex<FakeState>>,
     }
 
+    impl Drop for FakeRuntime {
+        fn drop(&mut self) {
+            self.state.lock().unwrap().drops += 1;
+        }
+    }
+
     impl BrowserRuntime for FakeRuntime {
         fn start(&mut self) -> BoxFuture<'_, RuntimeResult<()>> {
-            self.state.lock().unwrap().starts += 1;
-            Box::pin(async { Ok(()) })
+            let start_delay = {
+                let mut state = self.state.lock().unwrap();
+                state.starts += 1;
+                state.start_delay
+            };
+            Box::pin(async move {
+                if let Some(delay) = start_delay {
+                    tokio::time::sleep(delay).await;
+                }
+                Ok(())
+            })
         }
 
         fn restart(&mut self) -> BoxFuture<'_, RuntimeResult<()>> {
@@ -851,6 +1052,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn emergency_abort_interrupts_active_command_and_closes_runtime() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        state.lock().unwrap().navigation_delay = Some(Duration::from_secs(60));
+        let worker = BrowserWorker::spawn_with_runtime(
+            identity(),
+            capabilities(),
+            4,
+            FakeRuntime {
+                state: Arc::clone(&state),
+            },
+        )
+        .unwrap();
+        worker.wait_until_settled().await.unwrap();
+
+        let command_worker = worker.clone();
+        let command = tokio::spawn(async move {
+            command_worker
+                .execute(AgentCommand::Navigate {
+                    url: "https://example.test".into(),
+                })
+                .await
+        });
+        while state.lock().unwrap().navigations.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        worker.abort_now();
+        tokio::time::timeout(Duration::from_secs(1), worker.wait_aborted())
+            .await
+            .expect("emergency abort must close and drop the runtime promptly");
+        assert!(matches!(command.await.unwrap(), Err(WorkerError::WorkerStopped)));
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.closes, 1);
+        assert_eq!(state.drops, 1);
+    }
+
+    #[tokio::test]
+    async fn emergency_close_timeout_still_drops_runtime() {
+        let command_timeout = Duration::from_millis(100);
+        let state = Arc::new(Mutex::new(FakeState {
+            close_delay: Some(Duration::from_secs(60)),
+            ..FakeState::default()
+        }));
+        let worker = BrowserWorker::spawn_with_runtime_and_timeout(
+            identity(),
+            capabilities(),
+            4,
+            command_timeout,
+            FakeRuntime {
+                state: Arc::clone(&state),
+            },
+        )
+        .unwrap();
+        worker.wait_until_settled().await.unwrap();
+
+        worker.abort_now();
+        tokio::time::timeout(Duration::from_secs(1), worker.wait_aborted())
+            .await
+            .expect("emergency close must honor its hard deadline");
+
+        let snapshot = worker.snapshot();
+        assert_eq!(snapshot.lifecycle, WorkerLifecycle::Stopped);
+        assert_eq!(snapshot.last_failure, Some(RuntimeFailureKind::Timeout));
+        assert!(matches!(
+            worker.shutdown().await,
+            Err(WorkerError::Runtime(error))
+                if error.kind() == RuntimeFailureKind::Timeout
+        ));
+        let state = state.lock().unwrap();
+        assert_eq!(state.closes, 1);
+        assert_eq!(state.drops, 1);
+    }
+
+    #[tokio::test]
     async fn runtime_failure_degrades_until_explicit_restart() {
         let state = Arc::new(Mutex::new(FakeState {
             fail_navigation: true,
@@ -880,6 +1155,42 @@ mod tests {
         assert_eq!(worker.snapshot().lifecycle, WorkerLifecycle::Ready);
         assert_eq!(state.lock().unwrap().restarts, 1);
         worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_timeout_cannot_be_reported_as_clean_shutdown() {
+        let command_timeout = Duration::from_millis(100);
+        let state = Arc::new(Mutex::new(FakeState {
+            start_delay: Some(Duration::from_secs(60)),
+            ..FakeState::default()
+        }));
+        let worker = BrowserWorker::spawn_with_runtime_and_timeout(
+            identity(),
+            capabilities(),
+            4,
+            command_timeout,
+            FakeRuntime {
+                state: Arc::clone(&state),
+            },
+        )
+        .unwrap();
+
+        let snapshot = worker.wait_until_settled().await.unwrap();
+        assert_eq!(snapshot.lifecycle, WorkerLifecycle::Degraded);
+        assert_eq!(snapshot.last_failure, Some(RuntimeFailureKind::Timeout));
+        assert!(matches!(
+            worker.execute(AgentCommand::Restart).await,
+            Err(WorkerError::Unavailable)
+        ));
+        assert!(matches!(
+            worker.shutdown().await,
+            Err(WorkerError::Runtime(error))
+                if error.kind() == RuntimeFailureKind::Shutdown
+        ));
+        let state = state.lock().unwrap();
+        assert_eq!(state.starts, 1);
+        assert_eq!(state.closes, 1);
+        assert_eq!(state.drops, 1);
     }
 
     #[tokio::test]

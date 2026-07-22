@@ -9,8 +9,15 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use dig2browser::agentic::{
+    AgentCommand, AgentReply, BrowserWorker, BrowserWorkerConfig, CapabilitySet,
+    CapturePolicy,
+};
 use dig2browser::browser::{Cookie, CookieJar, StealthBrowser, StealthPage};
-use dig2browser::detect::{BrowserProfile, LaunchConfig};
+use dig2browser::detect::{BrowserPreference, BrowserProfile, LaunchConfig};
+use dig2browser::identity::{
+    BrowserBackend, DevicePersona, IdentityClass, IdentityProfile,
+};
 use dig2browser::stealth::StealthConfig;
 use base64::Engine;
 use sha2::{Digest, Sha256};
@@ -309,7 +316,21 @@ fn serve_connection(
     if has_server_cookie && has_cdp_cookie {
         requests_with_both_cookies.fetch_add(1, Ordering::AcqRel);
     }
-    let body = "<!doctype html><title>cookie-profile-e2e</title><main data-ready>ready</main>";
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or("/");
+    let title = if path == "/worker-check" {
+        if has_server_cookie {
+            "worker-cookie-ok"
+        } else {
+            "worker-cookie-missing"
+        }
+    } else {
+        "cookie-profile-e2e"
+    };
+    let body = format!("<!doctype html><title>{title}</title><main data-ready>ready</main>");
     let set_cookie = if issue_server_cookie {
         format!(
             "Set-Cookie: {SERVER_COOKIE_NAME}={SERVER_COOKIE_VALUE}; Path=/; Max-Age=3600; HttpOnly; SameSite=Lax\r\n"
@@ -409,7 +430,6 @@ async fn visible_to_headless_profile_preserves_exact_cookie_values_e2e() {
         false,
         true,
     );
-
     let expires = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time after epoch")
@@ -473,6 +493,104 @@ async fn visible_to_headless_profile_preserves_exact_cookie_values_e2e() {
     headless.close().await.expect("close headless successor");
 
     remove_profile(&profile).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn browser_worker_persists_cookie_across_process_replacement_e2e() {
+    browser_worker_persists_cookie_across_process_replacement(
+        BrowserPreference::ChromeOnly,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edge_browser_worker_persists_cookie_across_process_replacement_e2e() {
+    browser_worker_persists_cookie_across_process_replacement(
+        BrowserPreference::EdgeOnly,
+        false,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn headless_edge_browser_worker_persists_cookie_across_process_replacement_e2e() {
+    browser_worker_persists_cookie_across_process_replacement(
+        BrowserPreference::EdgeOnly,
+        true,
+    )
+    .await;
+}
+
+async fn browser_worker_persists_cookie_across_process_replacement(
+    browser_preference: BrowserPreference,
+    first_headless: bool,
+) {
+    let fixture = FixtureServer::start();
+    let profiles_root = e2e_profile();
+    std::fs::create_dir_all(&profiles_root).expect("create worker cookie profiles root");
+    let identity = IdentityProfile::new(
+        &profiles_root,
+        "worker-cookie-profile",
+        IdentityClass::Authenticated,
+        BrowserBackend::Chromium,
+        DevicePersona::DesktopNative,
+    )
+    .expect("create worker cookie identity");
+    let mut visible_config = BrowserWorkerConfig::default();
+    visible_config.launch.headless = first_headless;
+    visible_config.launch.browser_pref = browser_preference;
+    let visible = BrowserWorker::spawn(
+        identity.clone(),
+        CapabilitySet::monitoring(),
+        visible_config,
+    )
+    .expect("spawn visible cookie worker");
+    let settled = visible
+        .wait_until_settled()
+        .await
+        .expect("wait for visible cookie worker");
+    assert_eq!(settled.lifecycle, dig2browser::agentic::WorkerLifecycle::Ready);
+    visible
+        .execute(AgentCommand::Navigate {
+            url: fixture.url("/worker-seed"),
+        })
+        .await
+        .expect("seed worker cookie");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    visible.shutdown().await.expect("close visible cookie worker");
+
+    let mut headless_config = BrowserWorkerConfig::default();
+    headless_config.launch.browser_pref = browser_preference;
+    let headless = BrowserWorker::spawn(
+        identity,
+        CapabilitySet::monitoring(),
+        headless_config,
+    )
+    .expect("spawn headless cookie worker");
+    let settled = headless
+        .wait_until_settled()
+        .await
+        .expect("wait for headless cookie worker");
+    assert_eq!(settled.lifecycle, dig2browser::agentic::WorkerLifecycle::Ready);
+    headless
+        .execute(AgentCommand::Navigate {
+            url: fixture.url("/worker-check"),
+        })
+        .await
+        .expect("check worker cookie");
+    let reply = headless
+        .execute(AgentCommand::Capture {
+            policy: CapturePolicy::StateOnly,
+        })
+        .await
+        .expect("capture worker cookie state");
+    let AgentReply::Capture(dig2browser::agentic::CaptureArtifact::StateOnly(state)) = reply else {
+        panic!("worker cookie check did not return state capture");
+    };
+    assert_eq!(state.title, "worker-cookie-ok");
+    headless.shutdown().await.expect("close headless cookie worker");
+    remove_profile(&profiles_root).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

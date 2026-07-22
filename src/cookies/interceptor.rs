@@ -153,7 +153,6 @@ pub async fn intercept_cookies(config: &InterceptConfig) -> Result<CookieJar, Co
     };
     let port = LaunchConfig::find_free_port();
     let mut args = launch.build_args(&profile_dir, port, None);
-    args.push("--disable-background-mode".into());
     args.push(config.start_url.clone());
 
     // Step 4: print instructions and launch.

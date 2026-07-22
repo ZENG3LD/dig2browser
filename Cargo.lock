@@ -636,10 +636,12 @@ dependencies = [
  "dig2browser-protocol",
  "dig2browser-runtime-lightweight",
  "dig2browser-trace",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",
  "uuid",
+ "windows",
 ]
 
 [[package]]

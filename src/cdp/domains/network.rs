@@ -31,7 +31,13 @@ impl CdpSession {
     /// Set a single cookie.
     pub async fn set_cookie(&self, cookie: CdpCookie) -> Result<(), CdpError> {
         let params = serde_json::to_value(&cookie)?;
-        self.call("Network.setCookie", Some(params)).await?;
+        let result = self.call("Network.setCookie", Some(params)).await?;
+        if result.get("success").and_then(serde_json::Value::as_bool) == Some(false) {
+            return Err(CdpError::Protocol {
+                code: -1,
+                message: "Network.setCookie rejected the cookie".to_owned(),
+            });
+        }
         Ok(())
     }
 

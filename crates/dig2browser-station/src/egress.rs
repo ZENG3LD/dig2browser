@@ -10,6 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{lookup_host, TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 
 const MAX_CONNECTIONS: usize = 64;
 const MAX_HEADER_BYTES: usize = 32 * 1024;
@@ -210,6 +211,7 @@ pub struct EgressReport {
     pub completed_connections: u64,
     pub denied_connections: u64,
     pub invalid_connections: u64,
+    pub idle_connections: u64,
     pub failed_connections: u64,
     pub timed_out_connections: u64,
     pub aborted_connections: u64,
@@ -240,6 +242,7 @@ enum ConnectionOutcome {
     Completed,
     Denied,
     Invalid,
+    Idle,
     Failed,
     TimedOut,
     Aborted,
@@ -258,6 +261,9 @@ fn record_join(
         }
         Some(Ok(ConnectionOutcome::Invalid)) => {
             report.invalid_connections = report.invalid_connections.saturating_add(1)
+        }
+        Some(Ok(ConnectionOutcome::Idle)) => {
+            report.idle_connections = report.idle_connections.saturating_add(1)
         }
         Some(Ok(ConnectionOutcome::TimedOut)) => {
             report.timed_out_connections = report.timed_out_connections.saturating_add(1)
@@ -307,6 +313,7 @@ async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
 enum ConnectionFailure {
     Denied,
     Invalid,
+    Idle,
     Failed,
     TimedOut,
 }
@@ -316,6 +323,7 @@ impl ConnectionFailure {
         match self {
             Self::Denied => ConnectionOutcome::Denied,
             Self::Invalid => ConnectionOutcome::Invalid,
+            Self::Idle => ConnectionOutcome::Idle,
             Self::Failed => ConnectionOutcome::Failed,
             Self::TimedOut => ConnectionOutcome::TimedOut,
         }
@@ -327,9 +335,7 @@ async fn serve_connection_inner(
     policy: &NavigationPolicy,
     peer_policy: &EgressPeerPolicy,
 ) -> Result<(), ConnectionFailure> {
-    let (head, buffered) = tokio::time::timeout(HEADER_TIMEOUT, read_request_head(&mut client))
-        .await
-        .map_err(|_| ConnectionFailure::TimedOut)??;
+    let (head, buffered) = read_request_head(&mut client).await?;
     let request = parse_request(&head, buffered, policy)?;
     let addresses = resolve_target(&request.target, peer_policy).await?;
     let mut upstream = connect_target(&addresses).await?;
@@ -372,12 +378,25 @@ async fn serve_connection_inner(
 async fn read_request_head(
     stream: &mut TcpStream,
 ) -> Result<(Vec<u8>, Vec<u8>), ConnectionFailure> {
+    read_request_head_until(stream, Instant::now() + HEADER_TIMEOUT).await
+}
+
+async fn read_request_head_until(
+    stream: &mut TcpStream,
+    deadline: Instant,
+) -> Result<(Vec<u8>, Vec<u8>), ConnectionFailure> {
     let mut received = Vec::with_capacity(READ_CHUNK_BYTES);
     let mut chunk = [0_u8; READ_CHUNK_BYTES];
     loop {
-        let count = stream
-            .read(&mut chunk)
+        let count = tokio::time::timeout_at(deadline, stream.read(&mut chunk))
             .await
+            .map_err(|_| {
+                if received.is_empty() {
+                    ConnectionFailure::Idle
+                } else {
+                    ConnectionFailure::TimedOut
+                }
+            })?
             .map_err(|_| ConnectionFailure::Failed)?;
         if count == 0 {
             return Err(ConnectionFailure::Invalid);
@@ -922,6 +941,41 @@ mod tests {
             parse_request(&oversized, Vec::new(), &policy),
             Err(ConnectionFailure::Invalid)
         ));
+    }
+
+    #[tokio::test]
+    async fn empty_preconnect_and_partial_header_have_distinct_timeout_outcomes() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind header timeout fixture");
+        let address = listener.local_addr().expect("header timeout fixture address");
+
+        let idle_client = TcpStream::connect(address)
+            .await
+            .expect("connect idle preconnect fixture");
+        let (mut idle_server, _) = listener.accept().await.expect("accept idle preconnect");
+        let idle = read_request_head_until(
+            &mut idle_server,
+            Instant::now() + Duration::from_millis(25),
+        )
+        .await;
+        assert!(matches!(idle, Err(ConnectionFailure::Idle)));
+        drop(idle_client);
+
+        let mut partial_client = TcpStream::connect(address)
+            .await
+            .expect("connect partial header fixture");
+        let (mut partial_server, _) = listener.accept().await.expect("accept partial header");
+        partial_client
+            .write_all(b"GET http://example.test/ HTTP/1.1\r\n")
+            .await
+            .expect("write partial header");
+        let partial = read_request_head_until(
+            &mut partial_server,
+            Instant::now() + Duration::from_millis(25),
+        )
+        .await;
+        assert!(matches!(partial, Err(ConnectionFailure::TimedOut)));
     }
 
     #[tokio::test]

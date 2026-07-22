@@ -6,7 +6,11 @@
 //! publication stay in consumers.
 
 use std::collections::HashMap;
+#[cfg(windows)]
+use std::ffi::OsString;
 use std::io::Write;
+#[cfg(windows)]
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -23,6 +27,7 @@ use dig2browser::identity::{
     IdentityError, IdentityProfile, ProfileOwnershipGuard,
 };
 use dig2browser::stealth::{ClientHintsProfile, LocaleProfile};
+use dig2browser::BrowserProcessIsolation;
 use dig2browser_protocol::{
     BrowserPersona, IdentitySessionStatus, PersonaKind, ProfileClass,
     SessionHealthProbe, SessionPhase, SessionStateUpdate,
@@ -36,11 +41,16 @@ use tokio::sync::{Mutex, RwLock, Semaphore};
 use route::PreparedRoute;
 
 mod collection;
+pub mod containment;
 mod crawl;
 mod egress;
 pub mod ipc;
 mod route;
 pub mod runtime;
+#[cfg(windows)]
+mod windows_containment;
+#[cfg(windows)]
+pub mod windows_wfp_broker;
 
 pub use dig2browser_core::{
     ResolvedRuntime, RuntimeKind, RuntimeRequirements, RuntimeSelector,
@@ -76,11 +86,15 @@ impl ProfilesRootOwnership {
             return Err(ProfilesRootError::NotAbsolute);
         }
         std::fs::create_dir_all(&root).map_err(ProfilesRootError::Io)?;
-        let root = std::fs::canonicalize(root).map_err(ProfilesRootError::Io)?;
-        if !root.metadata().map_err(ProfilesRootError::Io)?.is_dir() {
+        let canonical_root = std::fs::canonicalize(root).map_err(ProfilesRootError::Io)?;
+        if !canonical_root
+            .metadata()
+            .map_err(ProfilesRootError::Io)?
+            .is_dir()
+        {
             return Err(ProfilesRootError::NotDirectory);
         }
-        let guard = match ProfileOwnershipGuard::acquire(&root) {
+        let guard = match ProfileOwnershipGuard::acquire(&canonical_root) {
             Ok(guard) => guard,
             Err(IdentityError::ProfileAlreadyOwned { .. }) => {
                 return Err(ProfilesRootError::AlreadyOwned)
@@ -91,7 +105,7 @@ impl ProfilesRootOwnership {
             }
         };
         Ok(Self {
-            root,
+            root: child_process_compatible_path(canonical_root),
             _guard: guard,
         })
     }
@@ -99,6 +113,42 @@ impl ProfilesRootOwnership {
     pub fn root(&self) -> &Path {
         &self.root
     }
+}
+
+#[cfg(windows)]
+fn child_process_compatible_path(path: PathBuf) -> PathBuf {
+    const VERBATIM_PREFIX: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    const VERBATIM_UNC_PREFIX: [u16; 8] = [
+        b'\\' as u16,
+        b'\\' as u16,
+        b'?' as u16,
+        b'\\' as u16,
+        b'U' as u16,
+        b'N' as u16,
+        b'C' as u16,
+        b'\\' as u16,
+    ];
+
+    let encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if encoded.starts_with(&VERBATIM_UNC_PREFIX) {
+        let mut compatible = Vec::with_capacity(encoded.len().saturating_sub(6));
+        compatible.extend_from_slice(&[b'\\' as u16, b'\\' as u16]);
+        compatible.extend_from_slice(&encoded[VERBATIM_UNC_PREFIX.len()..]);
+        return PathBuf::from(OsString::from_wide(&compatible));
+    }
+    if encoded.starts_with(&VERBATIM_PREFIX)
+        && encoded.len() >= 7
+        && encoded[5] == b':' as u16
+        && matches!(encoded[6], value if value == b'\\' as u16 || value == b'/' as u16)
+    {
+        return PathBuf::from(OsString::from_wide(&encoded[VERBATIM_PREFIX.len()..]));
+    }
+    path
+}
+
+#[cfg(not(windows))]
+fn child_process_compatible_path(path: PathBuf) -> PathBuf {
+    path
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +162,7 @@ pub struct StationConfig {
     runtime_registry: RuntimeRegistry,
     route_registry: RouteRegistry,
     navigation_policy: NavigationPolicy,
+    process_isolation: BrowserProcessIsolation,
 }
 
 impl StationConfig {
@@ -140,6 +191,7 @@ impl StationConfig {
             runtime_registry: RuntimeRegistry::default(),
             route_registry: RouteRegistry::default(),
             navigation_policy: NavigationPolicy::default(),
+            process_isolation: BrowserProcessIsolation::Native,
         })
     }
 
@@ -165,6 +217,11 @@ impl StationConfig {
 
     pub fn with_navigation_policy(mut self, policy: NavigationPolicy) -> Self {
         self.navigation_policy = policy;
+        self
+    }
+
+    pub fn with_process_isolation(mut self, isolation: BrowserProcessIsolation) -> Self {
+        self.process_isolation = isolation;
         self
     }
 
@@ -273,6 +330,7 @@ impl IdentityRequest {
     fn bind_runtime_backend(mut self, runtime: RuntimeKind) -> Result<Self, StationError> {
         self.backend = match runtime {
             RuntimeKind::Chrome | RuntimeKind::Edge => BrowserBackend::Chromium,
+            RuntimeKind::Firefox => BrowserBackend::Firefox,
             RuntimeKind::Lightweight => BrowserBackend::Lightweight,
             unsupported => return Err(StationError::RuntimeBackendUnsupported(unsupported)),
         };
@@ -444,7 +502,10 @@ fn runtime_requirements(
 fn task_runtime_requirements(
     task: &BrowserTask,
 ) -> Result<RuntimeRequirements, RuntimeRequirementsError> {
-    let mut features = vec![RuntimeFeature::Lifecycle];
+    let mut features = vec![
+        RuntimeFeature::Lifecycle,
+        RuntimeFeature::PersistentProfile,
+    ];
     let mut add = |feature| {
         if !features.contains(&feature) {
             features.push(feature);
@@ -756,11 +817,9 @@ fn compiled_binding_matches(
     let Some((preset, route_field)) = compiled_persona_metadata(persona) else {
         return false;
     };
-    [RuntimeKind::Chrome, RuntimeKind::Edge]
-        .into_iter()
-        .filter(|runtime| preset.supports_runtime(*runtime))
-        .any(|runtime| {
-            binding
+    let matches_runtime = |runtime| {
+        preset.supports_runtime(runtime)
+            && binding
                 == format!(
                     "v2|preset={}|runtime={runtime:?}|class={}|route={route_field}|persona={}:{}",
                     preset.as_str(),
@@ -771,7 +830,13 @@ fn compiled_binding_matches(
                     persona.len(),
                     persona,
                 )
-        })
+    };
+    match preset.required_runtime() {
+        Some(runtime) => matches_runtime(runtime),
+        None => [RuntimeKind::Chrome, RuntimeKind::Edge]
+            .into_iter()
+            .any(matches_runtime),
+    }
 }
 
 fn read_identity_session_status(
@@ -937,6 +1002,7 @@ struct Inner {
     clock: AtomicU64,
     command_waiters: AtomicUsize,
     session_state_gate: Mutex<()>,
+    emergency_workers: std::sync::Mutex<Vec<BrowserWorker>>,
 }
 
 /// Cloneable facade over one station-owned browser fleet.
@@ -960,8 +1026,24 @@ impl BrowserStation {
                 clock: AtomicU64::new(0),
                 command_waiters: AtomicUsize::new(0),
                 session_state_gate: Mutex::new(()),
+                emergency_workers: std::sync::Mutex::new(Vec::new()),
             }),
         }
+    }
+
+    fn register_emergency_worker(&self, worker: &BrowserWorker) -> Result<(), StationError> {
+        let mut workers = self
+            .inner
+            .emergency_workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        workers.retain(|worker| worker.snapshot().lifecycle != WorkerLifecycle::Stopped);
+        workers.push(worker.clone());
+        if self.inner.shutting_down.load(Ordering::Acquire) {
+            worker.abort_now();
+            return Err(StationError::ShuttingDown);
+        }
+        Ok(())
     }
 
     pub fn profiles_root(&self) -> &Path {
@@ -1093,6 +1175,10 @@ impl BrowserStation {
         validate_persona_runtime(identity.persona(), runtime.resolved())?;
         let identity = identity.bind_runtime_backend(runtime.resolved().kind())?;
 
+        // Cover actor creation and registration with the same gate drained by
+        // shutdown. A cancelled lease may leave no state slot, so the worker
+        // registry remains the canonical shutdown set.
+        let _operation = self.inner.operation_gate.read().await;
         let mut state = self.inner.state.lock().await;
         if self.inner.shutting_down.load(Ordering::Acquire) {
             return Err(StationError::ShuttingDown);
@@ -1190,8 +1276,10 @@ impl BrowserStation {
             prepared_route
                 .as_ref()
                 .and_then(PreparedRoute::egress_proxy),
+            self.inner.config.process_isolation.clone(),
             worker_config,
         )?;
+        self.register_emergency_worker(&worker)?;
         let snapshot = worker.wait_until_settled().await?;
         let ready = match snapshot.lifecycle {
             WorkerLifecycle::Ready => true,
@@ -1336,6 +1424,7 @@ impl BrowserStation {
             return Err(StationError::Worker(WorkerError::InvalidInput));
         }
         validate_persona_runtime(identity.persona(), runtime.resolved())?;
+        let identity = identity.bind_runtime_backend(runtime.resolved().kind())?;
         let _operation = self.inner.operation_gate.read().await;
 
         let evicted = {
@@ -1429,6 +1518,7 @@ impl BrowserStation {
             prepared_route
                 .as_ref()
                 .and_then(PreparedRoute::egress_proxy),
+            self.inner.config.process_isolation.clone(),
             worker_config,
         ) {
             Ok(worker) => worker,
@@ -1437,10 +1527,18 @@ impl BrowserStation {
                 return Err(error.into());
             }
         };
-        let ready = worker
-            .wait_until_settled()
-            .await
-            .is_ok_and(|snapshot| snapshot.lifecycle == WorkerLifecycle::Ready);
+        if let Err(error) = self.register_emergency_worker(&worker) {
+            self.remove_auth_reservation(&identity).await;
+            return Err(error);
+        }
+        let ready = match worker.wait_until_settled().await {
+            Ok(snapshot) if snapshot.lifecycle == WorkerLifecycle::Ready => true,
+            Ok(snapshot) if snapshot.lifecycle == WorkerLifecycle::Degraded => worker
+                .execute(AgentCommand::Restart)
+                .await
+                .is_ok(),
+            _ => false,
+        };
         if !ready {
             let _ = worker.shutdown().await;
             self.remove_auth_reservation(&identity).await;
@@ -1680,20 +1778,18 @@ impl BrowserStation {
             return Err(StationError::ShuttingDown);
         }
         let _drained = self.inner.operation_gate.write().await;
-        let workers = {
+        {
             let mut state = self.inner.state.lock().await;
-            let mut workers = state
-                .slots
-                .drain()
-                .map(|(_, slot)| slot.worker.clone())
-                .collect::<Vec<_>>();
-            workers.extend(
-                state
-                    .auth_sessions
-                    .drain()
-                    .filter_map(|(_, worker)| worker),
-            );
-            workers
+            state.slots.clear();
+            state.auth_sessions.clear();
+        }
+        let workers = {
+            let registered = self
+                .inner
+                .emergency_workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registered.clone()
         };
         let mut stopped = 0;
         let mut failed = 0;
@@ -1703,10 +1799,58 @@ impl BrowserStation {
                 Err(_) => failed += 1,
             }
         }
+        self.inner
+            .emergency_workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         if failed > 0 {
             return Err(StationError::ShutdownIncomplete { stopped, failed });
         }
         Ok(ShutdownReport { stopped })
+    }
+
+    /// Emergency shutdown after loss of an external containment boundary.
+    /// Admission stops first, then every registered actor is cancelled before
+    /// any IPC or collection drain can delay browser process-tree termination.
+    pub async fn emergency_shutdown(&self) -> ShutdownReport {
+        self.inner.shutting_down.store(true, Ordering::Release);
+        let active_workers = {
+            let registered = self
+                .inner
+                .emergency_workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registered.clone()
+        };
+        for worker in active_workers {
+            worker.abort_now();
+        }
+
+        // Admission that already holds the read side may still register a
+        // worker after the first snapshot. Such registration observes
+        // `shutting_down`, aborts itself, and remains in the canonical registry
+        // collected after the gate drains.
+        let _drained = self.inner.operation_gate.write().await;
+        let workers = {
+            let mut registered = self
+                .inner
+                .emergency_workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut *registered)
+        };
+        for worker in &workers {
+            worker.abort_now();
+        }
+        let stopped = workers.len();
+        for worker in &workers {
+            worker.wait_aborted().await;
+        }
+        let mut state = self.inner.state.lock().await;
+        state.slots.clear();
+        state.auth_sessions.clear();
+        ShutdownReport { stopped }
     }
 }
 
@@ -2275,10 +2419,141 @@ pub enum StationError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dig2browser::agentic::{Capability, L3Capability};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::AtomicUsize;
+
+    use dig2browser::agentic::{
+        BrowserRuntime, Capability, CaptureArtifact, CapturePolicy,
+        DocumentState, L3Capability, RuntimeError, RuntimeResult,
+    };
     use dig2browser_core::{
         FeatureSupport, NegotiationError, RuntimeDescriptor, SupportLevel,
     };
+
+    type RuntimeFuture<'a, T> =
+        Pin<Box<dyn Future<Output = RuntimeResult<T>> + Send + 'a>>;
+
+    struct LifecycleTestRuntime {
+        closes: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+        close_failure: bool,
+        close_release: Option<Arc<tokio::sync::Semaphore>>,
+    }
+
+    impl Drop for LifecycleTestRuntime {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl BrowserRuntime for LifecycleTestRuntime {
+        fn start(&mut self) -> RuntimeFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn restart(&mut self) -> RuntimeFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn close(&mut self) -> RuntimeFuture<'_, ()> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            let close_failure = self.close_failure;
+            let close_release = self.close_release.clone();
+            Box::pin(async move {
+                if let Some(close_release) = close_release {
+                    close_release
+                        .acquire()
+                        .await
+                        .expect("close release semaphore remains open")
+                        .forget();
+                }
+                if close_failure {
+                    Err(RuntimeError::new(RuntimeFailureKind::Shutdown))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn needs_restart(&self) -> bool {
+            false
+        }
+
+        fn navigate<'a>(&'a mut self, url: &'a str) -> RuntimeFuture<'a, DocumentState> {
+            let url = url.to_owned();
+            Box::pin(async move {
+                Ok(DocumentState {
+                    url,
+                    title: String::new(),
+                    ready_state: "complete".to_owned(),
+                    http_status: Some(200),
+                })
+            })
+        }
+
+        fn click_at(&mut self, _x: f64, _y: f64) -> RuntimeFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn wheel(
+            &mut self,
+            _x: f64,
+            _y: f64,
+            _delta_x: f64,
+            _delta_y: f64,
+        ) -> RuntimeFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn key_press<'a>(&'a mut self, _key: &'a str) -> RuntimeFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn resolve_element<'a>(
+            &'a mut self,
+            _selector: &'a str,
+        ) -> RuntimeFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn click_element<'a>(&'a mut self, _selector: &'a str) -> RuntimeFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn type_element<'a>(
+            &'a mut self,
+            _selector: &'a str,
+            _text: &'a str,
+        ) -> RuntimeFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn read_element_text<'a>(
+            &'a mut self,
+            _selector: &'a str,
+        ) -> RuntimeFuture<'a, String> {
+            Box::pin(async { Ok(String::new()) })
+        }
+
+        fn evaluate<'a>(
+            &'a mut self,
+            _script: &'a str,
+        ) -> RuntimeFuture<'a, serde_json::Value> {
+            Box::pin(async { Ok(serde_json::Value::Null) })
+        }
+
+        fn capture(&mut self, _policy: CapturePolicy) -> RuntimeFuture<'_, CaptureArtifact> {
+            Box::pin(async {
+                Ok(CaptureArtifact::StateOnly(DocumentState {
+                    url: String::new(),
+                    title: String::new(),
+                    ready_state: "complete".to_owned(),
+                    http_status: None,
+                }))
+            })
+        }
+    }
 
     struct ExactPreflightRuntimeFactory {
         descriptor: RuntimeDescriptor,
@@ -2382,6 +2657,225 @@ mod tests {
             config.with_worker_capabilities(capabilities),
             Err(ConfigError::LifecycleCapabilityRequired)
         ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_actor_registered_during_admission_race() {
+        let root = std::env::temp_dir().join(format!(
+            "dig2browser-station-register-shutdown-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = StationConfig::new(&root, 1, 1).expect("valid station config");
+        let station = BrowserStation::new(config);
+        let operation = station.inner.operation_gate.read().await;
+        let shutdown_station = station.clone();
+        let shutdown = tokio::spawn(async move { shutdown_station.shutdown().await });
+        while !station.inner.shutting_down.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+
+        let closes = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let profile = IdentityProfile::new(
+            &root,
+            "register-race",
+            IdentityClass::Public,
+            BrowserBackend::Chromium,
+            DevicePersona::DesktopNative,
+        )
+        .unwrap();
+        let worker = BrowserWorker::spawn_with_runtime(
+            profile,
+            CapabilitySet::monitoring(),
+            1,
+            LifecycleTestRuntime {
+                closes: Arc::clone(&closes),
+                drops: Arc::clone(&drops),
+                close_failure: false,
+                close_release: None,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            station.register_emergency_worker(&worker),
+            Err(StationError::ShuttingDown)
+        ));
+
+        drop(operation);
+        match shutdown.await.unwrap() {
+            Ok(report) => assert_eq!(report.stopped, 1),
+            Err(StationError::ShutdownIncomplete { stopped, failed }) => {
+                assert_eq!(stopped, 0);
+                assert_eq!(failed, 1);
+            }
+            Err(error) => panic!("unexpected shutdown result: {error}"),
+        }
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_registered_worker_close_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "dig2browser-station-close-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = StationConfig::new(&root, 1, 1).expect("valid station config");
+        let station = BrowserStation::new(config);
+        let closes = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let profile = IdentityProfile::new(
+            &root,
+            "close-failure",
+            IdentityClass::Public,
+            BrowserBackend::Chromium,
+            DevicePersona::DesktopNative,
+        )
+        .unwrap();
+        let worker = BrowserWorker::spawn_with_runtime(
+            profile,
+            CapabilitySet::monitoring(),
+            1,
+            LifecycleTestRuntime {
+                closes: Arc::clone(&closes),
+                drops: Arc::clone(&drops),
+                close_failure: true,
+                close_release: None,
+            },
+        )
+        .unwrap();
+        worker.wait_until_settled().await.unwrap();
+        station.register_emergency_worker(&worker).unwrap();
+
+        assert!(matches!(
+            station.shutdown().await,
+            Err(StationError::ShutdownIncomplete {
+                stopped: 0,
+                failed: 1,
+            })
+        ));
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn emergency_shutdown_aborts_registered_actor_before_admission_drain() {
+        let root = std::env::temp_dir().join(format!(
+            "dig2browser-station-emergency-register-race-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = StationConfig::new(&root, 1, 1).expect("valid station config");
+        let station = BrowserStation::new(config);
+        let closes = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let profile = IdentityProfile::new(
+            &root,
+            "emergency-register-race",
+            IdentityClass::Public,
+            BrowserBackend::Chromium,
+            DevicePersona::DesktopNative,
+        )
+        .unwrap();
+        let worker = BrowserWorker::spawn_with_runtime(
+            profile,
+            CapabilitySet::monitoring(),
+            1,
+            LifecycleTestRuntime {
+                closes: Arc::clone(&closes),
+                drops: Arc::clone(&drops),
+                close_failure: false,
+                close_release: None,
+            },
+        )
+        .unwrap();
+        station.register_emergency_worker(&worker).unwrap();
+        worker.wait_until_settled().await.unwrap();
+
+        let operation = station.inner.operation_gate.read().await;
+        let shutdown_station = station.clone();
+        let shutdown = tokio::spawn(async move { shutdown_station.emergency_shutdown().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !station.inner.shutting_down.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+            worker.wait_stopped().await.unwrap();
+        })
+        .await
+        .expect("emergency abort waited for admission drain");
+        assert!(!shutdown.is_finished());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        drop(operation);
+        let report = shutdown.await.unwrap();
+        assert_eq!(report.stopped, 1);
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn emergency_shutdown_preempts_normal_shutdown_after_registry_snapshot() {
+        let root = std::env::temp_dir().join(format!(
+            "dig2browser-station-concurrent-shutdown-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config = StationConfig::new(&root, 1, 1).expect("valid station config");
+        let station = BrowserStation::new(config);
+        let closes = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let close_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let profile = IdentityProfile::new(
+            &root,
+            "concurrent-shutdown",
+            IdentityClass::Public,
+            BrowserBackend::Chromium,
+            DevicePersona::DesktopNative,
+        )
+        .unwrap();
+        let worker = BrowserWorker::spawn_with_runtime(
+            profile,
+            CapabilitySet::monitoring(),
+            1,
+            LifecycleTestRuntime {
+                closes: Arc::clone(&closes),
+                drops: Arc::clone(&drops),
+                close_failure: false,
+                close_release: Some(Arc::clone(&close_release)),
+            },
+        )
+        .unwrap();
+        worker.wait_until_settled().await.unwrap();
+        station.register_emergency_worker(&worker).unwrap();
+
+        let normal_station = station.clone();
+        let normal = tokio::spawn(async move { normal_station.shutdown().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while closes.load(Ordering::SeqCst) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("normal shutdown did not enter runtime close");
+
+        let emergency_station = station.clone();
+        let emergency = tokio::spawn(async move {
+            emergency_station.emergency_shutdown().await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while closes.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("emergency shutdown could not reach worker held by normal shutdown");
+
+        close_release.add_permits(2);
+        let _ = normal.await.expect("join normal shutdown");
+        let _ = emergency.await.expect("join emergency shutdown");
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2658,6 +3152,8 @@ mod tests {
         ));
         let first = ProfilesRootOwnership::acquire(&root).expect("acquire profiles root");
         assert!(first.root().is_absolute());
+        #[cfg(windows)]
+        assert!(!first.root().to_string_lossy().starts_with(r"\\?\"));
         assert!(matches!(
             ProfilesRootOwnership::acquire(&root),
             Err(ProfilesRootError::AlreadyOwned)
@@ -2667,5 +3163,45 @@ mod tests {
             ProfilesRootOwnership::acquire(&root).expect("successor acquires profiles root");
         drop(successor);
         std::fs::remove_dir_all(root).expect("remove profiles root fixture");
+    }
+
+    #[test]
+    fn session_status_accepts_firefox_compiled_profile_binding() {
+        let root = std::env::temp_dir().join(format!(
+            "dig2browser-station-firefox-session-status-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let profile_dir = root.join("firefox-auth");
+        std::fs::create_dir_all(&profile_dir).expect("create Firefox profile fixture");
+        let route = RouteRef::host_direct();
+        let persona = BrowserPersona::compiled(
+            PersonaPreset::FirefoxWindowsDesktopV1,
+            route.clone(),
+        )
+        .expect("compile Firefox persona");
+        let persona = persona_contract(&persona);
+        let binding = format!(
+            "v2|preset={}|runtime=Firefox|class=Authenticated|route={}:{}|persona={}:{}",
+            PersonaPreset::FirefoxWindowsDesktopV1.as_str(),
+            route.as_str().len(),
+            route.as_str(),
+            persona.len(),
+            persona,
+        );
+        std::fs::write(profile_dir.join(PERSONA_MANIFEST), &persona)
+            .expect("write persona manifest");
+        std::fs::write(profile_dir.join(PROFILE_CLASS_MANIFEST), "Authenticated")
+            .expect("write class manifest");
+        std::fs::write(profile_dir.join(PROFILE_BINDING_MANIFEST), binding)
+            .expect("write Firefox binding manifest");
+
+        let status = read_identity_session_status(&root, "firefox-auth")
+            .expect("Firefox binding must be valid session state");
+
+        assert!(status.profile_exists);
+        assert!(status.persona_bound);
+        assert_eq!(status.profile_class, Some(ProfileClass::Authenticated));
+        assert_eq!(status.phase, SessionPhase::Unknown);
+        std::fs::remove_dir_all(root).expect("remove Firefox profile fixture");
     }
 }

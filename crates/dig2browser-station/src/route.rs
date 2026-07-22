@@ -2,16 +2,21 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use dig2browser::agentic::BrowserWorkerConfig;
+use dig2browser::BrowserProxy;
 use dig2browser_core::RouteRef;
 
 /// The browser-visible transport selected for one non-secret route reference.
 ///
-/// `HostDirect` means Chromium is forced to use the host network stack without
+/// `HostDirect` means the selected browser uses the host network stack without
 /// a browser-configured proxy. It does not claim a particular public IP, DNS
 /// path, ASN, VPN state, or physical location.
+/// External transports configure one station-selected browser proxy endpoint;
+/// they do not add process-level network containment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteTransport {
     HostDirect,
+    ExternalHttp(SocketAddr),
+    ExternalSocks5(SocketAddr),
 }
 
 /// Station-owned resolution of an opaque route reference.
@@ -42,6 +47,35 @@ impl RouteDescriptor {
             reference,
             transport: RouteTransport::HostDirect,
             egress_proxy: Some(egress_proxy),
+        })
+    }
+
+    pub fn external_http(
+        reference: RouteRef,
+        proxy: SocketAddr,
+    ) -> Result<Self, EgressRouteError> {
+        Self::external_proxy(reference, RouteTransport::ExternalHttp(proxy), proxy)
+    }
+
+    pub fn external_socks5(
+        reference: RouteRef,
+        proxy: SocketAddr,
+    ) -> Result<Self, EgressRouteError> {
+        Self::external_proxy(reference, RouteTransport::ExternalSocks5(proxy), proxy)
+    }
+
+    fn external_proxy(
+        reference: RouteRef,
+        transport: RouteTransport,
+        proxy: SocketAddr,
+    ) -> Result<Self, EgressRouteError> {
+        if proxy.port() == 0 || proxy.ip().is_unspecified() || proxy.ip().is_multicast() {
+            return Err(EgressRouteError::InvalidExternalProxy);
+        }
+        Ok(Self {
+            reference,
+            transport,
+            egress_proxy: None,
         })
     }
 
@@ -121,11 +155,12 @@ impl PreparedRoute {
         descriptor: RouteDescriptor,
         worker: &BrowserWorkerConfig,
     ) -> Result<Self, RouteRegistryError> {
-        if worker
-            .launch
-            .extra_args
-            .iter()
-            .any(|argument| route_owned_argument(argument))
+        if worker.launch.browser_proxy.is_some()
+            || worker
+                .launch
+                .extra_args
+                .iter()
+                .any(|argument| route_owned_argument(argument))
         {
             return Err(RouteRegistryError::ConflictingLaunchArgument);
         }
@@ -136,8 +171,14 @@ impl PreparedRoute {
         match self.descriptor.transport {
             RouteTransport::HostDirect => {
                 if self.descriptor.egress_proxy.is_none() {
-                    worker.launch.extra_args.push("--no-proxy-server".to_owned());
+                    worker.launch.browser_proxy = Some(BrowserProxy::Direct);
                 }
+            }
+            RouteTransport::ExternalHttp(proxy) => {
+                worker.launch.browser_proxy = Some(BrowserProxy::Http(proxy));
+            }
+            RouteTransport::ExternalSocks5(proxy) => {
+                worker.launch.browser_proxy = Some(BrowserProxy::Socks5(proxy));
             }
         }
     }
@@ -188,6 +229,8 @@ pub enum RouteRegistryError {
 pub enum EgressRouteError {
     #[error("station egress proxy must be a bound loopback endpoint")]
     InvalidEgressProxy,
+    #[error("external route proxy must be a usable IP endpoint")]
+    InvalidExternalProxy,
 }
 
 #[cfg(test)]
@@ -195,7 +238,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn host_direct_is_resolved_and_forces_browser_proxy_off() {
+    fn host_direct_is_resolved_to_typed_direct_proxy_policy() {
         let registry = RouteRegistry::host_direct_only();
         let mut worker = BrowserWorkerConfig::default();
         let route = registry
@@ -204,11 +247,7 @@ mod tests {
 
         route.apply(&mut worker);
 
-        assert!(worker
-            .launch
-            .extra_args
-            .iter()
-            .any(|argument| argument == "--no-proxy-server"));
+        assert_eq!(worker.launch.browser_proxy, Some(BrowserProxy::Direct));
     }
 
     #[test]
@@ -229,11 +268,7 @@ mod tests {
         route.apply(&mut worker);
 
         assert_eq!(route.egress_proxy(), Some(endpoint));
-        assert!(!worker
-            .launch
-            .extra_args
-            .iter()
-            .any(|argument| argument == "--no-proxy-server"));
+        assert_eq!(worker.launch.browser_proxy, None);
     }
 
     #[test]
@@ -258,6 +293,72 @@ mod tests {
             registry.prepare(&RouteRef::host_direct(), &worker),
             Err(RouteRegistryError::ConflictingLaunchArgument)
         );
+    }
+
+    #[test]
+    fn route_policy_rejects_consumer_typed_proxy_configuration() {
+        let registry = RouteRegistry::host_direct_only();
+        let mut worker = BrowserWorkerConfig::default();
+        worker.launch.browser_proxy = Some(BrowserProxy::Http(
+            "127.0.0.1:8080".parse().expect("proxy endpoint"),
+        ));
+
+        assert_eq!(
+            registry.prepare(&RouteRef::host_direct(), &worker),
+            Err(RouteRegistryError::ConflictingLaunchArgument)
+        );
+    }
+
+    #[test]
+    fn external_routes_apply_typed_browser_proxy_policy() {
+        let http_endpoint = "192.0.2.10:8080".parse().expect("HTTP proxy endpoint");
+        let socks_endpoint = "198.51.100.20:1080"
+            .parse()
+            .expect("SOCKS5 proxy endpoint");
+        for (descriptor, expected) in [
+            (
+                RouteDescriptor::external_http(
+                    RouteRef::new("external.http").expect("HTTP route reference"),
+                    http_endpoint,
+                )
+                .expect("HTTP route"),
+                BrowserProxy::Http(http_endpoint),
+            ),
+            (
+                RouteDescriptor::external_socks5(
+                    RouteRef::new("external.socks5").expect("SOCKS5 route reference"),
+                    socks_endpoint,
+                )
+                .expect("SOCKS5 route"),
+                BrowserProxy::Socks5(socks_endpoint),
+            ),
+        ] {
+            let reference = descriptor.reference().clone();
+            let mut registry = RouteRegistry::empty();
+            registry.register(descriptor).expect("register route");
+            let mut worker = BrowserWorkerConfig::default();
+            let prepared = registry.prepare(&reference, &worker).expect("prepare route");
+
+            prepared.apply(&mut worker);
+
+            assert_eq!(worker.launch.browser_proxy, Some(expected));
+            assert_eq!(prepared.egress_proxy(), None);
+        }
+    }
+
+    #[test]
+    fn external_routes_reject_unusable_proxy_endpoints() {
+        for endpoint in ["0.0.0.0:8080", "224.0.0.1:8080", "127.0.0.1:0"] {
+            let endpoint = endpoint.parse().expect("socket endpoint");
+            assert_eq!(
+                RouteDescriptor::external_http(RouteRef::host_direct(), endpoint),
+                Err(EgressRouteError::InvalidExternalProxy)
+            );
+            assert_eq!(
+                RouteDescriptor::external_socks5(RouteRef::host_direct(), endpoint),
+                Err(EgressRouteError::InvalidExternalProxy)
+            );
+        }
     }
 
     #[test]

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use crate::detect::{BrowserPreference, LaunchConfig};
+use crate::process_isolation::BrowserProcessIsolation;
 use crate::stealth::StealthConfig;
 
 use crate::browser::backend::{BrowserBackend, cdp::CdpBrowserBackend, bidi::BiDiBrowserBackend};
@@ -63,13 +64,37 @@ impl StealthBrowser {
         launch: LaunchConfig,
         stealth: StealthConfig,
     ) -> Result<Self, BrowserError> {
+        Self::launch_with_process_isolation(
+            launch,
+            stealth,
+            BrowserProcessIsolation::Native,
+        )
+        .await
+    }
+
+    /// Launch with an explicit outer process-isolation policy.
+    pub async fn launch_with_process_isolation(
+        launch: LaunchConfig,
+        stealth: StealthConfig,
+        process_isolation: BrowserProcessIsolation,
+    ) -> Result<Self, BrowserError> {
         let backend: Box<dyn BrowserBackend> = match launch.browser_pref {
             BrowserPreference::Firefox => {
+                if !process_isolation.is_native() {
+                    return Err(BrowserError::Launch(
+                        "outer process isolation is unavailable for Firefox".into(),
+                    ));
+                }
                 let b = BiDiBrowserBackend::launch(&launch, &stealth).await?;
                 Box::new(b)
             }
             _ => {
-                let b = CdpBrowserBackend::launch(&launch, &stealth).await?;
+                let b = CdpBrowserBackend::launch_with_process_isolation(
+                    &launch,
+                    &stealth,
+                    &process_isolation,
+                )
+                .await?;
                 Box::new(b)
             }
         };

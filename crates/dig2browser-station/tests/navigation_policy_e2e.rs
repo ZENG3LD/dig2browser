@@ -1,7 +1,12 @@
 #![cfg(windows)]
 
+use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::mem::size_of;
+use std::net::{
+    IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener,
+    TcpStream, UdpSocket,
+};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 #[cfg(feature = "tls-test-hooks")]
@@ -13,17 +18,569 @@ use std::time::Duration;
 #[cfg(feature = "tls-test-hooks")]
 use std::time::Instant;
 
+use dig2browser::detect::{
+    BrowserBinary, BrowserKind, BrowserPreference, LaunchConfig,
+};
 use dig2browser::identity::ProfileOwnershipGuard;
+use dig2browser::stealth::StealthConfig;
+use dig2browser::{BrowserProcessIsolation, StealthBrowser};
 use dig2browser_client::{
     BrowserPersona, ClientConfig, ClientError, CollectionTask, ResponseStatus,
     RuntimeFeature, RuntimeKind, RuntimeRequirements, RuntimeSelector, StationClient,
     TaskCapturePolicy, TaskReply, TaskRuntimeContract, TaskStep,
 };
+use dig2browser_station::windows_wfp_broker::WindowsWfpBrokerCapability;
 use dig2browser_station::ProfilesRootOwnership;
 use tokio::io::AsyncReadExt;
+use windows::core::PWSTR;
+use windows::Win32::Foundation::{
+    CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE,
+};
+use windows::Win32::System::Threading::{
+    GetExitCodeProcess, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
+    PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION,
+};
 
 type ControlledResponse = (&'static str, Vec<(String, String)>, String);
 type Responder = Arc<dyn Fn(&str) -> ControlledResponse + Send + Sync>;
+
+const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+const ERROR_NO_MORE_FILES: i32 = 18;
+
+#[repr(C)]
+struct ProcessEntry32W {
+    size: u32,
+    usage: u32,
+    process_id: u32,
+    default_heap_id: usize,
+    module_id: u32,
+    thread_count: u32,
+    parent_process_id: u32,
+    base_priority: i32,
+    flags: u32,
+    executable: [u16; 260],
+}
+
+impl Default for ProcessEntry32W {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+#[derive(Clone)]
+struct ProcessEntry {
+    process_id: u32,
+    parent_process_id: u32,
+    executable: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ProcessIdentity {
+    process_id: u32,
+    creation_filetime: u64,
+}
+
+struct ReadOnlyHandle(HANDLE);
+
+impl Drop for ReadOnlyHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    #[link_name = "CreateToolhelp32Snapshot"]
+    fn create_toolhelp32_snapshot(flags: u32, process_id: u32) -> HANDLE;
+    #[link_name = "Process32FirstW"]
+    fn process32_first(snapshot: HANDLE, entry: *mut ProcessEntry32W) -> i32;
+    #[link_name = "Process32NextW"]
+    fn process32_next(snapshot: HANDLE, entry: *mut ProcessEntry32W) -> i32;
+}
+
+fn process_snapshot() -> Result<Vec<ProcessEntry>, String> {
+    let snapshot = unsafe { create_toolhelp32_snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(format!(
+            "create read-only process snapshot: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let snapshot = ReadOnlyHandle(snapshot);
+    let mut raw = ProcessEntry32W {
+        size: size_of::<ProcessEntry32W>() as u32,
+        ..ProcessEntry32W::default()
+    };
+    if unsafe { process32_first(snapshot.0, &mut raw) } == 0 {
+        return Err(format!(
+            "read first process snapshot entry: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let mut entries = Vec::new();
+    loop {
+        let name_length = raw
+            .executable
+            .iter()
+            .position(|character| *character == 0)
+            .unwrap_or(raw.executable.len());
+        entries.push(ProcessEntry {
+            process_id: raw.process_id,
+            parent_process_id: raw.parent_process_id,
+            executable: String::from_utf16_lossy(&raw.executable[..name_length]),
+        });
+        raw = ProcessEntry32W {
+            size: size_of::<ProcessEntry32W>() as u32,
+            ..ProcessEntry32W::default()
+        };
+        if unsafe { process32_next(snapshot.0, &mut raw) } == 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_NO_MORE_FILES) {
+                return Err(format!("read process snapshot entry: {error}"));
+            }
+            break;
+        }
+    }
+    Ok(entries)
+}
+
+fn station_descendant_process_ids(
+    entries: &[ProcessEntry],
+    station_process_id: u32,
+    browser_executable: &str,
+) -> Result<Vec<u32>, String> {
+    let station_identity = current_process_identity(station_process_id)
+        .ok_or_else(|| "station process is not an active exact incarnation".to_owned())?;
+    let mut descendants = HashSet::from([station_process_id]);
+    loop {
+        let previous_count = descendants.len();
+        for entry in entries {
+            let belongs_to_current_station = current_process_identity(entry.process_id)
+                .is_some_and(|identity| {
+                    identity.creation_filetime >= station_identity.creation_filetime
+                });
+            if descendants.contains(&entry.parent_process_id)
+                && belongs_to_current_station
+            {
+                descendants.insert(entry.process_id);
+            }
+        }
+        if descendants.len() == previous_count {
+            break;
+        }
+    }
+
+    descendants.remove(&station_process_id);
+    if descendants.is_empty() {
+        return Err("station process tree does not contain browser processes".to_owned());
+    }
+    let browser_processes: HashSet<u32> = entries
+        .iter()
+        .filter(|entry| {
+            descendants.contains(&entry.process_id)
+                && entry.executable.eq_ignore_ascii_case(browser_executable)
+        })
+        .map(|entry| entry.process_id)
+        .collect();
+    if browser_processes.len() < 2 {
+        return Err(format!(
+            "station process tree does not contain a {browser_executable} root and descendant"
+        ));
+    }
+    let root_count = entries.iter().filter(|entry| {
+        browser_processes.contains(&entry.process_id)
+            && !browser_processes.contains(&entry.parent_process_id)
+    }).count();
+    if root_count != 1 {
+        return Err(format!(
+            "station process tree contains {root_count} {browser_executable} roots"
+        ));
+    }
+    Ok(descendants.into_iter().collect())
+}
+
+fn process_image_path(process_id: u32) -> Result<String, String> {
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) }
+        .map(ReadOnlyHandle)
+        .map_err(|error| format!("open Chrome for image-path query: {error}"))?;
+    let mut path = vec![0_u16; 32_768];
+    let mut path_length = path.len() as u32;
+    unsafe {
+        QueryFullProcessImageNameW(
+            process.0,
+            PROCESS_NAME_WIN32,
+            PWSTR(path.as_mut_ptr()),
+            &mut path_length,
+        )
+    }
+    .map_err(|error| format!("query Chrome process image path: {error}"))?;
+    path.truncate(path_length as usize);
+    Ok(String::from_utf16_lossy(&path))
+}
+
+fn chromium_root_process_image_path(
+    station_process_id: u32,
+    runtime_name: &str,
+) -> PathBuf {
+    let browser_executable = match runtime_name {
+        "chrome" => "chrome.exe",
+        "edge" => "msedge.exe",
+        other => panic!("unsupported Chromium E2E runtime: {other}"),
+    };
+    let entries = process_snapshot().expect("read station process tree");
+    let descendants = station_descendant_process_ids(
+        &entries,
+        station_process_id,
+        browser_executable,
+    )
+    .expect("resolve station browser descendants")
+    .into_iter()
+    .collect::<HashSet<_>>();
+    let browser_processes = entries
+        .iter()
+        .filter(|entry| {
+            descendants.contains(&entry.process_id)
+                && entry.executable.eq_ignore_ascii_case(browser_executable)
+        })
+        .map(|entry| entry.process_id)
+        .collect::<HashSet<_>>();
+    let roots = entries
+        .iter()
+        .filter(|entry| {
+            browser_processes.contains(&entry.process_id)
+                && !browser_processes.contains(&entry.parent_process_id)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        roots.len(),
+        1,
+        "station must have one exact {browser_executable} root"
+    );
+    PathBuf::from(
+        process_image_path(roots[0].process_id)
+            .expect("read station browser root image path"),
+    )
+}
+
+fn current_process_identity(process_id: u32) -> Option<ProcessIdentity> {
+    let process = unsafe {
+        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id)
+    }
+    .ok()?;
+    let process = ReadOnlyHandle(process);
+    let mut exit_code = 0u32;
+    unsafe { GetExitCodeProcess(process.0, &mut exit_code) }.ok()?;
+    if exit_code != STILL_ACTIVE.0 as u32 {
+        return None;
+    }
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    unsafe {
+        GetProcessTimes(
+            process.0,
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    }
+    .ok()?;
+    let creation_filetime =
+        ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
+    (creation_filetime != 0).then_some(ProcessIdentity {
+        process_id,
+        creation_filetime,
+    })
+}
+
+fn normalized_windows_path(path: impl AsRef<str>) -> String {
+    let normalized = path.as_ref().replace('/', "\\").to_ascii_lowercase();
+    if let Some(relative) = normalized.strip_prefix(r"\\?\unc\") {
+        format!(r"\\{relative}")
+    } else if let Some(relative) = normalized.strip_prefix(r"\\?\") {
+        relative.to_owned()
+    } else {
+        normalized
+    }
+}
+
+fn runtime_mirror_root_for_image(
+    image_path: &str,
+    mirror_catalog: &Path,
+) -> Result<String, String> {
+    let image = std::fs::canonicalize(image_path)
+        .map_err(|error| format!("canonicalize descendant image '{image_path}': {error}"))?;
+    let catalog = std::fs::canonicalize(mirror_catalog).map_err(|error| {
+        format!(
+            "canonicalize runtime-mirror catalog '{}': {error}",
+            mirror_catalog.display()
+        )
+    })?;
+    let image = normalized_windows_path(image.to_string_lossy());
+    let catalog = normalized_windows_path(catalog.to_string_lossy())
+        .trim_end_matches('\\')
+        .to_owned();
+    let prefix = format!("{catalog}\\");
+    let relative = image.strip_prefix(&prefix).ok_or_else(|| {
+        format!("descendant image is outside the runtime-mirror catalog: {image}")
+    })?;
+    let mut components = relative.split('\\');
+    let key = components.next().unwrap_or_default();
+    if key.len() != 64
+        || !key.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || key.bytes().any(|byte| byte.is_ascii_uppercase())
+        || components.next().is_none()
+    {
+        return Err(format!(
+            "descendant image is not inside an exact content-keyed mirror root: {image}"
+        ));
+    }
+    Ok(format!("{prefix}{key}"))
+}
+
+async fn assert_chromium_descendants_use_station_mirror(
+    station_process_id: u32,
+    original_browser_path: &Path,
+    mirror_catalog: &Path,
+    expected_mirror_root: &Path,
+    runtime_name: &str,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let original_browser_path = std::fs::canonicalize(original_browser_path)
+        .unwrap_or_else(|_| original_browser_path.to_path_buf());
+    let original_browser_path = normalized_windows_path(original_browser_path.to_string_lossy());
+    let expected_mirror_root = std::fs::canonicalize(expected_mirror_root)
+        .unwrap_or_else(|_| expected_mirror_root.to_path_buf());
+    let expected_mirror_root = normalized_windows_path(expected_mirror_root.to_string_lossy());
+    let browser_executable = match runtime_name {
+        "chrome" => "chrome.exe",
+        "edge" => "msedge.exe",
+        other => panic!("unsupported Chromium E2E runtime: {other}"),
+    };
+    let mut last_error =
+        format!("station process tree does not contain a {runtime_name} root and descendant");
+    while tokio::time::Instant::now() < deadline {
+        match process_snapshot() {
+            Ok(entries) => {
+                match station_descendant_process_ids(
+                    &entries,
+                    station_process_id,
+                    browser_executable,
+                ) {
+                    Ok(process_ids) => {
+                        let image_paths = process_ids
+                            .into_iter()
+                            .map(process_image_path)
+                            .collect::<Result<Vec<_>, _>>();
+                        match image_paths {
+                            Ok(image_paths) => {
+                                let mut mirror_roots = HashSet::new();
+                                for image_path in image_paths {
+                                    let image_path = normalized_windows_path(&image_path);
+                                    assert_ne!(
+                                        image_path, original_browser_path,
+                                        "browser descendant ran from the original installed binary"
+                                    );
+                                    match runtime_mirror_root_for_image(
+                                        &image_path,
+                                        mirror_catalog,
+                                    ) {
+                                        Ok(root) => {
+                                            mirror_roots.insert(root);
+                                        }
+                                        Err(error) => {
+                                            last_error = error;
+                                            mirror_roots.clear();
+                                            break;
+                                        }
+                                    }
+                                }
+                                if mirror_roots.len() == 1
+                                    && mirror_roots.contains(&expected_mirror_root)
+                                {
+                                    return;
+                                }
+                                if !mirror_roots.is_empty() {
+                                    last_error = format!(
+                                        "station descendants use unexpected runtime mirrors: {mirror_roots:?}"
+                                    );
+                                }
+                            }
+                            Err(error) => last_error = error,
+                        }
+                    }
+                    Err(error) => last_error = error,
+                }
+            }
+            Err(error) => last_error = error,
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("could not prove {runtime_name} runtime-mirror ownership: {last_error}");
+}
+
+async fn assert_chromium_descendants_use_installed_runtime(
+    station_process_id: u32,
+    installed_browser_path: &Path,
+    mirror_catalog: &Path,
+    runtime_name: &str,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let installed_browser_path = std::fs::canonicalize(installed_browser_path)
+        .unwrap_or_else(|_| installed_browser_path.to_path_buf());
+    let installed_runtime_root = installed_browser_path
+        .parent()
+        .expect("installed browser has an application root")
+        .to_path_buf();
+    let installed_browser_path =
+        normalized_windows_path(installed_browser_path.to_string_lossy());
+    let installed_runtime_root =
+        normalized_windows_path(installed_runtime_root.to_string_lossy());
+    let mirror_catalog = std::fs::canonicalize(mirror_catalog)
+        .unwrap_or_else(|_| mirror_catalog.to_path_buf());
+    let mirror_catalog = normalized_windows_path(mirror_catalog.to_string_lossy());
+    let browser_executable = match runtime_name {
+        "chrome" => "chrome.exe",
+        "edge" => "msedge.exe",
+        other => panic!("unsupported Chromium E2E runtime: {other}"),
+    };
+    let mut last_error = format!(
+        "station process tree does not contain installed {runtime_name} descendants"
+    );
+    while tokio::time::Instant::now() < deadline {
+        match process_snapshot().and_then(|entries| {
+            station_descendant_process_ids(
+                &entries,
+                station_process_id,
+                browser_executable,
+            )
+        }) {
+            Ok(process_ids) => {
+                match process_ids
+                    .into_iter()
+                    .map(process_image_path)
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    Ok(image_paths) => {
+                        let normalized = image_paths
+                            .iter()
+                            .map(normalized_windows_path)
+                            .collect::<Vec<_>>();
+                        assert!(
+                            normalized.iter().all(|path| !path.starts_with(&mirror_catalog)),
+                            "positive control used a station runtime mirror: {normalized:?}"
+                        );
+                        let root_path = normalized_windows_path(
+                            chromium_root_process_image_path(
+                                station_process_id,
+                                runtime_name,
+                            )
+                            .to_string_lossy(),
+                        );
+                        if root_path == installed_browser_path
+                            && normalized
+                            .iter()
+                            .all(|path| {
+                                Path::new(path).starts_with(Path::new(&installed_runtime_root))
+                            })
+                        {
+                            return;
+                        }
+                        last_error = format!(
+                            "positive-control root={root_path} descendants used unexpected paths: {normalized:?}"
+                        );
+                    }
+                    Err(error) => last_error = error,
+                }
+            }
+            Err(error) => last_error = error,
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("could not prove direct installed {runtime_name} runtime use: {last_error}");
+}
+
+async fn chromium_browser_descendant_process_identities(
+    station_process_id: u32,
+    runtime_name: &str,
+) -> Vec<ProcessIdentity> {
+    let browser_executable = match runtime_name {
+        "chrome" => "chrome.exe",
+        "edge" => "msedge.exe",
+        other => panic!("unsupported Chromium E2E runtime: {other}"),
+    };
+    let station_identity = current_process_identity(station_process_id)
+        .expect("station process must be an active exact incarnation");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut last_error = "browser descendants are not live".to_owned();
+    while tokio::time::Instant::now() < deadline {
+        match process_snapshot() {
+            Ok(entries) => {
+                match station_descendant_process_ids(
+                    &entries,
+                    station_process_id,
+                    browser_executable,
+                ) {
+                    Ok(descendants) => {
+                        let descendants = descendants.into_iter().collect::<HashSet<_>>();
+                        let browser_processes = entries
+                            .iter()
+                            .filter(|entry| {
+                                descendants.contains(&entry.process_id)
+                                    && entry.executable.eq_ignore_ascii_case(browser_executable)
+                            })
+                            .filter_map(|entry| current_process_identity(entry.process_id))
+                            .filter(|identity| {
+                                identity.creation_filetime
+                                    >= station_identity.creation_filetime
+                            })
+                            .collect::<Vec<_>>();
+                        if browser_processes.len() >= 2 {
+                            return browser_processes;
+                        }
+                        last_error = format!(
+                            "station has only {} live {browser_executable} descendants",
+                            browser_processes.len()
+                        );
+                    }
+                    Err(error) => last_error = error,
+                }
+            }
+            Err(error) => last_error = error,
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("could not capture live {runtime_name} descendants: {last_error}");
+}
+
+async fn assert_processes_exit(
+    process_identities: &[ProcessIdentity],
+    context: &str,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let live = process_identities
+            .iter()
+            .copied()
+            .filter(|identity| {
+                current_process_identity(identity.process_id) == Some(*identity)
+            })
+            .collect::<Vec<_>>();
+        if live.is_empty() {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("{context} left browser processes alive: {live:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
 
 struct ControlledOrigin {
     address: SocketAddr,
@@ -101,11 +658,29 @@ impl ControlledOrigin {
         }))
     }
 
-    fn webrtc_probe(stun_address: SocketAddr) -> Self {
-        let page = r#"<!doctype html><html><head><title>WebRTC containment fixture</title><link rel="icon" href="data:,"></head><body><main id="webrtc-state">pending</main><script>(async()=>{const state=document.querySelector('#webrtc-state');if(typeof RTCPeerConnection!=='function'){state.textContent='api-missing';return;}const peer=new RTCPeerConnection({iceServers:[{urls:'stun:__STUN_ADDRESS__'}]});window.__dig2browserWebRtcProbe=peer;peer.createDataChannel('probe');try{const offer=await peer.createOffer();await peer.setLocalDescription(offer);state.textContent='ice-attempted:'+peer.iceGatheringState;}catch(error){state.textContent='ice-error:'+error.name;}})();</script></body></html>"#
-            .replace("__STUN_ADDRESS__", &stun_address.to_string());
+    fn webrtc_probe(
+        stun_ipv4_address: SocketAddr,
+        stun_ipv6_address: SocketAddr,
+        turn_tcp_address: SocketAddr,
+    ) -> Self {
+        let page = r#"<!doctype html><html><head><title>WebRTC containment fixture</title><link rel="icon" href="data:,"></head><body><main id="webrtc-state">pending</main><script>(async()=>{const state=document.querySelector('#webrtc-state');if(typeof RTCPeerConnection!=='function'){state.textContent='api-missing';return;}const probes=[['udp4',{urls:'stun:__STUN_IPV4_ADDRESS__'}],['udp6',{urls:'stun:__STUN_IPV6_ADDRESS__'}],['turn-tcp',{urls:'turn:__TURN_TCP_ADDRESS__?transport=tcp',username:'dig2browser',credential:'containment-proof'}]];window.__dig2browserWebRtcProbes=[];try{const attempts=probes.map(async([name,iceServer])=>{const peer=new RTCPeerConnection({iceServers:[iceServer]});window.__dig2browserWebRtcProbes.push(peer);peer.createDataChannel(name);const offer=await peer.createOffer();await peer.setLocalDescription(offer);return name+':'+peer.iceGatheringState;});state.textContent='ice-attempted:'+(await Promise.all(attempts)).join(',');}catch(error){state.textContent='ice-error:'+error.name;}})();</script></body></html>"#
+            .replace("__STUN_IPV4_ADDRESS__", &stun_ipv4_address.to_string())
+            .replace("__STUN_IPV6_ADDRESS__", &stun_ipv6_address.to_string())
+            .replace("__TURN_TCP_ADDRESS__", &turn_tcp_address.to_string());
         Self::start_on("127.0.0.1", Arc::new(move |path| match path {
             "/webrtc-probe" => ("200 OK", Vec::new(), page.clone()),
+            _ => ("404 Not Found", Vec::new(), String::new()),
+        }))
+    }
+
+    fn direct_tcp_probe() -> Self {
+        let bind_ip = selected_non_loopback_ipv4().to_string();
+        Self::start_on(&bind_ip, Arc::new(|path| match path {
+            "/direct-tcp-probe" => (
+                "200 OK",
+                Vec::new(),
+                "<!doctype html><title>direct tcp probe</title>".to_owned(),
+            ),
             _ => ("404 Not Found", Vec::new(), String::new()),
         }))
     }
@@ -180,21 +755,21 @@ struct ControlledUdpReceiver {
 }
 
 impl ControlledUdpReceiver {
-    fn start() -> Self {
-        let route_probe = UdpSocket::bind("0.0.0.0:0")
-            .expect("bind local-interface route probe");
-        route_probe
-            .connect("192.0.2.1:9")
-            .expect("select a local IPv4 interface for the STUN receiver");
-        let local_ip = route_probe
-            .local_addr()
-            .expect("read selected local interface")
-            .ip();
-        assert!(
-            !local_ip.is_loopback() && !local_ip.is_unspecified(),
-            "WebRTC egress E2E requires a non-loopback local interface"
-        );
-        let socket = UdpSocket::bind((local_ip, 0))
+    fn start_ipv4() -> Self {
+        Self::start_on(SocketAddr::V4(SocketAddrV4::new(
+            selected_non_loopback_ipv4(),
+            0,
+        )))
+    }
+
+    fn start_ipv6() -> Self {
+        let bind_address = selected_ipv6_address()
+            .unwrap_or_else(|| SocketAddrV6::new(std::net::Ipv6Addr::LOCALHOST, 0, 0, 0));
+        Self::start_on(SocketAddr::V6(bind_address))
+    }
+
+    fn start_on(bind_address: SocketAddr) -> Self {
+        let socket = UdpSocket::bind(bind_address)
             .expect("bind controlled WebRTC STUN receiver");
         let address = socket.local_addr().expect("read STUN receiver address");
         socket
@@ -256,7 +831,16 @@ impl ControlledUdpReceiver {
 
     fn prove_ready(&self) {
         let baseline = self.datagram_count();
-        let sender = UdpSocket::bind((self.address.ip(), 0))
+        let sender_address = match self.address {
+            SocketAddr::V4(address) => SocketAddr::V4(SocketAddrV4::new(*address.ip(), 0)),
+            SocketAddr::V6(address) => SocketAddr::V6(SocketAddrV6::new(
+                *address.ip(),
+                0,
+                address.flowinfo(),
+                address.scope_id(),
+            )),
+        };
+        let sender = UdpSocket::bind(sender_address)
             .expect("bind controlled STUN receiver readiness sender");
         sender
             .send_to(b"dig2browser-udp-readiness", self.address)
@@ -280,6 +864,176 @@ impl ControlledUdpReceiver {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
+}
+
+fn selected_non_loopback_ipv4() -> Ipv4Addr {
+    let route_probe = UdpSocket::bind("0.0.0.0:0")
+        .expect("bind local-interface route probe");
+    route_probe
+        .connect("192.0.2.1:9")
+        .expect("select a local IPv4 interface for the direct-egress receiver");
+    let IpAddr::V4(local_ip) = route_probe
+        .local_addr()
+        .expect("read selected local IPv4 interface")
+        .ip()
+    else {
+        panic!("IPv4 route probe selected a non-IPv4 interface");
+    };
+    assert!(
+        !local_ip.is_loopback() && !local_ip.is_unspecified(),
+        "WebRTC egress E2E requires a non-loopback local IPv4 interface"
+    );
+    local_ip
+}
+
+fn selected_ipv6_address() -> Option<SocketAddrV6> {
+    let route_probe = UdpSocket::bind("[::]:0").ok()?;
+    route_probe.connect("[2001:db8::1]:9").ok()?;
+    let SocketAddr::V6(address) = route_probe.local_addr().ok()? else {
+        return None;
+    };
+    if address.ip().is_loopback()
+        || address.ip().is_unspecified()
+        || address.ip().is_unicast_link_local()
+    {
+        None
+    } else {
+        Some(SocketAddrV6::new(
+            *address.ip(),
+            0,
+            address.flowinfo(),
+            address.scope_id(),
+        ))
+    }
+}
+
+struct ControlledTurnTcpReceiver {
+    address: SocketAddr,
+    connections: Arc<AtomicUsize>,
+    allocate_requests: Arc<AtomicUsize>,
+    stopping: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl ControlledTurnTcpReceiver {
+    fn start() -> Self {
+        let listener = TcpListener::bind((selected_non_loopback_ipv4(), 0))
+            .expect("bind controlled WebRTC TURN/TCP receiver");
+        let address = listener.local_addr().expect("read TURN/TCP receiver address");
+        listener
+            .set_nonblocking(true)
+            .expect("make TURN/TCP receiver nonblocking");
+        let connections = Arc::new(AtomicUsize::new(0));
+        let allocate_requests = Arc::new(AtomicUsize::new(0));
+        let stopping = Arc::new(AtomicBool::new(false));
+        let thread_connections = Arc::clone(&connections);
+        let thread_allocate_requests = Arc::clone(&allocate_requests);
+        let thread_stopping = Arc::clone(&stopping);
+        let thread = thread::spawn(move || {
+            while !thread_stopping.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _peer)) => {
+                        thread_connections.fetch_add(1, Ordering::AcqRel);
+                        stream
+                            .set_read_timeout(Some(Duration::from_millis(500)))
+                            .expect("bound TURN/TCP receiver read timeout");
+                        let mut received = Vec::new();
+                        let mut buffer = [0_u8; 2048];
+                        loop {
+                            match stream.read(&mut buffer) {
+                                Ok(0) => break,
+                                Ok(count) => {
+                                    received.extend_from_slice(&buffer[..count]);
+                                    if contains_turn_allocate_request(&received) {
+                                        thread_allocate_requests.fetch_add(1, Ordering::AcqRel);
+                                        break;
+                                    }
+                                    if received.len() >= 8192 {
+                                        break;
+                                    }
+                                }
+                                Err(error)
+                                    if matches!(
+                                        error.kind(),
+                                        std::io::ErrorKind::WouldBlock
+                                            | std::io::ErrorKind::TimedOut
+                                    ) =>
+                                {
+                                    break;
+                                }
+                                Err(error) => panic!("controlled TURN/TCP receiver failed: {error}"),
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("controlled TURN/TCP listener failed: {error}"),
+                }
+            }
+        });
+        Self {
+            address,
+            connections,
+            allocate_requests,
+            stopping,
+            thread: Some(thread),
+        }
+    }
+
+    fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    fn connection_count(&self) -> usize {
+        self.connections.load(Ordering::Acquire)
+    }
+
+    fn allocate_request_count(&self) -> usize {
+        self.allocate_requests.load(Ordering::Acquire)
+    }
+
+    fn prove_ready(&self) {
+        let baseline = self.connection_count();
+        TcpStream::connect_timeout(&self.address, Duration::from_secs(1))
+            .expect("connect controlled TURN/TCP readiness probe");
+        for _ in 0..100 {
+            if self.connection_count() > baseline {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("controlled TURN/TCP receiver did not observe its readiness connection");
+    }
+
+    async fn wait_for_allocate_request(&self, timeout: Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let count = self.allocate_request_count();
+            if count > 0 || tokio::time::Instant::now() >= deadline {
+                return count;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+}
+
+impl Drop for ControlledTurnTcpReceiver {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        let _ = TcpStream::connect_timeout(&self.address, Duration::from_millis(100));
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn contains_turn_allocate_request(received: &[u8]) -> bool {
+    received.windows(20).any(|header| {
+        u16::from_be_bytes([header[0], header[1]]) == 0x0003
+            && usize::from(u16::from_be_bytes([header[2], header[3]])) % 4 == 0
+            && header[4..8] == [0x21, 0x12, 0xa4, 0x42]
+    })
 }
 
 impl Drop for ControlledUdpReceiver {
@@ -679,37 +1433,884 @@ async fn stationd_chrome_spki_certificate_exception_reaches_https_through_owned_
     remove_tree(&base).await;
 }
 
-// This is a truth regression for the current browser-only mitigation. It must
-// be replaced by a zero-datagram acceptance test when OS-level isolation lands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires installed Chrome; proves the known browser-only WebRTC UDP gap"]
-async fn stationd_chrome_exact_route_detects_direct_webrtc_stun_udp_gap_e2e() {
+#[ignore = "requires an elevated test process, installed Chrome, and --features containment-test-hooks; proves IPv4/IPv6 STUN UDP and direct HTTP TCP"]
+async fn stationd_chrome_wfp_app_id_allows_only_exact_proxy_and_blocks_direct_egress_e2e() {
     let _serial = e2e_serial_guard().await;
+    run_wfp_app_id_containment_e2e("chrome", RuntimeKind::Chrome).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an elevated test process, installed Edge, and --features containment-test-hooks; proves IPv4/IPv6 STUN UDP and direct HTTP TCP"]
+async fn stationd_edge_wfp_app_id_allows_only_exact_proxy_and_blocks_direct_egress_e2e() {
+    let _serial = e2e_serial_guard().await;
+    run_wfp_app_id_containment_e2e("edge", RuntimeKind::Edge).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires installed Chrome and --features containment-test-hooks; proves IPv4/IPv6 STUN UDP and direct HTTP TCP positive controls"]
+async fn stationd_chrome_direct_egress_positive_control_e2e() {
+    let _serial = e2e_serial_guard().await;
+    run_direct_stun_positive_control_only_e2e("chrome", RuntimeKind::Chrome).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires installed Edge and --features containment-test-hooks; proves IPv4/IPv6 STUN UDP and direct HTTP TCP positive controls"]
+async fn stationd_edge_direct_egress_positive_control_e2e() {
+    let _serial = e2e_serial_guard().await;
+    run_direct_stun_positive_control_only_e2e("edge", RuntimeKind::Edge).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an elevated test process, installed Chrome, and --features containment-test-hooks; kills a test-owned WFP broker"]
+async fn stationd_chrome_wfp_broker_crash_is_fail_closed_and_reconciles_e2e() {
+    let _serial = e2e_serial_guard().await;
+    assert_containment_test_hooks_enabled();
+    let runtime_name = "chrome";
+    let runtime_kind = RuntimeKind::Chrome;
     let unique = uuid::Uuid::new_v4();
-    let profiles = e2e_temp_base().join(format!("dig2browser-webrtc-{unique}"));
-    let traces = e2e_temp_base().join(format!("dig2browser-webrtc-trace-{unique}"));
-    std::fs::create_dir_all(&profiles).expect("create WebRTC profiles root");
-    std::fs::create_dir_all(&traces).expect("create WebRTC trace root");
-    let udp = ControlledUdpReceiver::start();
-    udp.prove_ready();
-    let origin = ControlledOrigin::webrtc_probe(udp.address());
-    let pipe_name = format!("dig2browser-webrtc-{unique}");
+    let profiles = e2e_temp_base().join(format!(
+        "dig2browser-containment-crash-{runtime_name}-{unique}"
+    ));
+    let traces = e2e_temp_base().join(format!(
+        "dig2browser-containment-crash-trace-{runtime_name}-{unique}"
+    ));
+    let successor_profiles = e2e_temp_base().join(format!(
+        "dig2browser-containment-crash-successor-{runtime_name}-{unique}"
+    ));
+    std::fs::create_dir_all(&profiles).expect("create crash E2E profiles root");
+    std::fs::create_dir_all(&traces).expect("create crash E2E trace root");
+    std::fs::create_dir_all(&successor_profiles)
+        .expect("create crash successor E2E profiles root");
+    let prepared = prepare_webrtc_runtime(runtime_name, runtime_kind);
+    let udp_ipv4 = ControlledUdpReceiver::start_ipv4();
+    let udp_ipv6 = ControlledUdpReceiver::start_ipv6();
+    let turn_tcp = ControlledTurnTcpReceiver::start();
+    let direct_tcp = ControlledOrigin::direct_tcp_probe();
+    udp_ipv4.prove_ready();
+    udp_ipv6.prove_ready();
+    turn_tcp.prove_ready();
+    let turn_tcp_connection_baseline = turn_tcp.connection_count();
+    let origin = ControlledOrigin::webrtc_probe(
+        udp_ipv4.address(),
+        udp_ipv6.address(),
+        turn_tcp.address(),
+    );
     let allowed_origin = origin.origin();
-    let mut daemon = spawn_stationd(
-        &pipe_name,
+    let first_broker_pipe = format!("dig2browser-wfp-crash-first-{unique}");
+    let first_station_pipe = format!("dig2browser-wfp-crash-station-first-{unique}");
+    let (first_broker_capability, first_station_capability) =
+        WindowsWfpBrokerCapability::generate_pair();
+    let mut first_broker = spawn_wfp_broker(
+        &first_broker_pipe,
+        &prepared.mirror_catalog,
+        first_broker_capability,
+    )
+    .await;
+    let first_broker_pid = first_broker.id().expect("first WFP broker remains live");
+    let mut first_daemon = spawn_webrtc_stationd(
+        &first_station_pipe,
+        &profiles,
+        &traces,
+        runtime_name,
+        &[&allowed_origin],
+        WebRtcStationOptions {
+            broker_pipe_name: Some(&first_broker_pipe),
+            broker_capability: Some(first_station_capability),
+            command_timeout_seconds: 60,
+            test_close_delay_millis: None,
+        },
+    )
+    .await;
+    let first_client = connect(&first_station_pipe).await;
+    let profile_id = "webrtc-wfp-crash-chrome";
+    assert_webrtc_probe_completes(
+        &first_client,
+        profile_id,
+        runtime_kind,
+        &origin,
+        runtime_name,
+    )
+    .await;
+
+    let mirror_entries = directory_entry_names(&prepared.mirror_catalog);
+    let created_mirrors = mirror_entries
+        .difference(&prepared.mirror_entries_before)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        created_mirrors.len(),
+        1,
+        "first broker did not create exactly one crash-scoped mirror: {created_mirrors:?}"
+    );
+    let mirror_root = prepared.mirror_catalog.join(&created_mirrors[0]);
+    let first_station_pid = first_daemon
+        .id()
+        .expect("first containment station remains live");
+    assert_chromium_descendants_use_station_mirror(
+        first_station_pid,
+        &prepared.original_browser_path,
+        &prepared.mirror_catalog,
+        &mirror_root,
+        runtime_name,
+    )
+    .await;
+    let mirror_browser_path = chromium_root_process_image_path(
+        first_station_pid,
+        runtime_name,
+    );
+    assert_owned_browser_direct_tcp_probe(
+        runtime_kind,
+        mirror_browser_path,
+        &direct_tcp,
+        false,
+        &format!("WFP-contained {runtime_name}"),
+    )
+    .await;
+    let first_browser_processes =
+        chromium_browser_descendant_process_identities(first_station_pid, runtime_name).await;
+    assert_eq!(
+        udp_ipv4.wait_for_stun(Duration::from_secs(2)).await,
+        0,
+        "first contained browser emitted IPv4 STUN before broker crash"
+    );
+    assert_eq!(
+        udp_ipv6.wait_for_stun(Duration::from_secs(2)).await,
+        0,
+        "first contained browser emitted IPv6 STUN before broker crash"
+    );
+    assert_eq!(
+        turn_tcp.wait_for_allocate_request(Duration::from_secs(2)).await,
+        0,
+        "first contained browser emitted TURN/TCP before broker crash"
+    );
+
+    first_broker
+        .kill()
+        .await
+        .expect("kill test-owned first WFP broker");
+    let first_broker_status = first_broker
+        .wait()
+        .await
+        .expect("wait for killed first WFP broker");
+    assert!(!first_broker_status.success(), "killed broker exited successfully");
+    assert_containment_lost_exit(&mut first_daemon).await;
+    drop(first_client);
+    assert_processes_exit(
+        &first_browser_processes,
+        "containment-lost emergency shutdown",
+    )
+    .await;
+    assert_eq!(
+        directory_entry_names(&prepared.mirror_catalog),
+        mirror_entries,
+        "broker crash removed or changed the fail-closed runtime mirror"
+    );
+    assert_eq!(
+        udp_ipv4.stun_datagram_count(),
+        0,
+        "broker crash exposed an IPv4 STUN leak before emergency browser termination"
+    );
+    assert_eq!(
+        udp_ipv6.stun_datagram_count(),
+        0,
+        "broker crash exposed an IPv6 STUN leak before emergency browser termination"
+    );
+    assert_eq!(
+        turn_tcp.connection_count(),
+        turn_tcp_connection_baseline,
+        "broker crash exposed a TURN/TCP connection before emergency browser termination"
+    );
+    let released_profiles = ProfilesRootOwnership::acquire(&profiles)
+        .expect("containment-lost station releases profiles-root ownership");
+    let released_profile = ProfileOwnershipGuard::acquire(profiles.join(profile_id))
+        .expect("containment-lost station releases browser profile ownership");
+    drop(released_profile);
+    drop(released_profiles);
+
+    let successor_broker_pipe = format!("dig2browser-wfp-crash-successor-{unique}");
+    let successor_station_pipe = format!("dig2browser-wfp-crash-station-successor-{unique}");
+    let (successor_broker_capability, successor_station_capability) =
+        WindowsWfpBrokerCapability::generate_pair();
+    let mut successor_broker = spawn_wfp_broker(
+        &successor_broker_pipe,
+        &prepared.mirror_catalog,
+        successor_broker_capability,
+    )
+    .await;
+    assert_ne!(
+        successor_broker.id().expect("successor WFP broker remains live"),
+        first_broker_pid,
+        "successor broker unexpectedly reused the killed broker PID"
+    );
+    let mut successor_daemon = spawn_webrtc_stationd(
+        &successor_station_pipe,
+        &successor_profiles,
+        &traces,
+        runtime_name,
+        &[&allowed_origin],
+        WebRtcStationOptions {
+            broker_pipe_name: Some(&successor_broker_pipe),
+            broker_capability: Some(successor_station_capability),
+            command_timeout_seconds: 60,
+            test_close_delay_millis: None,
+        },
+    )
+    .await;
+    let successor_client = connect(&successor_station_pipe).await;
+    assert_webrtc_probe_completes(
+        &successor_client,
+        profile_id,
+        runtime_kind,
+        &origin,
+        runtime_name,
+    )
+    .await;
+    let successor_mirror_entries = directory_entry_names(&prepared.mirror_catalog);
+    let successor_created_mirrors = successor_mirror_entries
+        .difference(&prepared.mirror_entries_before)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        successor_created_mirrors.len(),
+        1,
+        "successor did not leave exactly one active mirror after stale cleanup: {successor_created_mirrors:?}"
+    );
+    let successor_mirror_root = prepared
+        .mirror_catalog
+        .join(&successor_created_mirrors[0]);
+    assert_ne!(
+        successor_mirror_root, mirror_root,
+        "a different profiles scope unexpectedly reused the crash-scoped mirror"
+    );
+    assert!(
+        !mirror_root.exists(),
+        "successor retained the dead, unreferenced crash-scoped mirror"
+    );
+    assert_chromium_descendants_use_station_mirror(
+        successor_daemon
+            .id()
+            .expect("successor containment station remains live"),
+        &prepared.original_browser_path,
+        &prepared.mirror_catalog,
+        &successor_mirror_root,
+        runtime_name,
+    )
+    .await;
+    assert_eq!(udp_ipv4.stun_datagram_count(), 0);
+    assert_eq!(udp_ipv6.stun_datagram_count(), 0);
+    assert_eq!(turn_tcp.connection_count(), turn_tcp_connection_baseline);
+
+    successor_client
+        .shutdown()
+        .await
+        .expect("request clean successor station shutdown");
+    drop(successor_client);
+    assert_webrtc_clean_exit(&mut successor_daemon, true).await;
+    assert_wfp_broker_clean_exit(&mut successor_broker).await;
+    assert_eq!(
+        directory_entry_names(&prepared.mirror_catalog),
+        prepared.mirror_entries_before,
+        "clean successor close did not remove the reconciled runtime mirror"
+    );
+    let released_profiles = ProfilesRootOwnership::acquire(&successor_profiles)
+        .expect("clean successor releases profiles-root ownership");
+    let released_profile = ProfileOwnershipGuard::acquire(successor_profiles.join(profile_id))
+        .expect("clean successor releases browser profile ownership");
+    drop(released_profile);
+    drop(released_profiles);
+    drop(origin);
+    drop(udp_ipv4);
+    drop(udp_ipv6);
+    drop(turn_tcp);
+    remove_tree(&profiles).await;
+    remove_tree(&traces).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires an elevated test process, installed Chrome, and --features containment-test-hooks; forces a contained worker close timeout"]
+async fn stationd_chrome_worker_close_timeout_retains_wfp_until_process_tree_exit_e2e() {
+    let _serial = e2e_serial_guard().await;
+    assert_containment_test_hooks_enabled();
+    let unique = uuid::Uuid::new_v4();
+    let profiles = e2e_temp_base().join(format!(
+        "dig2browser-containment-close-timeout-{unique}"
+    ));
+    let successor_profiles = e2e_temp_base().join(format!(
+        "dig2browser-containment-close-timeout-successor-{unique}"
+    ));
+    let traces = e2e_temp_base().join(format!(
+        "dig2browser-containment-close-timeout-trace-{unique}"
+    ));
+    std::fs::create_dir_all(&profiles).expect("create close-timeout profiles root");
+    std::fs::create_dir_all(&successor_profiles)
+        .expect("create close-timeout successor profiles root");
+    std::fs::create_dir_all(&traces).expect("create close-timeout trace root");
+    let prepared = prepare_webrtc_runtime("chrome", RuntimeKind::Chrome);
+
+    let udp_ipv4 = ControlledUdpReceiver::start_ipv4();
+    let udp_ipv6 = ControlledUdpReceiver::start_ipv6();
+    let turn_tcp = ControlledTurnTcpReceiver::start();
+    udp_ipv4.prove_ready();
+    udp_ipv6.prove_ready();
+    turn_tcp.prove_ready();
+    let turn_tcp_connection_baseline = turn_tcp.connection_count();
+    let origin = ControlledOrigin::webrtc_probe(
+        udp_ipv4.address(),
+        udp_ipv6.address(),
+        turn_tcp.address(),
+    );
+    let allowed_origin = origin.origin();
+    let broker_pipe = format!("dig2browser-wfp-close-timeout-{unique}");
+    let station_pipe = format!("dig2browser-wfp-close-timeout-station-{unique}");
+    let (broker_capability, station_capability) =
+        WindowsWfpBrokerCapability::generate_pair();
+    let mut broker = spawn_wfp_broker(
+        &broker_pipe,
+        &prepared.mirror_catalog,
+        broker_capability,
+    )
+    .await;
+    let mut daemon = spawn_webrtc_stationd(
+        &station_pipe,
         &profiles,
         &traces,
         "chrome",
         &[&allowed_origin],
-    );
-    let client = connect(&pipe_name).await;
-    let profile_id = "webrtc-browser-containment";
-    let requested_url = origin.url("/webrtc-probe");
+        WebRtcStationOptions {
+            broker_pipe_name: Some(&broker_pipe),
+            broker_capability: Some(station_capability),
+            command_timeout_seconds: 1,
+            test_close_delay_millis: Some(30_000),
+        },
+    )
+    .await;
+    let client = connect(&station_pipe).await;
+    let profile_id = "webrtc-wfp-close-timeout-chrome";
+    assert_webrtc_probe_completes(
+        &client,
+        profile_id,
+        RuntimeKind::Chrome,
+        &origin,
+        "chrome",
+    )
+    .await;
 
-    let result = client
-        .run_task(profile_id, webrtc_probe_task(requested_url.clone()))
+    let active_entries = directory_entry_names(&prepared.mirror_catalog);
+    let active_mirrors = active_entries
+        .difference(&prepared.mirror_entries_before)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(active_mirrors.len(), 1, "unexpected active mirrors: {active_mirrors:?}");
+    let old_mirror_root = prepared.mirror_catalog.join(&active_mirrors[0]);
+    let station_pid = daemon.id().expect("close-timeout station remains live");
+    assert_chromium_descendants_use_station_mirror(
+        station_pid,
+        &prepared.original_browser_path,
+        &prepared.mirror_catalog,
+        &old_mirror_root,
+        "chrome",
+    )
+    .await;
+    let browser_processes =
+        chromium_browser_descendant_process_identities(station_pid, "chrome").await;
+    assert_eq!(udp_ipv4.wait_for_stun(Duration::from_secs(2)).await, 0);
+    assert_eq!(udp_ipv6.wait_for_stun(Duration::from_secs(2)).await, 0);
+    assert_eq!(
+        turn_tcp.wait_for_allocate_request(Duration::from_secs(2)).await,
+        0
+    );
+
+    let shutdown_started = tokio::time::Instant::now();
+    client
+        .shutdown()
         .await
-        .expect("exact Chrome route must complete the controlled WebRTC page task");
+        .expect("request close-timeout station shutdown");
+    drop(client);
+    assert_station_shutdown_failure(&mut daemon).await;
+    assert!(
+        shutdown_started.elapsed() < Duration::from_secs(15),
+        "station waited for the full injected close delay instead of its worker timeout"
+    );
+    assert_processes_exit(&browser_processes, "close-timeout containment shutdown").await;
+    assert!(
+        old_mirror_root.exists(),
+        "failed station shutdown removed its retained runtime mirror"
+    );
+    assert_eq!(
+        directory_entry_names(&prepared.mirror_catalog),
+        active_entries,
+        "failed station shutdown changed the retained mirror catalog"
+    );
+    assert_eq!(udp_ipv4.stun_datagram_count(), 0);
+    assert_eq!(udp_ipv6.stun_datagram_count(), 0);
+    assert_eq!(turn_tcp.connection_count(), turn_tcp_connection_baseline);
+    assert_wfp_broker_client_disconnected(&mut broker).await;
+
+    let successor_broker_pipe = format!("dig2browser-wfp-close-timeout-next-{unique}");
+    let successor_station_pipe = format!(
+        "dig2browser-wfp-close-timeout-station-next-{unique}"
+    );
+    let (successor_broker_capability, successor_station_capability) =
+        WindowsWfpBrokerCapability::generate_pair();
+    let mut successor_broker = spawn_wfp_broker(
+        &successor_broker_pipe,
+        &prepared.mirror_catalog,
+        successor_broker_capability,
+    )
+    .await;
+    let mut successor_daemon = spawn_webrtc_stationd(
+        &successor_station_pipe,
+        &successor_profiles,
+        &traces,
+        "chrome",
+        &[&allowed_origin],
+        WebRtcStationOptions {
+            broker_pipe_name: Some(&successor_broker_pipe),
+            broker_capability: Some(successor_station_capability),
+            command_timeout_seconds: 60,
+            test_close_delay_millis: None,
+        },
+    )
+    .await;
+    let successor_client = connect(&successor_station_pipe).await;
+    assert_webrtc_probe_completes(
+        &successor_client,
+        profile_id,
+        RuntimeKind::Chrome,
+        &origin,
+        "chrome",
+    )
+    .await;
+    assert!(
+        !old_mirror_root.exists(),
+        "successor reconciliation retained the dead unreferenced mirror"
+    );
+    successor_client
+        .shutdown()
+        .await
+        .expect("request clean successor shutdown");
+    drop(successor_client);
+    assert_webrtc_clean_exit(&mut successor_daemon, true).await;
+    assert_wfp_broker_clean_exit(&mut successor_broker).await;
+    assert_eq!(
+        directory_entry_names(&prepared.mirror_catalog),
+        prepared.mirror_entries_before,
+        "successor cleanup did not restore the mirror catalog baseline"
+    );
+
+    drop(origin);
+    drop(udp_ipv4);
+    drop(udp_ipv6);
+    drop(turn_tcp);
+    remove_tree(&profiles).await;
+    remove_tree(&successor_profiles).await;
+    remove_tree(&traces).await;
+}
+
+struct PreparedWebRtcRuntime {
+    original_browser_path: PathBuf,
+    mirror_catalog: PathBuf,
+    mirror_entries_before: HashSet<String>,
+}
+
+fn prepare_webrtc_runtime(
+    runtime_name: &str,
+    runtime_kind: RuntimeKind,
+) -> PreparedWebRtcRuntime {
+    let candidates = match runtime_kind {
+        RuntimeKind::Chrome => vec![
+            PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+            PathBuf::from(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+            std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_default()
+                .join(r"Google\Chrome\Application\chrome.exe"),
+        ],
+        RuntimeKind::Edge => vec![
+            PathBuf::from(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
+            PathBuf::from(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
+            std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_default()
+                .join(r"Microsoft\Edge\Application\msedge.exe"),
+        ],
+        other => panic!("unsupported WFP E2E runtime: {other:?}"),
+    };
+    let original_browser_path = candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("no standard installed {runtime_name} runtime found"));
+    let mirror_catalog = runtime_mirror_catalog();
+    std::fs::create_dir_all(&mirror_catalog)
+        .expect("create station-owned runtime-mirror catalog");
+    let mirror_entries_before = directory_entry_names(&mirror_catalog);
+    PreparedWebRtcRuntime {
+        original_browser_path,
+        mirror_catalog,
+        mirror_entries_before,
+    }
+}
+
+fn assert_containment_test_hooks_enabled() {
+    #[cfg(not(feature = "containment-test-hooks"))]
+    panic!("this E2E requires --features containment-test-hooks");
+}
+
+fn browser_binary_kind(runtime_kind: RuntimeKind) -> BrowserKind {
+    match runtime_kind {
+        RuntimeKind::Chrome => BrowserKind::Chrome,
+        RuntimeKind::Edge => BrowserKind::Edge,
+        other => panic!("unsupported direct TCP probe runtime: {other:?}"),
+    }
+}
+
+fn browser_preference(runtime_kind: RuntimeKind) -> BrowserPreference {
+    match runtime_kind {
+        RuntimeKind::Chrome => BrowserPreference::ChromeOnly,
+        RuntimeKind::Edge => BrowserPreference::EdgeOnly,
+        other => panic!("unsupported direct TCP probe runtime: {other:?}"),
+    }
+}
+
+async fn assert_owned_browser_direct_tcp_probe(
+    runtime_kind: RuntimeKind,
+    binary_path: PathBuf,
+    origin: &ControlledOrigin,
+    expected_reachable: bool,
+    context: &str,
+) {
+    let launch = LaunchConfig {
+        browser_pref: browser_preference(runtime_kind),
+        browser_proxy: Some(dig2browser::BrowserProxy::Direct),
+        ..LaunchConfig::default()
+    };
+    let isolation = BrowserProcessIsolation::WindowsRuntimeMirror(BrowserBinary {
+        path: binary_path,
+        kind: browser_binary_kind(runtime_kind),
+    });
+    let browser = StealthBrowser::launch_with_process_isolation(
+        launch,
+        StealthConfig::default(),
+        isolation,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{context}: launch direct TCP probe browser: {error}"));
+    let baseline = origin.path_count("/direct-tcp-probe");
+    let navigation = tokio::time::timeout(
+        Duration::from_secs(10),
+        browser.new_page(&origin.url("/direct-tcp-probe")),
+    )
+    .await;
+    let reached = origin.path_count("/direct-tcp-probe") > baseline;
+    if expected_reachable {
+        assert!(
+            matches!(navigation, Ok(Ok(_))) && reached,
+            "{context}: exact browser binary did not reach the direct TCP fixture"
+        );
+    } else {
+        assert!(
+            !reached,
+            "{context}: contained exact browser binary reached the direct TCP fixture"
+        );
+    }
+    drop(navigation);
+    browser
+        .close()
+        .await
+        .unwrap_or_else(|error| panic!("{context}: close direct TCP probe browser: {error}"));
+}
+
+async fn run_direct_stun_positive_control_only_e2e(
+    runtime_name: &str,
+    runtime_kind: RuntimeKind,
+) {
+    assert_containment_test_hooks_enabled();
+    let unique = uuid::Uuid::new_v4();
+    let profiles = e2e_temp_base().join(format!(
+        "dig2browser-stun-positive-{runtime_name}-{unique}"
+    ));
+    let traces = e2e_temp_base().join(format!(
+        "dig2browser-stun-positive-trace-{runtime_name}-{unique}"
+    ));
+    std::fs::create_dir_all(&profiles).expect("create positive-control profiles root");
+    std::fs::create_dir_all(&traces).expect("create positive-control trace root");
+    let prepared = prepare_webrtc_runtime(runtime_name, runtime_kind);
+
+    run_direct_egress_positive_control(
+        runtime_name,
+        runtime_kind,
+        &unique,
+        &profiles,
+        &traces,
+        &prepared,
+    )
+    .await;
+
+    assert_eq!(
+        directory_entry_names(&prepared.mirror_catalog),
+        prepared.mirror_entries_before,
+        "positive control unexpectedly created a runtime mirror"
+    );
+    remove_tree(&profiles).await;
+    remove_tree(&traces).await;
+}
+
+async fn run_wfp_app_id_containment_e2e(
+    runtime_name: &str,
+    runtime_kind: RuntimeKind,
+) {
+    assert_containment_test_hooks_enabled();
+    let unique = uuid::Uuid::new_v4();
+    let broker_pipe_name = format!("dig2browser-wfp-e2e-{runtime_name}-{unique}");
+    let profiles = e2e_temp_base().join(format!(
+        "dig2browser-containment-{runtime_name}-{unique}"
+    ));
+    let traces = e2e_temp_base().join(format!(
+        "dig2browser-containment-trace-{runtime_name}-{unique}"
+    ));
+    std::fs::create_dir_all(&profiles).expect("create WebRTC profiles root");
+    std::fs::create_dir_all(&traces).expect("create WebRTC trace root");
+    let prepared = prepare_webrtc_runtime(runtime_name, runtime_kind);
+
+    run_direct_egress_positive_control(
+        runtime_name,
+        runtime_kind,
+        &unique,
+        &profiles,
+        &traces,
+        &prepared,
+    )
+    .await;
+
+    let (broker_capability, station_capability) =
+        WindowsWfpBrokerCapability::generate_pair();
+    let mut broker = spawn_wfp_broker(
+        &broker_pipe_name,
+        &prepared.mirror_catalog,
+        broker_capability,
+    )
+    .await;
+
+    let udp_ipv4 = ControlledUdpReceiver::start_ipv4();
+    let udp_ipv6 = ControlledUdpReceiver::start_ipv6();
+    let turn_tcp = ControlledTurnTcpReceiver::start();
+    let direct_tcp = ControlledOrigin::direct_tcp_probe();
+    udp_ipv4.prove_ready();
+    udp_ipv6.prove_ready();
+    turn_tcp.prove_ready();
+    let origin = ControlledOrigin::webrtc_probe(
+        udp_ipv4.address(),
+        udp_ipv6.address(),
+        turn_tcp.address(),
+    );
+    let pipe_name = format!("dig2browser-containment-{runtime_name}-{unique}");
+    let allowed_origin = origin.origin();
+    let mut daemon = spawn_webrtc_stationd(
+        &pipe_name,
+        &profiles,
+        &traces,
+        runtime_name,
+        &[&allowed_origin],
+        WebRtcStationOptions {
+            broker_pipe_name: Some(&broker_pipe_name),
+            broker_capability: Some(station_capability),
+            command_timeout_seconds: 60,
+            test_close_delay_millis: None,
+        },
+    )
+    .await;
+    let client = connect(&pipe_name).await;
+    let profile_id = format!("webrtc-wfp-app-id-{runtime_name}");
+    assert_webrtc_probe_completes(
+        &client,
+        &profile_id,
+        runtime_kind,
+        &origin,
+        runtime_name,
+    )
+    .await;
+
+    let mirror_entries = directory_entry_names(&prepared.mirror_catalog);
+    let created_mirrors = mirror_entries
+        .difference(&prepared.mirror_entries_before)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        created_mirrors.len(),
+        1,
+        "elevated broker did not create exactly one scoped runtime mirror: {created_mirrors:?}"
+    );
+    let mirror_root = prepared.mirror_catalog.join(&created_mirrors[0]);
+    assert_chromium_descendants_use_station_mirror(
+        daemon.id().expect("containment station process remains live"),
+        &prepared.original_browser_path,
+        &prepared.mirror_catalog,
+        &mirror_root,
+        runtime_name,
+    )
+    .await;
+    let mirror_browser_path = chromium_root_process_image_path(
+        daemon.id().expect("containment station process remains live"),
+        runtime_name,
+    );
+    assert_owned_browser_direct_tcp_probe(
+        runtime_kind,
+        mirror_browser_path,
+        &direct_tcp,
+        false,
+        &format!("WFP-contained {runtime_name}"),
+    )
+    .await;
+
+    let stun_ipv4_datagrams = udp_ipv4.wait_for_stun(Duration::from_secs(5)).await;
+    assert_eq!(
+        stun_ipv4_datagrams, 0,
+        "WFP App-ID containment allowed {runtime_name} to emit direct IPv4 STUN"
+    );
+    let stun_ipv6_datagrams = udp_ipv6.wait_for_stun(Duration::from_secs(5)).await;
+    assert_eq!(
+        stun_ipv6_datagrams, 0,
+        "WFP App-ID containment allowed {runtime_name} to emit direct IPv6 STUN to {}",
+        udp_ipv6.address()
+    );
+
+    client.shutdown().await.expect("request clean WebRTC station shutdown");
+    drop(client);
+    assert_webrtc_clean_exit(&mut daemon, true).await;
+    assert_eq!(
+        directory_entry_names(&prepared.mirror_catalog),
+        prepared.mirror_entries_before,
+        "clean station shutdown left a runtime mirror or staging directory behind"
+    );
+    let released_profiles = ProfilesRootOwnership::acquire(&profiles)
+        .expect("clean WebRTC station shutdown releases profiles-root ownership");
+    let released_profile = ProfileOwnershipGuard::acquire(profiles.join(&profile_id))
+        .expect("clean WebRTC station shutdown releases the browser profile");
+    drop(released_profile);
+    drop(released_profiles);
+    drop(origin);
+    drop(udp_ipv4);
+    drop(udp_ipv6);
+    drop(turn_tcp);
+    drop(direct_tcp);
+    assert_wfp_broker_clean_exit(&mut broker).await;
+
+    remove_tree(&profiles).await;
+    remove_tree(&traces).await;
+}
+
+async fn run_direct_egress_positive_control(
+    runtime_name: &str,
+    runtime_kind: RuntimeKind,
+    unique: &uuid::Uuid,
+    profiles: &Path,
+    traces: &Path,
+    prepared: &PreparedWebRtcRuntime,
+) {
+    let udp_ipv4 = ControlledUdpReceiver::start_ipv4();
+    let udp_ipv6 = ControlledUdpReceiver::start_ipv6();
+    let turn_tcp = ControlledTurnTcpReceiver::start();
+    let direct_tcp = ControlledOrigin::direct_tcp_probe();
+    udp_ipv4.prove_ready();
+    udp_ipv6.prove_ready();
+    turn_tcp.prove_ready();
+    let origin = ControlledOrigin::webrtc_probe(
+        udp_ipv4.address(),
+        udp_ipv6.address(),
+        turn_tcp.address(),
+    );
+    let pipe_name = format!("dig2browser-stun-positive-{runtime_name}-{unique}");
+    let allowed_origin = origin.origin();
+    let mut daemon = spawn_webrtc_stationd(
+        &pipe_name,
+        profiles,
+        traces,
+        runtime_name,
+        &[&allowed_origin],
+        WebRtcStationOptions {
+            broker_pipe_name: None,
+            broker_capability: None,
+            command_timeout_seconds: 60,
+            test_close_delay_millis: None,
+        },
+    )
+    .await;
+    let client = connect(&pipe_name).await;
+    let profile_id = format!("webrtc-stun-positive-{runtime_name}");
+    assert_webrtc_probe_completes(
+        &client,
+        &profile_id,
+        runtime_kind,
+        &origin,
+        runtime_name,
+    )
+    .await;
+
+    assert_chromium_descendants_use_installed_runtime(
+        daemon.id().expect("positive-control station process remains live"),
+        &prepared.original_browser_path,
+        &prepared.mirror_catalog,
+        runtime_name,
+    )
+    .await;
+    assert_owned_browser_direct_tcp_probe(
+        runtime_kind,
+        prepared.original_browser_path.clone(),
+        &direct_tcp,
+        true,
+        &format!("uncontained {runtime_name}"),
+    )
+    .await;
+
+    let stun_ipv4_datagrams = udp_ipv4.wait_for_stun(Duration::from_secs(5)).await;
+    assert!(
+        stun_ipv4_datagrams >= 1,
+        "uncontained {runtime_name} positive control emitted no direct IPv4 STUN"
+    );
+    let stun_ipv6_datagrams = udp_ipv6.wait_for_stun(Duration::from_secs(5)).await;
+    assert!(
+        stun_ipv6_datagrams >= 1,
+        "uncontained {runtime_name} positive control emitted no direct IPv6 STUN to {}",
+        udp_ipv6.address()
+    );
+
+    client
+        .shutdown()
+        .await
+        .expect("request clean positive-control station shutdown");
+    drop(client);
+    assert_webrtc_clean_exit(&mut daemon, false).await;
+    let released_profiles = ProfilesRootOwnership::acquire(profiles)
+        .expect("positive-control station releases profiles-root ownership");
+    let released_profile = ProfileOwnershipGuard::acquire(profiles.join(&profile_id))
+        .expect("positive-control station releases the browser profile");
+    drop(released_profile);
+    drop(released_profiles);
+    drop(origin);
+    drop(udp_ipv4);
+    drop(udp_ipv6);
+    drop(turn_tcp);
+    drop(direct_tcp);
+}
+
+async fn assert_webrtc_probe_completes(
+    client: &StationClient,
+    profile_id: &str,
+    runtime_kind: RuntimeKind,
+    origin: &ControlledOrigin,
+    runtime_name: &str,
+) {
+    let requested_url = origin.url("/webrtc-probe");
+    let result = client
+        .run_task(
+            profile_id,
+            webrtc_probe_task(runtime_kind, requested_url.clone()),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("exact {runtime_name} route did not complete WebRTC task: {error}")
+        });
     assert_eq!(result.replies().len(), 4);
     assert_eq!(result.replies()[0], TaskReply::Acknowledged);
     assert_eq!(result.replies()[1], TaskReply::Acknowledged);
@@ -720,6 +2321,12 @@ async fn stationd_chrome_exact_route_detects_direct_webrtc_stun_udp_gap_e2e() {
         ice_state.starts_with("ice-attempted:"),
         "WebRTC API/ICE attempt did not actually run: {ice_state}"
     );
+    for probe in ["udp4:", "udp6:", "turn-tcp:"] {
+        assert!(
+            ice_state.contains(probe),
+            "WebRTC page did not execute the {probe} ICE probe: {ice_state}"
+        );
+    }
     let TaskReply::Capture(capture) = &result.replies()[3] else {
         panic!("WebRTC task did not return an HTML capture");
     };
@@ -728,30 +2335,13 @@ async fn stationd_chrome_exact_route_detects_direct_webrtc_stun_udp_gap_e2e() {
     assert_eq!(capture.http_status, Some(200));
     assert_eq!(capture.title, "WebRTC containment fixture");
     assert!(
-        String::from_utf8_lossy(&capture.html).contains("webrtc-state"),
-        "WebRTC capture did not contain the controlled page marker"
+        String::from_utf8_lossy(&capture.html).contains("ice-attempted:"),
+        "WebRTC capture did not preserve the completed ICE attempt"
     );
-
-    let stun_datagrams = udp.wait_for_stun(Duration::from_secs(5)).await;
     assert!(
-        stun_datagrams >= 1,
-        "Chrome no longer emitted direct STUN; replace this gap regression with a zero-datagram containment acceptance test"
+        origin.path_count("/webrtc-probe") >= 1,
+        "exact allowed origin did not serve the controlled page"
     );
-
-    client.shutdown().await.expect("request clean WebRTC station shutdown");
-    drop(client);
-    assert_webrtc_clean_exit(&mut daemon).await;
-    let released_profiles = ProfilesRootOwnership::acquire(&profiles)
-        .expect("clean WebRTC station shutdown releases profiles-root ownership");
-    let released_profile = ProfileOwnershipGuard::acquire(profiles.join(profile_id))
-        .expect("clean WebRTC station shutdown releases the browser profile");
-    drop(released_profile);
-    drop(released_profiles);
-    drop(origin);
-    drop(udp);
-
-    remove_tree(&profiles).await;
-    remove_tree(&traces).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1041,7 +2631,7 @@ fn worker_task(url: String) -> CollectionTask {
         vec![
             TaskStep::Navigate { url },
             TaskStep::Wait {
-                duration: Duration::from_millis(1_500),
+                duration: Duration::from_millis(3_000),
             },
             TaskStep::ReadSelectorText {
                 selector: "#worker-state".to_owned(),
@@ -1055,9 +2645,9 @@ fn worker_task(url: String) -> CollectionTask {
     )
 }
 
-fn webrtc_probe_task(url: String) -> CollectionTask {
+fn webrtc_probe_task(runtime: RuntimeKind, url: String) -> CollectionTask {
     task(
-        RuntimeKind::Chrome,
+        runtime,
         vec![
             TaskStep::Navigate { url },
             TaskStep::Wait {
@@ -1158,6 +2748,140 @@ fn spawn_stationd(
         .kill_on_drop(true)
         .spawn()
         .expect("spawn navigation-policy station")
+}
+
+struct WebRtcStationOptions<'a> {
+    broker_pipe_name: Option<&'a str>,
+    broker_capability: Option<WindowsWfpBrokerCapability>,
+    command_timeout_seconds: u64,
+    test_close_delay_millis: Option<u64>,
+}
+
+async fn spawn_webrtc_stationd(
+    pipe_name: &str,
+    profiles: &Path,
+    traces: &Path,
+    runtime: &str,
+    allowed_origins: &[&str],
+    options: WebRtcStationOptions<'_>,
+) -> tokio::process::Child {
+    let WebRtcStationOptions {
+        broker_pipe_name,
+        broker_capability,
+        command_timeout_seconds,
+        test_close_delay_millis,
+    } = options;
+    assert_eq!(
+        broker_pipe_name.is_some(),
+        broker_capability.is_some(),
+        "WFP broker pipe and capability must be configured together"
+    );
+    let mut command = tokio::process::Command::new(
+        env!("CARGO_BIN_EXE_dig2browser-stationd"),
+    );
+    command.args([
+        "--pipe-name",
+        pipe_name,
+        "--profiles-root",
+        profiles.to_str().expect("profiles path is UTF-8"),
+        "--trace-root",
+        traces.to_str().expect("trace path is UTF-8"),
+        "--runtime",
+        runtime,
+        "--max-resident",
+        "1",
+        "--max-in-flight",
+        "2",
+        "--max-connections",
+        "2",
+        "--drain-seconds",
+        "15",
+        "--allow-remote-shutdown",
+        "--allow-interactive-tasks",
+        "--allow-headful-auth",
+        "--allow-durable-read",
+        "--allow-durable-write",
+    ]);
+    command
+        .arg("--timeout-seconds")
+        .arg(command_timeout_seconds.to_string());
+    if let Some(delay_millis) = test_close_delay_millis {
+        command
+            .arg("--test-chromium-close-delay-millis")
+            .arg(delay_millis.to_string());
+    }
+    if let Some(broker_pipe_name) = broker_pipe_name {
+        command.args([
+            "--windows-containment",
+            "required",
+            "--windows-wfp-broker-pipe",
+            broker_pipe_name,
+        ]);
+    }
+    for origin in allowed_origins {
+        command.args(["--allow-origin", origin]);
+    }
+    command.args(["--allow-private-peer", "127.0.0.1"]);
+    let mut child = command
+        .env_remove("CHROME_PATH")
+        .env_remove("EDGE_PATH")
+        .env("DIG2BROWSER_TEST_ALLOW_DIRECT_WEBRTC_UDP", "1")
+        .env("HTTP_PROXY", "http://127.0.0.1:1")
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("ALL_PROXY", "http://127.0.0.1:1")
+        .env("NO_PROXY", "*")
+        .stdin(if broker_capability.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn WebRTC proof station");
+    if let Some(capability) = broker_capability {
+        let mut stdin = child
+            .stdin
+            .take()
+            .expect("contained station stdin is piped");
+        capability
+            .write_to_async(&mut stdin)
+            .await
+            .expect("write station WFP capability");
+    }
+    child
+}
+
+async fn spawn_wfp_broker(
+    pipe_name: &str,
+    allowed_runtime_root: &Path,
+    capability: WindowsWfpBrokerCapability,
+) -> tokio::process::Child {
+    let mut command = tokio::process::Command::new(
+        env!("CARGO_BIN_EXE_dig2browser-wfp-broker"),
+    );
+    command.args([
+        "--pipe-name",
+        pipe_name,
+        "--allowed-runtime-root",
+        allowed_runtime_root
+            .to_str()
+            .expect("runtime-mirror catalog path is UTF-8"),
+    ]);
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn test-owned elevated WFP broker");
+    let mut stdin = child.stdin.take().expect("WFP broker stdin is piped");
+    capability
+        .write_to_async(&mut stdin)
+        .await
+        .expect("write broker WFP capability");
+    child
 }
 
 fn spawn_capacity_shutdown_stationd(
@@ -1286,7 +3010,10 @@ async fn assert_clean_exit(daemon: &mut tokio::process::Child) {
     );
 }
 
-async fn assert_webrtc_clean_exit(daemon: &mut tokio::process::Child) {
+async fn assert_webrtc_clean_exit(
+    daemon: &mut tokio::process::Child,
+    expected_containment: bool,
+) {
     let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
         .await
         .expect("WebRTC policy station exit timeout")
@@ -1307,6 +3034,7 @@ async fn assert_webrtc_clean_exit(daemon: &mut tokio::process::Child) {
         "egress_completed_connections",
         "egress_denied_connections",
         "egress_invalid_connections",
+        "egress_idle_connections",
         "egress_failed_connections",
         "egress_timed_out_connections",
         "egress_aborted_connections",
@@ -1321,9 +3049,93 @@ async fn assert_webrtc_clean_exit(daemon: &mut tokio::process::Child) {
             .is_some_and(|count| count >= 1),
         "WebRTC station did not complete the controlled HTTP request: {stdout}"
     );
-    assert_eq!(report["egress_failed_connections"], 0);
-    assert_eq!(report["egress_timed_out_connections"], 0);
+    assert_eq!(
+        report["egress_failed_connections"],
+        0,
+        "WebRTC station reported failed egress: {stdout}"
+    );
+    assert_eq!(
+        report["egress_timed_out_connections"],
+        0,
+        "WebRTC station reported timed-out egress: {stdout}"
+    );
     assert_eq!(report["egress_drain_timed_out"], false);
+    if expected_containment {
+        assert_eq!(report["containment_subject_scope"], "known_executable_set");
+        assert_eq!(report["containment_station_instance_exclusive"], true);
+        assert_eq!(report["containment_provider_crash"], "enforcement_retained");
+        assert_eq!(report["containment_tcp"], true);
+        assert_eq!(report["containment_udp"], true);
+        assert_eq!(report["containment_raw_ip"], true);
+        assert_eq!(report["containment_system_name_resolution"], false);
+        assert_eq!(report["containment_ipv4"], true);
+        assert_eq!(report["containment_ipv6"], true);
+    } else {
+        assert_eq!(report["containment_subject_scope"], "disabled");
+        assert_eq!(report["containment_station_instance_exclusive"], false);
+        assert_eq!(report["containment_provider_crash"], "not_applicable");
+    }
+}
+
+async fn assert_containment_lost_exit(daemon: &mut tokio::process::Child) {
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("containment-lost station exit timeout")
+        .expect("wait for containment-lost station");
+    assert!(!status.success(), "containment-lost station exited successfully");
+    let (stdout, stderr) = read_child_output(daemon).await;
+    assert!(
+        stdout.is_empty(),
+        "containment-lost station unexpectedly wrote a clean report: {stdout}"
+    );
+    let report: serde_json::Value = serde_json::from_str(stderr.trim())
+        .expect("parse containment-lost station exit report");
+    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["event"], "station_exit");
+    assert_eq!(report["outcome"], "error");
+    assert_eq!(report["error_class"], "containment_lost");
+}
+
+async fn assert_wfp_broker_clean_exit(broker: &mut tokio::process::Child) {
+    let status = tokio::time::timeout(Duration::from_secs(30), broker.wait())
+        .await
+        .expect("WFP broker exit timeout")
+        .expect("wait for WFP broker");
+    assert!(status.success(), "WFP broker failed: {status}");
+    let (stdout, stderr) = read_child_output(broker).await;
+    assert!(stderr.is_empty(), "WFP broker wrote stderr: {stderr}");
+    let report: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("parse WFP broker exit report");
+    assert_eq!(report["outcome"], "closed", "unclean WFP broker report: {stdout}");
+    assert_eq!(report["version"], 3);
+}
+
+async fn assert_wfp_broker_client_disconnected(broker: &mut tokio::process::Child) {
+    let status = tokio::time::timeout(Duration::from_secs(30), broker.wait())
+        .await
+        .expect("disconnected WFP broker exit timeout")
+        .expect("wait for disconnected WFP broker");
+    assert!(!status.success(), "disconnected WFP broker exited successfully");
+    let (stdout, stderr) = read_child_output(broker).await;
+    assert!(stderr.is_empty(), "disconnected WFP broker wrote stderr: {stderr}");
+    let report: serde_json::Value = serde_json::from_str(stdout.trim())
+        .expect("parse disconnected WFP broker report");
+    assert_eq!(report["outcome"], "client_disconnected", "{stdout}");
+    assert_eq!(report["version"], 3);
+}
+
+async fn assert_station_shutdown_failure(daemon: &mut tokio::process::Child) {
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("shutdown-failure station exit timeout")
+        .expect("wait for shutdown-failure station");
+    assert!(!status.success(), "shutdown-failure station exited successfully");
+    let (stdout, stderr) = read_child_output(daemon).await;
+    assert!(stdout.is_empty(), "shutdown-failure station wrote clean report: {stdout}");
+    let report: serde_json::Value = serde_json::from_str(stderr.trim())
+        .expect("parse shutdown-failure station report");
+    assert_eq!(report["outcome"], "error");
+    assert_eq!(report["error_class"], "station_shutdown_failure");
 }
 
 #[cfg(feature = "tls-test-hooks")]
@@ -1359,6 +3171,7 @@ async fn assert_https_clean_exit(daemon: &mut tokio::process::Child) {
         "egress_completed_connections",
         "egress_denied_connections",
         "egress_invalid_connections",
+        "egress_idle_connections",
         "egress_failed_connections",
         "egress_timed_out_connections",
         "egress_aborted_connections",
@@ -1395,6 +3208,29 @@ fn e2e_temp_base() -> PathBuf {
     std::env::var_os("DIG2BROWSER_E2E_TMP")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\tmp"))
+}
+
+fn runtime_mirror_catalog() -> PathBuf {
+    PathBuf::from(
+        std::env::var_os("LOCALAPPDATA")
+            .filter(|value| !value.is_empty())
+            .expect("LOCALAPPDATA is available for the Windows E2E"),
+    )
+    .join("dig2browser")
+    .join("runtime-mirrors")
+}
+
+fn directory_entry_names(path: &Path) -> HashSet<String> {
+    std::fs::read_dir(path)
+        .expect("read runtime-mirror catalog")
+        .map(|entry| {
+            entry
+                .expect("read runtime-mirror catalog entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
 }
 
 async fn remove_tree(path: &Path) {

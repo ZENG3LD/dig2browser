@@ -33,14 +33,16 @@ pub enum PersonaPreset {
     ChromiumDesktopPrivacyCohortV1,
     ChromeWindowsDesktopV1,
     EdgeWindowsDesktopV1,
+    FirefoxWindowsDesktopV1,
     ChromeAndroidPixel7MobileWebV1,
 }
 
 impl PersonaPreset {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::ChromiumDesktopPrivacyCohortV1,
         Self::ChromeWindowsDesktopV1,
         Self::EdgeWindowsDesktopV1,
+        Self::FirefoxWindowsDesktopV1,
         Self::ChromeAndroidPixel7MobileWebV1,
     ];
 
@@ -51,6 +53,7 @@ impl PersonaPreset {
             }
             Self::ChromeWindowsDesktopV1 => "chrome-windows-desktop-v1",
             Self::EdgeWindowsDesktopV1 => "edge-windows-desktop-v1",
+            Self::FirefoxWindowsDesktopV1 => "firefox-windows-desktop-v1",
             Self::ChromeAndroidPixel7MobileWebV1 => {
                 "chrome-android-pixel7-mobile-web-v1"
             }
@@ -62,6 +65,7 @@ impl PersonaPreset {
             Self::ChromiumDesktopPrivacyCohortV1 => PersonaMode::PrivacyCohort,
             Self::ChromeWindowsDesktopV1
             | Self::EdgeWindowsDesktopV1
+            | Self::FirefoxWindowsDesktopV1
             | Self::ChromeAndroidPixel7MobileWebV1 => PersonaMode::NamedCompatibility,
         }
     }
@@ -71,7 +75,8 @@ impl PersonaPreset {
             Self::ChromeAndroidPixel7MobileWebV1 => PersonaDeviceClass::MobileWeb,
             Self::ChromiumDesktopPrivacyCohortV1
             | Self::ChromeWindowsDesktopV1
-            | Self::EdgeWindowsDesktopV1 => PersonaDeviceClass::Desktop,
+            | Self::EdgeWindowsDesktopV1
+            | Self::FirefoxWindowsDesktopV1 => PersonaDeviceClass::Desktop,
         }
     }
 
@@ -81,6 +86,7 @@ impl PersonaPreset {
             Self::ChromeWindowsDesktopV1
             | Self::ChromeAndroidPixel7MobileWebV1 => Some(RuntimeKind::Chrome),
             Self::EdgeWindowsDesktopV1 => Some(RuntimeKind::Edge),
+            Self::FirefoxWindowsDesktopV1 => Some(RuntimeKind::Firefox),
         }
     }
 
@@ -94,6 +100,7 @@ impl PersonaPreset {
                 matches!(runtime, RuntimeKind::Chrome)
             }
             Self::EdgeWindowsDesktopV1 => matches!(runtime, RuntimeKind::Edge),
+            Self::FirefoxWindowsDesktopV1 => matches!(runtime, RuntimeKind::Firefox),
         }
     }
 }
@@ -642,6 +649,13 @@ mod tests {
                 Some(RuntimeKind::Edge),
             ),
             (
+                PersonaPreset::FirefoxWindowsDesktopV1,
+                "firefox-windows-desktop-v1",
+                PersonaMode::NamedCompatibility,
+                PersonaDeviceClass::Desktop,
+                Some(RuntimeKind::Firefox),
+            ),
+            (
                 PersonaPreset::ChromeAndroidPixel7MobileWebV1,
                 "chrome-android-pixel7-mobile-web-v1",
                 PersonaMode::NamedCompatibility,
@@ -650,6 +664,7 @@ mod tests {
             ),
         ];
 
+        assert_eq!(PersonaPreset::ALL, cases.map(|case| case.0));
         for (preset, name, mode, device_class, required_runtime) in cases {
             assert_eq!(preset.as_str(), name);
             assert_eq!(preset.mode(), mode);
@@ -701,6 +716,10 @@ mod tests {
         assert!(PersonaPreset::EdgeWindowsDesktopV1
             .supports_runtime(RuntimeKind::Edge));
         assert!(!PersonaPreset::EdgeWindowsDesktopV1
+            .supports_runtime(RuntimeKind::Chrome));
+        assert!(PersonaPreset::FirefoxWindowsDesktopV1
+            .supports_runtime(RuntimeKind::Firefox));
+        assert!(!PersonaPreset::FirefoxWindowsDesktopV1
             .supports_runtime(RuntimeKind::Chrome));
         assert!(PersonaPreset::ChromeAndroidPixel7MobileWebV1
             .supports_runtime(RuntimeKind::Chrome));
