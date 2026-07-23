@@ -259,6 +259,9 @@ ws.onmessage=(event)=>{{document.title='ws-recv';}};\
             // auto-handler this blocks the load event and hangs the navigation.
             // The handler cancels it, so confirm() returns false and #out is set.
             "dialog-confirm" => "<span id=\"out\">pending</span><script>document.getElementById('out').textContent='confirm:'+confirm('proceed?');</script>",
+            // A file input whose change handler records the picked file's name,
+            // so a successful UploadFile is observable over the wire.
+            "file-upload" => "<input type=\"file\" id=\"f\"><span id=\"picked\">none</span><script>document.getElementById('f').addEventListener('change',function(e){document.getElementById('picked').textContent='picked:'+(e.target.files[0]?e.target.files[0].name:'');});</script>",
             _ => "",
         }
     );
@@ -1949,6 +1952,87 @@ async fn stationd_javascript_dialog_never_blocks_a_task_e2e() {
     remove_tree(&profiles).await;
 }
 
+// A.4.3 acceptance: the UploadFile step sets a file <input> from a LOCAL PATH
+// (the browser reads the file; bytes never cross IPC), behind its own default-
+// deny gate --allow-file-upload — distinct from interactive/scripted. Runs on a
+// station that permits ONLY file upload (no interactive/scripted gates), so
+// success proves that single gate is sufficient. The fixture's change handler
+// records the picked file's name; reading it back proves the file was selected
+// AND the change event fired, all over the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stationd_upload_file_sets_input_from_local_path_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-stationd-upload-e2e-{unique}");
+    let base = e2e_temp_base().join(format!("dig2browser-stationd-upload-e2e-{unique}"));
+    let profiles = base.join("profiles");
+    std::fs::create_dir_all(&profiles).expect("create upload profiles root");
+    // A real local file for the browser to read; its basename is what the page
+    // reports back through the change handler.
+    let upload_path = base.join("upload_src.txt");
+    std::fs::write(&upload_path, b"dig2browser upload e2e payload")
+        .expect("write upload source file");
+    let upload_path = upload_path.to_str().expect("upload path is UTF-8").to_owned();
+
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+    let mut daemon = spawn_stationd_file_upload_only(stationd, &pipe_name, &profiles);
+
+    let client = StationClient::connect(
+        ClientConfig::new(&pipe_name, Duration::from_secs(15), Duration::from_secs(90))
+            .expect("valid upload client config"),
+    )
+    .await
+    .expect("connect upload station client");
+
+    let url = fixture.url("/file-upload");
+    let task = CollectionTask::new(vec![
+        TaskStep::Navigate { url: url.clone() },
+        TaskStep::UploadFile {
+            selector: "#f".to_owned(),
+            path: upload_path,
+        },
+        TaskStep::ReadSelectorText {
+            selector: "#picked".to_owned(),
+        },
+    ])
+    .expect("valid upload task");
+    let mut result = None;
+    for attempt in 0..8 {
+        match client.run_task("upload-profile", task.clone()).await {
+            Ok(value) => {
+                result = Some(value);
+                break;
+            }
+            Err(ClientError::Remote {
+                status: ResponseStatus::Unavailable,
+                ..
+            }) if attempt < 7 => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            other => panic!("upload task failed: {other:?}"),
+        }
+    }
+    let result = result.expect("upload task after retries");
+    assert_eq!(result.replies().len(), 3);
+    assert_eq!(result.replies()[1], TaskReply::Acknowledged);
+    assert_eq!(
+        result.replies()[2],
+        TaskReply::Text("picked:upload_src.txt".to_owned()),
+        "UploadFile did not set the input and fire change"
+    );
+
+    client.shutdown().await.expect("request upload station drain");
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("upload station exit timeout")
+        .expect("wait for upload station");
+    assert!(status.success(), "upload station failed: {status}");
+    let (_, stderr) = read_child_output(&mut daemon).await;
+    assert!(stderr.is_empty(), "clean upload station wrote stderr: {stderr}");
+    remove_tree(&base).await;
+}
+
 fn frame_records(records: &[MonitorEvent]) -> Vec<&MonitorFrame> {
     records
         .iter()
@@ -2450,6 +2534,25 @@ async fn stationd_denies_active_task_capabilities_by_default_e2e() {
     .expect("valid restricted script task");
     assert!(matches!(
         client.run_task("restricted-profile", scripted_task).await,
+        Err(ClientError::Remote {
+            status: ResponseStatus::Invalid,
+            ..
+        })
+    ));
+    // File upload is behind its own default-deny gate (--allow-file-upload),
+    // rejected before any browser work when the gate is off.
+    let upload_task = CollectionTask::new(vec![
+        TaskStep::Navigate {
+            url: fixture.url("/restricted-upload"),
+        },
+        TaskStep::UploadFile {
+            selector: "#f".to_owned(),
+            path: "C:/tmp/dig2browser-upload-denied.txt".to_owned(),
+        },
+    ])
+    .expect("valid restricted upload task");
+    assert!(matches!(
+        client.run_task("restricted-profile", upload_task).await,
         Err(ClientError::Remote {
             status: ResponseStatus::Invalid,
             ..
@@ -3334,10 +3437,20 @@ async fn stationd_resumes_trace_and_reconciles_hard_kill_e2e() {
         client.health().await.is_err(),
         "stale trace transport unexpectedly survived hard kill"
     );
-    client
-        .health()
-        .await
-        .expect("trace client reconnects to successor");
+    // The successor was just spawned; under load it may not be listening yet.
+    // Poll until the client reconnects rather than racing its startup with a
+    // single call (this is the reconnect a real client would retry).
+    let reconnect_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if client.health().await.is_ok() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < reconnect_deadline,
+            "trace client did not reconnect to successor"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     let interrupted = wait_for_complete_trace(&client, interrupted_id).await;
     assert_eq!(interrupted.len(), 2);
     assert!(matches!(
@@ -4065,6 +4178,44 @@ fn spawn_stationd_for_runtime_with_routes(
             allow_headful_auth: false,
         },
     )
+}
+
+/// A station that permits ONLY file upload — no interactive/scripted gates — so
+/// an UploadFile that succeeds here is proven to need only `--allow-file-upload`.
+fn spawn_stationd_file_upload_only(
+    stationd: &str,
+    pipe_name: &str,
+    profiles: &Path,
+) -> tokio::process::Child {
+    let mut command = tokio::process::Command::new(stationd);
+    command.args([
+        "--pipe-name",
+        pipe_name,
+        "--profiles-root",
+        profiles.to_str().expect("profiles path is UTF-8"),
+        "--runtime",
+        "chrome",
+        "--max-resident",
+        "1",
+        "--max-in-flight",
+        "4",
+        "--max-connections",
+        "8",
+        "--timeout-seconds",
+        "90",
+        "--drain-seconds",
+        "15",
+        "--allow-remote-shutdown",
+        "--allow-file-upload",
+        // Deliberately NO --allow-interactive-tasks / --allow-scripted-tasks.
+    ]);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn file-upload-only station daemon")
 }
 
 /// A station that permits interactive tasks but NOT scripted tasks — so a step
