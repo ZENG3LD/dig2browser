@@ -20,7 +20,7 @@ use dig2browser_client::{
     MonitorFrame, MonitorStopReason, PersonaPreset,
     ProfileClass, ResponseStatus, RouteRef, RuntimeFeature, RuntimeKind,
     RuntimeRequirements, RuntimeSelector, SessionHealthProbe, SessionPhase,
-    SessionStateUpdate, StationClient, StationStatus, SupportLevel,
+    SessionStateUpdate, StationClient, StationStatus, SupportLevel, TabInfo,
     TaskCapturePolicy, TaskReply, TaskRuntimeContract, TaskStep,
     TerminalOutcome, TraceCursor, TraceEvent, TraceEventKind,
     WebSocketDirection, WebSocketOpcode, PROTOCOL_VERSION,
@@ -278,6 +278,9 @@ ws.onmessage=(event)=>{{document.title='ws-recv';}};\
             // child document carries a button — targeted via `iframe#inner >>> #btn`.
             "iframe-parent" => "<iframe id=\"inner\" src=\"/iframe-child\"></iframe>",
             "iframe-child" => "<button id=\"btn\">Inner Button</button>",
+            // A link that opens a second same-origin tab (target=_blank) — used to
+            // prove ListTabs sees the popup and SwitchToTab drives it.
+            "popup-parent" => "<a id=\"pop\" href=\"/popup-child\" target=\"_blank\">open</a>",
             _ => "",
         }
     );
@@ -2195,6 +2198,112 @@ async fn stationd_frame_piercing_selector_reaches_same_origin_iframe_e2e() {
     assert!(status.success(), "iframe station failed: {status}");
     let (_, stderr) = read_child_output(&mut daemon).await;
     assert!(stderr.is_empty(), "clean iframe station wrote stderr: {stderr}");
+    remove_tree(&profiles).await;
+}
+
+// A.4.6 acceptance: ListTabs enumerates the browser's open page targets and
+// SwitchToTab makes a second tab (a popup a click just opened) the worker's
+// active page — so an agent can act in a popup. No gate (all tabs are within the
+// agent's own lease). Task A navigates, clicks a target=_blank link, and lists
+// the tabs (asserting the popup appears); task B switches to the popup and reads
+// its content — proving adopt-and-drive over the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stationd_list_and_switch_tabs_drives_a_popup_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-stationd-tabs-e2e-{unique}");
+    let profiles = e2e_temp_base().join(format!(
+        "dig2browser-stationd-tabs-e2e-{unique}"
+    ));
+    std::fs::create_dir_all(&profiles).expect("create tabs profiles root");
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+    let mut daemon = spawn_stationd(stationd, &pipe_name, &profiles);
+
+    let client = StationClient::connect(
+        ClientConfig::new(&pipe_name, Duration::from_secs(15), Duration::from_secs(90))
+            .expect("valid tabs client config"),
+    )
+    .await
+    .expect("connect tabs station client");
+
+    // Task A: open the popup and list the tabs (single resident worker, so the
+    // popup persists for task B).
+    let open_and_list = CollectionTask::new(vec![
+        TaskStep::Navigate {
+            url: fixture.url("/popup-parent"),
+        },
+        TaskStep::ClickSelector {
+            selector: "#pop".to_owned(),
+        },
+        // Give the new target a moment to register with the browser.
+        TaskStep::Wait {
+            duration: Duration::from_millis(500),
+        },
+        TaskStep::ListTabs,
+    ])
+    .expect("valid open-and-list task");
+    let mut result = None;
+    for attempt in 0..8 {
+        match client.run_task("tabs-profile", open_and_list.clone()).await {
+            Ok(value) => {
+                result = Some(value);
+                break;
+            }
+            Err(ClientError::Remote {
+                status: ResponseStatus::Unavailable,
+                ..
+            }) if attempt < 7 => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            other => panic!("open-and-list task failed: {other:?}"),
+        }
+    }
+    let result = result.expect("open-and-list task after retries");
+    let TaskReply::Tabs(tabs) = &result.replies()[3] else {
+        panic!("expected Tabs reply, got {:?}", result.replies()[3]);
+    };
+    assert!(
+        tabs.len() >= 2,
+        "expected the parent + popup tabs, got {tabs:?}"
+    );
+    let popup: &TabInfo = tabs
+        .iter()
+        .find(|tab| tab.url().contains("popup-child"))
+        .unwrap_or_else(|| panic!("no popup tab (url contains popup-child) in {tabs:?}"));
+    let popup_id = popup.id().to_owned();
+
+    // Task B: switch to the popup and read its content (same resident worker).
+    let switch_and_read = CollectionTask::new(vec![
+        TaskStep::SwitchToTab { id: popup_id },
+        TaskStep::WaitForSelector {
+            selector: "main".to_owned(),
+            timeout: Duration::from_secs(10),
+        },
+        TaskStep::ReadSelectorText {
+            selector: "main".to_owned(),
+        },
+    ])
+    .expect("valid switch-and-read task");
+    let switched = client
+        .run_task("tabs-profile", switch_and_read)
+        .await
+        .expect("run switch-and-read task");
+    assert_eq!(switched.replies()[0], TaskReply::Acknowledged);
+    assert_eq!(
+        switched.replies()[2],
+        TaskReply::Text("popup-child".to_owned()),
+        "SwitchToTab did not make the popup the active page"
+    );
+
+    client.shutdown().await.expect("request tabs station drain");
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("tabs station exit timeout")
+        .expect("wait for tabs station");
+    assert!(status.success(), "tabs station failed: {status}");
+    let (_, stderr) = read_child_output(&mut daemon).await;
+    assert!(stderr.is_empty(), "clean tabs station wrote stderr: {stderr}");
     remove_tree(&profiles).await;
 }
 
