@@ -1,6 +1,6 @@
 //! JS script generators for anti-detection overrides.
 
-use crate::stealth::config::{StealthConfig, StealthLevel};
+use crate::stealth::config::{StealthConfig, StealthLevel, WebrtcPolicy};
 
 /// Returns stealth scripts for the given config.
 pub fn get_scripts(config: &StealthConfig) -> Vec<String> {
@@ -14,13 +14,16 @@ pub fn get_scripts(config: &StealthConfig) -> Vec<String> {
         return scripts;
     }
 
-    // StandardNoWebGL: adds canvas, plugins, languages, permissions, hardware, memory, connection
+    // StandardNoWebGL: adds canvas, audio, plugins, languages, permissions,
+    //                  hardware, memory, touch points, connection
     scripts.push(randomize_canvas_fingerprint());
+    scripts.push(randomize_audio_fingerprint());
     scripts.push(override_plugins());
     scripts.push(override_languages(&config.locale.locale));
     scripts.push(override_permissions_all());
     scripts.push(override_hardware_concurrency(config.hardware_concurrency));
     scripts.push(override_device_memory(config.device_memory_gb));
+    scripts.push(override_max_touch_points(config.max_touch_points));
     scripts.push(override_connection_info());
 
     if config.level == StealthLevel::StandardNoWebGL {
@@ -28,7 +31,7 @@ pub fn get_scripts(config: &StealthConfig) -> Vec<String> {
     }
 
     // Standard: adds webgl + screen_resolution
-    scripts.push(override_webgl_vendor());
+    scripts.push(override_webgl_vendor(&config.webgl_vendor, &config.webgl_renderer));
     scripts.push(override_screen_resolution(
         config.viewport.0,
         config.viewport.1,
@@ -41,7 +44,9 @@ pub fn get_scripts(config: &StealthConfig) -> Vec<String> {
 
     // Full: adds webrtc + timezone + media_devices + performance_timing + battery
     //       + outer window size + userAgentData
-    scripts.push(override_webrtc_leak());
+    if config.webrtc_policy == WebrtcPolicy::Remove {
+        scripts.push(override_webrtc_leak());
+    }
     if let Some(tz) = &config.locale.timezone {
         scripts.push(override_timezone(tz));
     }
@@ -260,6 +265,81 @@ fn randomize_canvas_fingerprint() -> String {
     .to_string()
 }
 
+/// Add slight noise to the two dominant AudioContext fingerprinting
+/// techniques (analyser-based and offline-render-based).
+///
+/// **This is mitigation, not verification.** Unlike the canvas noise above,
+/// there is no "correct" audio fingerprint for a persona to match — real
+/// browsers on real hardware naturally vary here. The goal is only to break
+/// exact hash stability *across sessions* while remaining stable *within* a
+/// session, following the same seeded-xorshift pattern as
+/// `randomize_canvas_fingerprint`. It does not make a probe-checkable claim
+/// about what the persona's audio stack should report.
+///
+/// Two entry points are patched, mirroring the two techniques fingerprint
+/// scripts actually use: `AnalyserNode.prototype.getFloatFrequencyData`
+/// (oscillator + analyser technique) and `OfflineAudioContext.prototype.
+/// startRendering` (render-then-hash technique, perturbed on the resolved
+/// `AudioBuffer`'s channel data).
+fn randomize_audio_fingerprint() -> String {
+    r#"
+    (function() {
+        // Seed computed once per page context — stable within session.
+        const _seed = (Math.random() * 0xFFFFFFFF) >>> 0;
+        function xorshift(n) {
+            n ^= n << 13; n ^= n >>> 17; n ^= n << 5;
+            return (n >>> 0);
+        }
+        // Small noise, deterministic per (seed, sample index) within a
+        // session: enough to move a hash, not enough to be audible or to
+        // break legitimate audio analysis.
+        function sampleOffset(idx) {
+            return ((xorshift(_seed ^ (idx * 2654435761)) % 1000) - 500) / 1000000;
+        }
+
+        if (typeof AnalyserNode !== 'undefined') {
+            const origGetFloatFrequencyData = AnalyserNode.prototype.getFloatFrequencyData;
+            const patchedGetFloatFrequencyData = function getFloatFrequencyData(array) {
+                origGetFloatFrequencyData.call(this, array);
+                for (let i = 0; i < array.length; i++) {
+                    array[i] += sampleOffset(i);
+                }
+            };
+            Object.defineProperty(patchedGetFloatFrequencyData, 'toString', {
+                value: function() { return 'function getFloatFrequencyData() { [native code] }'; },
+                configurable: true,
+            });
+            AnalyserNode.prototype.getFloatFrequencyData = patchedGetFloatFrequencyData;
+        }
+
+        if (typeof OfflineAudioContext !== 'undefined') {
+            const origStartRendering = OfflineAudioContext.prototype.startRendering;
+            const patchedStartRendering = function startRendering() {
+                const result = origStartRendering.apply(this, arguments);
+                if (result && typeof result.then === 'function') {
+                    return result.then(function(buffer) {
+                        for (let channel = 0; channel < buffer.numberOfChannels; channel++) {
+                            const data = buffer.getChannelData(channel);
+                            for (let i = 0; i < data.length; i++) {
+                                data[i] += sampleOffset(i);
+                            }
+                        }
+                        return buffer;
+                    });
+                }
+                return result;
+            };
+            Object.defineProperty(patchedStartRendering, 'toString', {
+                value: function() { return 'function startRendering() { [native code] }'; },
+                configurable: true,
+            });
+            OfflineAudioContext.prototype.startRendering = patchedStartRendering;
+        }
+    })();
+    "#
+    .to_string()
+}
+
 /// Fake `navigator.plugins` to look like a typical Chrome installation.
 fn override_plugins() -> String {
     r#"
@@ -329,6 +409,27 @@ fn override_device_memory(gb: u32) -> String {
     )
 }
 
+/// Set `navigator.maxTouchPoints` to `points`.
+///
+/// The CDP `Emulation.setTouchEmulationEnabled` call already sets this as a
+/// side effect on the CDP backend's main frame, but relying on the side
+/// effect alone leaves two gaps: prototype-chain diffing
+/// (`Object.getOwnPropertyDescriptor(Navigator.prototype, 'maxTouchPoints')`)
+/// can still see a native, non-overridden descriptor if the emulation call
+/// races script injection, and the BiDi/Firefox backend has no equivalent
+/// native call at all. Patching `Navigator.prototype` directly closes both
+/// gaps and matches the pattern used for `hardwareConcurrency`/`deviceMemory`.
+fn override_max_touch_points(points: u8) -> String {
+    format!(
+        r#"
+    Object.defineProperty(Navigator.prototype, 'maxTouchPoints', {{
+        get: () => {points},
+        configurable: true
+    }});
+    "#
+    )
+}
+
 /// Fake `navigator.connection` as a 4G connection.
 fn override_connection_info() -> String {
     r#"
@@ -345,12 +446,23 @@ fn override_connection_info() -> String {
     .to_string()
 }
 
-/// Spoof WebGL vendor/renderer strings to look like NVIDIA hardware.
+/// Spoof WebGL vendor/renderer strings per the configured device class.
 ///
 /// `toString()` is spoofed on the patched `getParameter` so that
 /// `WebGLRenderingContext.prototype.getParameter.toString()` returns the
 /// native-code string that bot detectors expect.
-fn override_webgl_vendor() -> String {
+///
+/// NOTE: this only overrides the two *queried* strings
+/// (`UNMASKED_VENDOR_WEBGL` / `UNMASKED_RENDERER_WEBGL`). The underlying GL
+/// pipeline (extension list, shader precision, draw-call timing) is still
+/// the real host GPU regardless of what these two strings report — a deep
+/// WebGL probe can still distinguish a mobile persona from the real desktop
+/// GPU behind it. Closing that gap needs a real mobile GPU/runtime, not a
+/// string override (see the plan's Phase 3 / `dig2browser-runtime-android`).
+fn override_webgl_vendor(vendor: &str, renderer: &str) -> String {
+    let vendor = serde_json::to_string(vendor).expect("WebGL vendor string is JSON serializable");
+    let renderer =
+        serde_json::to_string(renderer).expect("WebGL renderer string is JSON serializable");
     r#"
     (function() {
         function patchGetParameter(ctx) {
@@ -359,10 +471,10 @@ fn override_webgl_vendor() -> String {
                 const debugInfo = this.getExtension('WEBGL_debug_renderer_info');
                 if (debugInfo) {
                     if (parameter === debugInfo.UNMASKED_VENDOR_WEBGL) {
-                        return 'Google Inc. (NVIDIA)';
+                        return __VENDOR__;
                     }
                     if (parameter === debugInfo.UNMASKED_RENDERER_WEBGL) {
-                        return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1080 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+                        return __RENDERER__;
                     }
                 }
                 return orig.apply(this, arguments);
@@ -380,7 +492,8 @@ fn override_webgl_vendor() -> String {
         }
     })();
     "#
-    .to_string()
+    .replace("__VENDOR__", &vendor)
+    .replace("__RENDERER__", &renderer)
 }
 
 /// Override `screen.width/height/availWidth/availHeight` to `width × height`.
@@ -425,6 +538,12 @@ fn override_screen_resolution(width: u32, height: u32, device_scale_factor: f64)
 ///
 /// Map scraping never requires WebRTC, so the safest approach is to remove it
 /// entirely rather than wrapping it with a no-op that leaks local IPs anyway.
+///
+/// Called only when `StealthConfig::webrtc_policy` is `WebrtcPolicy::Remove`
+/// (the default — see `get_scripts`). `WebrtcPolicy::Retain` skips this call
+/// so `RTCPeerConnection` stays present; that policy is a lever for routes
+/// with an egress boundary that already blocks non-proxy ICE candidates, not
+/// a change to this function's own default behavior.
 fn override_webrtc_leak() -> String {
     r#"
     window.RTCPeerConnection = undefined;

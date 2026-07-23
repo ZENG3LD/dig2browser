@@ -202,6 +202,36 @@ impl BrowserPersona {
         &self.model
     }
 
+    /// Core device class implied by `kind`. Computed, not a wire field —
+    /// legacy (non-preset) personas get the same device-class-keyed
+    /// hardware profile as compiled ones.
+    fn device_class(&self) -> PersonaDeviceClass {
+        match self.kind {
+            PersonaKind::Desktop => PersonaDeviceClass::Desktop,
+            PersonaKind::Mobile => PersonaDeviceClass::MobileWeb,
+        }
+    }
+
+    /// Declared CPU thread count (`navigator.hardwareConcurrency`).
+    pub fn hardware_concurrency(&self) -> u8 {
+        self.device_class().hardware_concurrency()
+    }
+
+    /// Declared device memory in GB (`navigator.deviceMemory`).
+    pub fn device_memory_gb(&self) -> u8 {
+        self.device_class().device_memory_gb()
+    }
+
+    /// `WEBGL_debug_renderer_info` `UNMASKED_VENDOR_WEBGL` string.
+    pub fn webgl_vendor(&self) -> &'static str {
+        self.device_class().webgl_vendor()
+    }
+
+    /// `WEBGL_debug_renderer_info` `UNMASKED_RENDERER_WEBGL` string.
+    pub fn webgl_renderer(&self) -> &'static str {
+        self.device_class().webgl_renderer()
+    }
+
     pub fn is_mobile(&self) -> bool {
         self.kind == PersonaKind::Mobile
     }

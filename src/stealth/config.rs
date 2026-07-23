@@ -175,6 +175,23 @@ impl UserAgentProfile {
     }
 }
 
+/// WebRTC handling policy.
+///
+/// The default preserves current behavior: `RTCPeerConnection` is removed
+/// entirely, which is the safe choice absent a proven egress boundary. For a
+/// mobile persona this absence is itself an anomaly (real mobile Chrome
+/// keeps the API), but flipping the *default* is a separate decision that
+/// depends on the egress boundary guaranteeing no non-proxy ICE candidate can
+/// leak — this only adds the lever, it does not flip it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WebrtcPolicy {
+    /// Delete `RTCPeerConnection` (current, default behavior).
+    #[default]
+    Remove,
+    /// Keep `RTCPeerConnection` present and unpatched.
+    Retain,
+}
+
 /// Full stealth configuration passed to script generators and injection strategies.
 #[derive(Debug, Clone)]
 pub struct StealthConfig {
@@ -184,6 +201,12 @@ pub struct StealthConfig {
     pub device_scale_factor: DeviceScaleFactor,
     pub hardware_concurrency: u32,
     pub device_memory_gb: u32,
+    pub max_touch_points: u8,
+    /// `WEBGL_debug_renderer_info` `UNMASKED_VENDOR_WEBGL` override.
+    pub webgl_vendor: String,
+    /// `WEBGL_debug_renderer_info` `UNMASKED_RENDERER_WEBGL` override.
+    pub webgl_renderer: String,
+    pub webrtc_policy: WebrtcPolicy,
     /// User-Agent string to report via both HTTP headers and JS `navigator.userAgent`.
     /// CDP backend uses this with `Emulation.setUserAgentOverride`.
     pub user_agent: String,
@@ -199,6 +222,12 @@ impl Default for StealthConfig {
             device_scale_factor: DeviceScaleFactor::default(),
             hardware_concurrency: 8,
             device_memory_gb: 8,
+            max_touch_points: 0,
+            webgl_vendor: "Google Inc. (NVIDIA)".to_owned(),
+            webgl_renderer:
+                "ANGLE (NVIDIA, NVIDIA GeForce GTX 1080 Direct3D11 vs_5_0 ps_5_0, D3D11)"
+                    .to_owned(),
+            webrtc_policy: WebrtcPolicy::default(),
             user_agent: DEFAULT_USER_AGENT.to_owned(),
             client_hints: ClientHintsProfile::windows_desktop(),
         }

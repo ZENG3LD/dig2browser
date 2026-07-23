@@ -27,6 +27,59 @@ pub enum PersonaDeviceClass {
     MobileWeb,
 }
 
+impl PersonaDeviceClass {
+    /// Declared CPU thread count (`navigator.hardwareConcurrency`).
+    ///
+    /// Desktop: unchanged from the prior fixed 8-thread default (a common
+    /// mid-range baseline). Mobile: the real Pixel 7 (Tensor G2) is
+    /// 2x Cortex-X1 + 2x Cortex-A78 + 4x Cortex-A55 = 8 threads, so the
+    /// value is coincidentally identical but now explicit and sourced from
+    /// the persona rather than a shared hardcoded default.
+    pub const fn hardware_concurrency(self) -> u8 {
+        match self {
+            Self::Desktop => 8,
+            Self::MobileWeb => 8,
+        }
+    }
+
+    /// Declared device memory in GB (`navigator.deviceMemory`).
+    ///
+    /// Desktop: unchanged from the prior fixed 8 GB default. Mobile: the
+    /// real Pixel 7 base configuration ships 8 GB RAM.
+    pub const fn device_memory_gb(self) -> u8 {
+        match self {
+            Self::Desktop => 8,
+            Self::MobileWeb => 8,
+        }
+    }
+
+    /// `WEBGL_debug_renderer_info` `UNMASKED_VENDOR_WEBGL` string for this
+    /// device class.
+    pub const fn webgl_vendor(self) -> &'static str {
+        match self {
+            Self::Desktop => "Google Inc. (NVIDIA)",
+            Self::MobileWeb => "ARM",
+        }
+    }
+
+    /// `WEBGL_debug_renderer_info` `UNMASKED_RENDERER_WEBGL` string for this
+    /// device class.
+    ///
+    /// Mobile: the real Pixel 7 (Tensor G2) GPU is a Mali-G710. This only
+    /// controls the two *queried* strings — the underlying GL pipeline
+    /// (extension list, shader precision, draw timing) is still the real
+    /// host GPU regardless (see
+    /// `dig2browser/src/stealth/scripts.rs::override_webgl_vendor`).
+    pub const fn webgl_renderer(self) -> &'static str {
+        match self {
+            Self::Desktop => {
+                "ANGLE (NVIDIA, NVIDIA GeForce GTX 1080 Direct3D11 vs_5_0 ps_5_0, D3D11)"
+            }
+            Self::MobileWeb => "Mali-G710",
+        }
+    }
+}
+
 /// Versioned persona presets with stable names and runtime compatibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PersonaPreset {
@@ -178,6 +231,10 @@ pub struct CompiledPersona {
     timezone: Option<&'static str>,
     platform_version: &'static str,
     model: &'static str,
+    hardware_concurrency: u8,
+    device_memory_gb: u8,
+    webgl_vendor: &'static str,
+    webgl_renderer: &'static str,
 }
 
 impl CompiledPersona {
@@ -243,6 +300,22 @@ impl CompiledPersona {
         self.model
     }
 
+    pub fn hardware_concurrency(&self) -> u8 {
+        self.hardware_concurrency
+    }
+
+    pub fn device_memory_gb(&self) -> u8 {
+        self.device_memory_gb
+    }
+
+    pub fn webgl_vendor(&self) -> &'static str {
+        self.webgl_vendor
+    }
+
+    pub fn webgl_renderer(&self) -> &'static str {
+        self.webgl_renderer
+    }
+
     pub fn is_mobile(&self) -> bool {
         self.device_class() == PersonaDeviceClass::MobileWeb
     }
@@ -266,6 +339,7 @@ impl PersonaCompiler {
                 (393, 852, 3000, 5, "13.0.0", "Pixel 7")
             }
         };
+        let device_class = preset.device_class();
         CompiledPersona {
             preset,
             route_ref,
@@ -277,6 +351,10 @@ impl PersonaCompiler {
             timezone: Some("UTC"),
             platform_version,
             model,
+            hardware_concurrency: device_class.hardware_concurrency(),
+            device_memory_gb: device_class.device_memory_gb(),
+            webgl_vendor: device_class.webgl_vendor(),
+            webgl_renderer: device_class.webgl_renderer(),
         }
     }
 }
@@ -686,6 +764,13 @@ mod tests {
                     assert_eq!(compiled.platform_version(), "15.0.0");
                     assert_eq!(compiled.architecture(), "x86");
                     assert_eq!(compiled.model(), "");
+                    assert_eq!(compiled.hardware_concurrency(), 8);
+                    assert_eq!(compiled.device_memory_gb(), 8);
+                    assert_eq!(compiled.webgl_vendor(), "Google Inc. (NVIDIA)");
+                    assert_eq!(
+                        compiled.webgl_renderer(),
+                        "ANGLE (NVIDIA, NVIDIA GeForce GTX 1080 Direct3D11 vs_5_0 ps_5_0, D3D11)"
+                    );
                     assert!(!compiled.is_mobile());
                 }
                 PersonaDeviceClass::MobileWeb => {
@@ -698,6 +783,10 @@ mod tests {
                     assert_eq!(compiled.platform_version(), "13.0.0");
                     assert_eq!(compiled.architecture(), "");
                     assert_eq!(compiled.model(), "Pixel 7");
+                    assert_eq!(compiled.hardware_concurrency(), 8);
+                    assert_eq!(compiled.device_memory_gb(), 8);
+                    assert_eq!(compiled.webgl_vendor(), "ARM");
+                    assert_eq!(compiled.webgl_renderer(), "Mali-G710");
                     assert!(compiled.is_mobile());
                 }
             }

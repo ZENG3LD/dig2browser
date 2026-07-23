@@ -28,6 +28,12 @@ const MAX_DIMENSION: u16 = 16_384;
 const MAX_DPR_MILLI: u16 = 10_000;
 const MAX_TOUCH_POINTS: u8 = 20;
 const MAX_COLOR_DEPTH: u8 = 64;
+const MAX_HARDWARE_CONCURRENCY: u8 = 128;
+/// `navigator.deviceMemory` is spec-capped at 8 GB for fingerprinting
+/// mitigation (real Chrome never reports higher regardless of installed
+/// RAM), so this is an honest ceiling, not an arbitrary probe limit.
+const MAX_DEVICE_MEMORY_GB: u8 = 8;
+const MAX_WEBGL_STRING_BYTES: usize = 256;
 
 /// Browser-visible fields collected by the controlled probe page.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +55,10 @@ pub struct BrowserObservationV1 {
     pub hover: bool,
     pub webdriver: bool,
     pub color_depth: u8,
+    pub hardware_concurrency: u8,
+    pub device_memory: u8,
+    pub webgl_vendor: String,
+    pub webgl_renderer: String,
 }
 
 /// Server-visible request values normalized by the controlled probe origin.
@@ -113,6 +123,24 @@ impl ProbeObservationV1 {
             MAX_TOUCH_POINTS,
         )?;
         validate_number("browser.colorDepth", self.browser.color_depth, 1, MAX_COLOR_DEPTH)?;
+        validate_number(
+            "browser.hardwareConcurrency",
+            self.browser.hardware_concurrency,
+            1,
+            MAX_HARDWARE_CONCURRENCY,
+        )?;
+        validate_number(
+            "browser.deviceMemory",
+            self.browser.device_memory,
+            1,
+            MAX_DEVICE_MEMORY_GB,
+        )?;
+        validate_text("browser.webglVendor", &self.browser.webgl_vendor, MAX_WEBGL_STRING_BYTES)?;
+        validate_text(
+            "browser.webglRenderer",
+            &self.browser.webgl_renderer,
+            MAX_WEBGL_STRING_BYTES,
+        )?;
         Ok(())
     }
 }
@@ -380,6 +408,10 @@ impl ProbeTranscriptV1 {
         push_bool(&mut bytes, "browser.hover", browser.hover);
         push_bool(&mut bytes, "browser.webdriver", browser.webdriver);
         push_u8(&mut bytes, "browser.colorDepth", browser.color_depth);
+        push_u8(&mut bytes, "browser.hardwareConcurrency", browser.hardware_concurrency);
+        push_u8(&mut bytes, "browser.deviceMemory", browser.device_memory);
+        push_field(&mut bytes, "browser.webglVendor", browser.webgl_vendor.as_bytes());
+        push_field(&mut bytes, "browser.webglRenderer", browser.webgl_renderer.as_bytes());
         let server = &self.observation.server;
         push_field(&mut bytes, "server.userAgent", server.user_agent.as_bytes());
         push_field(
@@ -489,6 +521,22 @@ fn validate_matrix(
         "browser.maxTouchPoints",
         browser.max_touch_points,
         persona.max_touch_points(),
+    )?;
+    require_number(
+        "browser.hardwareConcurrency",
+        browser.hardware_concurrency,
+        persona.hardware_concurrency(),
+    )?;
+    require_number(
+        "browser.deviceMemory",
+        browser.device_memory,
+        persona.device_memory_gb(),
+    )?;
+    require_equal("browser.webglVendor", &browser.webgl_vendor, persona.webgl_vendor())?;
+    require_equal(
+        "browser.webglRenderer",
+        &browser.webgl_renderer,
+        persona.webgl_renderer(),
     )?;
     if browser.webdriver {
         return Err(ProbeError::Mismatch("browser.webdriver"));
@@ -766,7 +814,11 @@ mod tests {
                 "coarsePointer": false,
                 "hover": true,
                 "webdriver": false,
-                "colorDepth": 24
+                "colorDepth": 24,
+                "hardwareConcurrency": 8,
+                "deviceMemory": 8,
+                "webglVendor": "Google Inc. (NVIDIA)",
+                "webglRenderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 1080 Direct3D11 vs_5_0 ps_5_0, D3D11)"
             },
             "server": {
                 "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
@@ -795,7 +847,11 @@ mod tests {
                 "coarsePointer": true,
                 "hover": false,
                 "webdriver": false,
-                "colorDepth": 24
+                "colorDepth": 24,
+                "hardwareConcurrency": 8,
+                "deviceMemory": 8,
+                "webglVendor": "ARM",
+                "webglRenderer": "Mali-G710"
             },
             "server": {
                 "userAgent": "Mozilla/5.0 (Linux; Android 13.0.0; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Mobile Safari/537.36",

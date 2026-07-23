@@ -199,6 +199,19 @@ fn persona_probe_script(request: &str) -> String {
         r#"<script>(() => {{
 const output = document.getElementById('persona-probe-output');
 const uaData = navigator.userAgentData || null;
+let webglVendor = '';
+let webglRenderer = '';
+try {{
+  const canvas = document.createElement('canvas');
+  const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+  if (gl) {{
+    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+    if (dbg) {{
+      webglVendor = gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL);
+      webglRenderer = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL);
+    }}
+  }}
+}} catch (_) {{}}
 const observation = {{
   browser: {{
     userAgent: navigator.userAgent,
@@ -216,7 +229,11 @@ const observation = {{
     coarsePointer: matchMedia('(pointer: coarse)').matches,
     hover: matchMedia('(hover: hover)').matches,
     webdriver: navigator.webdriver === true,
-    colorDepth: screen.colorDepth
+    colorDepth: screen.colorDepth,
+    hardwareConcurrency: navigator.hardwareConcurrency,
+    deviceMemory: Math.round(navigator.deviceMemory),
+    webglVendor: webglVendor,
+    webglRenderer: webglRenderer
   }},
   server: {{
     userAgent: {server_user_agent},

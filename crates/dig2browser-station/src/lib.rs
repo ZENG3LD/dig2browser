@@ -433,6 +433,11 @@ fn apply_persona(
             persona.model(),
         ),
     };
+    worker.stealth.hardware_concurrency = u32::from(persona.hardware_concurrency());
+    worker.stealth.device_memory_gb = u32::from(persona.device_memory_gb());
+    worker.stealth.webgl_vendor = persona.webgl_vendor().to_owned();
+    worker.stealth.webgl_renderer = persona.webgl_renderer().to_owned();
+    worker.stealth.max_touch_points = persona.max_touch_points();
     worker.launch.window_size = worker.stealth.viewport;
     worker.mobile_layout = match persona.kind() {
         PersonaKind::Desktop => None,

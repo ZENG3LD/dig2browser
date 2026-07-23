@@ -8,7 +8,7 @@ pub mod inject;
 pub mod scripts;
 
 pub use config::{
-    ClientHintsProfile, LocaleProfile, StealthConfig, StealthLevel,
+    ClientHintsProfile, LocaleProfile, StealthConfig, StealthLevel, WebrtcPolicy,
     DEFAULT_USER_AGENT,
 };
 pub use inject::InjectionStrategy;
