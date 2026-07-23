@@ -101,6 +101,19 @@ pub trait BrowserRuntime: Send + 'static {
         let _ = (selector, value);
         Box::pin(async { Err(RuntimeError::new(RuntimeFailureKind::Protocol)) })
     }
+
+    /// Set the files selected by the file `<input>` at `selector` to the local
+    /// `path` (CDP `DOM.setFileInputFiles`). Default reports the surface as
+    /// unsupported; only [`RealBrowserRuntime`] overrides it. Backs the gated
+    /// `UploadFile` step.
+    fn set_file_input<'a>(
+        &'a mut self,
+        selector: &'a str,
+        path: &'a str,
+    ) -> BoxFuture<'a, RuntimeResult<()>> {
+        let _ = (selector, path);
+        Box::pin(async { Err(RuntimeError::new(RuntimeFailureKind::Protocol)) })
+    }
 }
 
 /// Production runtime owning exactly one browser and one page for an identity.
@@ -659,6 +672,20 @@ impl BrowserRuntime for RealBrowserRuntime {
         value: &'a str,
     ) -> BoxFuture<'a, RuntimeResult<()>> {
         Box::pin(async move { self.select_option_inner(selector, value).await })
+    }
+
+    fn set_file_input<'a>(
+        &'a mut self,
+        selector: &'a str,
+        path: &'a str,
+    ) -> BoxFuture<'a, RuntimeResult<()>> {
+        Box::pin(async move {
+            let paths = [path.to_owned()];
+            self.page()?
+                .set_input_files(selector, &paths)
+                .await
+                .map_err(|_| RuntimeError::new(RuntimeFailureKind::Interaction))
+        })
     }
 }
 

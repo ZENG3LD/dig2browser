@@ -176,6 +176,22 @@ impl CdpSession {
         Ok(())
     }
 
+    /// Set the files selected by a file `<input>` node (`DOM.setFileInputFiles`).
+    /// `files` are absolute local paths the browser process reads itself; no
+    /// bytes flow through this call.
+    pub async fn set_file_input_files(
+        &self,
+        node_id: i64,
+        files: &[String],
+    ) -> Result<(), CdpError> {
+        self.call(
+            "DOM.setFileInputFiles",
+            Some(json!({ "nodeId": node_id, "files": files })),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Scroll a DOM node into view.
     pub async fn scroll_into_view(&self, node_id: i64) -> Result<(), CdpError> {
         self.call(

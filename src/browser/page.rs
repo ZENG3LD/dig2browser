@@ -112,6 +112,17 @@ impl StealthPage {
         self.backend.set_cookies(&jar.0).await
     }
 
+    /// Set the files selected by the file `<input>` matching `selector`. `paths`
+    /// are local filesystem paths the browser process reads itself.
+    pub async fn set_input_files(
+        &self,
+        selector: &str,
+        paths: &[String],
+    ) -> Result<(), BrowserError> {
+        let element = self.find(selector).await?;
+        self.backend.set_element_files(&element.handle, paths).await
+    }
+
     /// Set extra HTTP headers that will be sent with every request from this page.
     ///
     /// On the CDP backend (Chrome/Edge) this calls `Network.setExtraHTTPHeaders`.

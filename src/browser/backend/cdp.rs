@@ -1786,6 +1786,20 @@ impl PageBackend for CdpPageBackend {
         })
     }
 
+    fn set_element_files<'a>(
+        &'a self,
+        element: &'a ElementHandle,
+        paths: &'a [String],
+    ) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move {
+            let node_id = cdp_node_id(element)?;
+            self.session
+                .set_file_input_files(node_id, paths)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))
+        })
+    }
+
     fn find_elements<'a>(
         &'a self,
         selector: &'a str,

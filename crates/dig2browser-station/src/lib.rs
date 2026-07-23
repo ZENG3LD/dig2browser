@@ -364,6 +364,7 @@ pub enum BrowserTaskStep {
     WaitForLoadState { state: LoadState, timeout: Duration },
     ReadInteractiveElements,
     SelectOption { selector: String, value: String },
+    UploadFile { selector: String, path: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -393,7 +394,8 @@ impl BrowserTask {
                 BrowserTaskStep::ClickSelector { selector }
                 | BrowserTaskStep::ReadSelectorText { selector }
                 | BrowserTaskStep::TypeSelector { selector, .. }
-                | BrowserTaskStep::SelectOption { selector, .. } => {
+                | BrowserTaskStep::SelectOption { selector, .. }
+                | BrowserTaskStep::UploadFile { selector, .. } => {
                     ElementRef::new(selector, 0).map_err(|_| TaskError::InvalidSelector)?;
                 }
                 BrowserTaskStep::WaitForSelector { selector, timeout } => {
@@ -554,7 +556,8 @@ fn task_runtime_requirements(
             BrowserTaskStep::KeyPress { .. } => add(RuntimeFeature::KeyboardInput),
             BrowserTaskStep::ClickSelector { .. }
             | BrowserTaskStep::TypeSelector { .. }
-            | BrowserTaskStep::SelectOption { .. } => {
+            | BrowserTaskStep::SelectOption { .. }
+            | BrowserTaskStep::UploadFile { .. } => {
                 add(RuntimeFeature::DomInspect);
                 add(RuntimeFeature::DomInteract);
             }
@@ -2345,6 +2348,17 @@ impl BrowserLease {
                     .await
                     .map_err(StationError::from)
             }
+            BrowserTaskStep::UploadFile { selector, path } => {
+                let element = self.resolve_task_element(selector).await?;
+                self.slot
+                    .worker
+                    .execute(AgentCommand::UploadFile {
+                        element,
+                        path: path.clone(),
+                    })
+                    .await
+                    .map_err(StationError::from)
+            }
         }
     }
 
@@ -2455,7 +2469,8 @@ impl BrowserLease {
                 }
                 BrowserTaskStep::ClickSelector { .. }
                 | BrowserTaskStep::TypeSelector { .. }
-                | BrowserTaskStep::SelectOption { .. } => &[
+                | BrowserTaskStep::SelectOption { .. }
+                | BrowserTaskStep::UploadFile { .. } => &[
                     Capability::L2(L2Capability::Inspect),
                     Capability::L2(L2Capability::Interact),
                 ],

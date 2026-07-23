@@ -197,6 +197,7 @@ pub struct ServerConfig {
     allow_authenticated_crawl: bool,
     allow_live_events: bool,
     allow_session_import: bool,
+    allow_file_upload: bool,
 }
 
 impl ServerConfig {
@@ -236,6 +237,7 @@ impl ServerConfig {
             allow_authenticated_crawl: false,
             allow_live_events: false,
             allow_session_import: false,
+            allow_file_upload: false,
         })
     }
 
@@ -246,6 +248,11 @@ impl ServerConfig {
 
     pub fn allow_interactive_tasks(mut self, allow: bool) -> Self {
         self.allow_interactive_tasks = allow;
+        self
+    }
+
+    pub fn allow_file_upload(mut self, allow: bool) -> Self {
+        self.allow_file_upload = allow;
         self
     }
 
@@ -524,6 +531,7 @@ async fn run_windows_server(
                         crawl_write: config.allow_crawl_write,
                         live_events: config.allow_live_events,
                         session_import: config.allow_session_import,
+                        file_upload: config.allow_file_upload,
                     },
                 };
                 connections.spawn(async move {
@@ -778,6 +786,7 @@ struct TaskPermissions {
     crawl_write: bool,
     live_events: bool,
     session_import: bool,
+    file_upload: bool,
 }
 
 async fn crawl_request(
@@ -1099,6 +1108,13 @@ async fn collection_request(
                     request,
                     ResponseStatus::Invalid,
                     "scripted tasks disabled",
+                );
+            }
+            if task.requires_file_upload() && !permissions.file_upload {
+                return WorkerResponse::failure(
+                    request,
+                    ResponseStatus::Invalid,
+                    "file upload disabled",
                 );
             }
             let station_task = match to_station_task(task) {
@@ -1577,6 +1593,15 @@ async fn run_task(
             started,
         );
     }
+    if task.requires_file_upload() && !permissions.file_upload {
+        observation.failure(FailureClass::Protocol);
+        return failure(
+            request,
+            ResponseStatus::Invalid,
+            "file upload disabled",
+            started,
+        );
+    }
     let station_task = match to_station_task(task) {
         Ok(task) => task,
         Err(_) => {
@@ -1781,6 +1806,12 @@ fn to_station_task(task: &CollectionTask) -> Result<BrowserTask, crate::TaskErro
                         value: value.clone(),
                     }
                 }
+                TaskStep::UploadFile { selector, path } => {
+                    BrowserTaskStep::UploadFile {
+                        selector: selector.clone(),
+                        path: path.clone(),
+                    }
+                }
             })
             .collect(),
     )
@@ -1809,7 +1840,8 @@ fn task_capabilities(task: &CollectionTask) -> CapabilitySet {
             TaskStep::KeyPress { .. } => add(Capability::L1(L1Capability::Keyboard)),
             TaskStep::ClickSelector { .. }
             | TaskStep::TypeSelector { .. }
-            | TaskStep::SelectOption { .. } => {
+            | TaskStep::SelectOption { .. }
+            | TaskStep::UploadFile { .. } => {
                 add(Capability::L2(L2Capability::Inspect));
                 add(Capability::L2(L2Capability::Interact));
             }

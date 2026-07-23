@@ -31,6 +31,8 @@ pub const MAX_INTERACTIVE_ELEMENTS: usize = 256;
 pub const MAX_ELEMENT_ROLE_BYTES: usize = 64;
 /// Upper bound on an interactive element's accessible `name`.
 pub const MAX_ELEMENT_NAME_BYTES: usize = 1_024;
+/// Upper bound on a local file path carried by an `UploadFile` step.
+pub const MAX_UPLOAD_PATH_BYTES: usize = 4_096;
 const MAX_KEY_BYTES: usize = 64;
 const MAX_TEXT_BYTES: usize = 64 * 1024;
 const MAX_SCRIPT_BYTES: usize = 64 * 1024;
@@ -113,6 +115,15 @@ pub enum TaskStep {
     /// caller's `value` (exactly as `TypeSelector` is parameterized by its text),
     /// never a caller-supplied script.
     SelectOption { selector: String, value: String },
+    /// Set the files selected by the file `<input>` at `selector` to the local
+    /// `path` (CDP `DOM.setFileInputFiles`).
+    ///
+    /// `path` is a **local filesystem path** the station hands to the browser,
+    /// which reads the file itself — the file's bytes never cross IPC (the same
+    /// shape as prepared-session import). Because it lets a page receive an
+    /// arbitrary local file, it sits behind its own default-deny gate
+    /// (`--allow-file-upload`), independent of `--allow-interactive-tasks`.
+    UploadFile { selector: String, path: String },
 }
 
 /// A document load milestone (`document.readyState`), ordered
@@ -245,6 +256,15 @@ impl CollectionTask {
             .any(|step| matches!(step, TaskStep::Evaluate { .. }))
     }
 
+    /// Whether any step uploads a local file (`UploadFile`). Gated separately
+    /// from interaction and script by `--allow-file-upload`, because it lets a
+    /// page receive an arbitrary local file.
+    pub fn requires_file_upload(&self) -> bool {
+        self.steps
+            .iter()
+            .any(|step| matches!(step, TaskStep::UploadFile { .. }))
+    }
+
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.steps.is_empty() || self.steps.len() > MAX_TASK_STEPS {
             return Err(ProtocolError::InvalidTaskPayload);
@@ -326,6 +346,10 @@ impl CollectionTask {
                 TaskStep::SelectOption { selector, value } => {
                     validate_selector(selector)?;
                     validate_text(value, MAX_TEXT_BYTES, false)?;
+                }
+                TaskStep::UploadFile { selector, path } => {
+                    validate_selector(selector)?;
+                    validate_text(path, MAX_UPLOAD_PATH_BYTES, false)?;
                 }
             }
         }
@@ -416,6 +440,11 @@ impl CollectionTask {
                     put_u16_bytes(&mut output, selector.as_bytes())?;
                     put_u32_bytes(&mut output, value.as_bytes())?;
                 }
+                TaskStep::UploadFile { selector, path } => {
+                    output.push(14);
+                    put_u16_bytes(&mut output, selector.as_bytes())?;
+                    put_u16_bytes(&mut output, path.as_bytes())?;
+                }
             }
         }
         if output.len() > MAX_REQUEST_BYTES {
@@ -485,6 +514,10 @@ impl CollectionTask {
                 13 => TaskStep::SelectOption {
                     selector: input.utf8_u16()?,
                     value: input.utf8_u32()?,
+                },
+                14 => TaskStep::UploadFile {
+                    selector: input.utf8_u16()?,
+                    path: input.utf8_u16()?,
                 },
                 _ => return Err(ProtocolError::InvalidTaskPayload),
             };
@@ -1582,6 +1615,36 @@ mod tests {
             TaskStep::SelectOption {
                 selector: "#country".to_owned(),
                 value: String::new(),
+            },
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn upload_file_round_trips_and_is_gated_separately() {
+        let task = CollectionTask::new(vec![
+            navigate_step(),
+            TaskStep::UploadFile {
+                selector: "#file".to_owned(),
+                path: "C:/tmp/report.pdf".to_owned(),
+            },
+        ])
+        .expect("valid task");
+
+        let encoded = task.encode_payload().expect("encode task");
+        let decoded = CollectionTask::decode_payload(&encoded).expect("decode task");
+        assert_eq!(decoded, task);
+        // File upload has its own gate — not folded into interaction or script.
+        assert!(task.requires_file_upload());
+        assert!(!task.requires_interaction());
+        assert!(!task.requires_script());
+
+        // An empty path is rejected.
+        assert!(CollectionTask::new(vec![
+            navigate_step(),
+            TaskStep::UploadFile {
+                selector: "#file".to_owned(),
+                path: String::new(),
             },
         ])
         .is_err());

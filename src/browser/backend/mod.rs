@@ -112,6 +112,23 @@ pub trait PageBackend: Send + Sync {
         element: &'a ElementHandle,
     ) -> BoxFuture<'a, Result<BoundingBox, BrowserError>>;
 
+    /// Set the files selected by a file `<input>` element
+    /// (`DOM.setFileInputFiles`). `paths` are local filesystem paths the browser
+    /// process reads itself — no bytes cross this call. Default: unsupported;
+    /// only the CDP backend implements it.
+    fn set_element_files<'a>(
+        &'a self,
+        element: &'a ElementHandle,
+        paths: &'a [String],
+    ) -> BoxFuture<'a, Result<(), BrowserError>> {
+        let _ = (element, paths);
+        Box::pin(async {
+            Err(BrowserError::Other(
+                "file input is not supported by this backend".to_owned(),
+            ))
+        })
+    }
+
     // ── PDF ───────────────────────────────────────────────────────────────
 
     /// Print the page as a PDF and return the raw bytes.

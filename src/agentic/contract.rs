@@ -239,6 +239,13 @@ pub enum AgentCommand {
         element: ElementRef,
         value: String,
     },
+    /// Set the files a file `<input>` element has selected, by local path (CDP
+    /// `DOM.setFileInputFiles`). The browser reads the file itself; no bytes
+    /// cross IPC. Backs the gated `UploadFile` task step.
+    UploadFile {
+        element: ElementRef,
+        path: String,
+    },
     ReadElementText {
         element: ElementRef,
     },
@@ -283,7 +290,8 @@ impl AgentCommand {
             | Self::ReadInteractiveElements => Capability::L2(L2Capability::Inspect),
             Self::ClickElement { .. }
             | Self::TypeElement { .. }
-            | Self::SelectOption { .. } => Capability::L2(L2Capability::Interact),
+            | Self::SelectOption { .. }
+            | Self::UploadFile { .. } => Capability::L2(L2Capability::Interact),
             Self::Evaluate { .. } => Capability::L2(L2Capability::Evaluate),
             Self::Navigate { .. } => Capability::L3(L3Capability::Navigate),
             Self::Capture { .. } => Capability::L3(L3Capability::Capture),

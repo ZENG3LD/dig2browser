@@ -23,6 +23,7 @@ const MAX_KEY_BYTES: usize = 64;
 const MAX_TEXT_BYTES: usize = 64 * 1024;
 const MAX_SCRIPT_BYTES: usize = 64 * 1024;
 const MAX_SCRIPT_RESULT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_UPLOAD_PATH_BYTES: usize = 4 * 1024;
 const MAX_IMPORT_COOKIES: usize = 512;
 const MAX_COOKIE_NAME_BYTES: usize = 4 * 1024;
 const MAX_COOKIE_VALUE_BYTES: usize = 8 * 1024;
@@ -708,6 +709,16 @@ async fn handle_command(
             }
             runtime
                 .select_option(element.selector(), &value)
+                .await
+                .map(|_| AgentReply::Acknowledged)
+        }
+        AgentCommand::UploadFile { element, path } => {
+            validate_element_epoch(&element, snapshot.page_epoch)?;
+            if path.is_empty() || path.len() > MAX_UPLOAD_PATH_BYTES || path.contains('\0') {
+                return Err(WorkerError::InvalidInput);
+            }
+            runtime
+                .set_file_input(element.selector(), &path)
                 .await
                 .map(|_| AgentReply::Acknowledged)
         }

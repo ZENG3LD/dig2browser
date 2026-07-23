@@ -234,6 +234,12 @@ struct Cli {
         help = "Allow importing a prepared session from a local file into an authenticated profile (cookie bytes are read locally, never over the pipe)"
     )]
     allow_session_import: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Allow an UploadFile task step to set a file <input> from a local path (the browser reads the file; bytes never cross the pipe)"
+    )]
+    allow_file_upload: bool,
 }
 
 #[cfg(windows)]
@@ -521,7 +527,8 @@ async fn run(cli: Cli) -> Result<DaemonReport, DaemonError> {
         .allow_crawl_write(cli.allow_crawl_write)
         .allow_authenticated_crawl(cli.allow_authenticated_crawl)
         .allow_live_events(cli.allow_live_events)
-        .allow_session_import(cli.allow_session_import);
+        .allow_session_import(cli.allow_session_import)
+        .allow_file_upload(cli.allow_file_upload);
         if let Some(trace_root) = cli.trace_root {
             server_config = server_config.trace_root(trace_root)?;
         }
