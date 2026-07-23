@@ -255,6 +255,10 @@ ws.onmessage=(event)=>{{document.title='ws-recv';}};\
             "persona-probe" => "<pre id=\"persona-probe-output\"></pre>",
             "interactive-elements" => "<button id=\"go\">Sign in</button><a href=\"/next\" id=\"next-link\">Next page</a><input id=\"q\" name=\"query\" placeholder=\"Search\">",
             "select-form" => "<select id=\"country\"><option value=\"\">--</option><option value=\"US\">United States</option><option value=\"DE\">Germany</option></select><span id=\"chosen\">none</span><script>document.getElementById('country').addEventListener('change',function(e){document.getElementById('chosen').textContent='chosen:'+e.target.value;});</script>",
+            // A confirm() fired during load: without the engine's dialog
+            // auto-handler this blocks the load event and hangs the navigation.
+            // The handler cancels it, so confirm() returns false and #out is set.
+            "dialog-confirm" => "<span id=\"out\">pending</span><script>document.getElementById('out').textContent='confirm:'+confirm('proceed?');</script>",
             _ => "",
         }
     );
@@ -1860,6 +1864,77 @@ async fn stationd_select_option_chooses_and_fires_change_e2e() {
     assert!(status.success(), "select station failed: {status}");
     let (_, stderr) = read_child_output(&mut daemon).await;
     assert!(stderr.is_empty(), "clean select station wrote stderr: {stderr}");
+    remove_tree(&profiles).await;
+}
+
+// A.4.2 acceptance: the engine's always-on JavaScript-dialog auto-handler keeps
+// a page's dialog from ever blocking the renderer. The fixture calls confirm()
+// during load — without the handler this blocks the load event and the
+// navigation hangs to timeout; with it the confirm is cancelled (returns false),
+// load completes, and the recorded answer is readable. Proves both that the task
+// is not stalled AND that the cancel policy (confirm -> false) took effect, with
+// no task step and no gate — it is engine-internal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stationd_javascript_dialog_never_blocks_a_task_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-stationd-dialog-e2e-{unique}");
+    let profiles = e2e_temp_base().join(format!(
+        "dig2browser-stationd-dialog-e2e-{unique}"
+    ));
+    std::fs::create_dir_all(&profiles).expect("create dialog profiles root");
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+    let mut daemon = spawn_stationd(stationd, &pipe_name, &profiles);
+
+    let client = StationClient::connect(
+        ClientConfig::new(&pipe_name, Duration::from_secs(15), Duration::from_secs(90))
+            .expect("valid dialog client config"),
+    )
+    .await
+    .expect("connect dialog station client");
+
+    let url = fixture.url("/dialog-confirm");
+    let task = CollectionTask::new(vec![
+        TaskStep::Navigate { url: url.clone() },
+        TaskStep::ReadSelectorText {
+            selector: "#out".to_owned(),
+        },
+    ])
+    .expect("valid dialog task");
+    let mut result = None;
+    for attempt in 0..8 {
+        match client.run_task("dialog-profile", task.clone()).await {
+            Ok(value) => {
+                result = Some(value);
+                break;
+            }
+            Err(ClientError::Remote {
+                status: ResponseStatus::Unavailable,
+                ..
+            }) if attempt < 7 => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            other => panic!("dialog task failed: {other:?}"),
+        }
+    }
+    let result = result.expect("dialog task after retries");
+    assert_eq!(result.replies().len(), 2);
+    // The navigation completed (not hung) AND the confirm was cancelled.
+    assert_eq!(
+        result.replies()[1],
+        TaskReply::Text("confirm:false".to_owned()),
+        "dialog was not auto-handled (or not cancelled)"
+    );
+
+    client.shutdown().await.expect("request dialog station drain");
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("dialog station exit timeout")
+        .expect("wait for dialog station");
+    assert!(status.success(), "dialog station failed: {status}");
+    let (_, stderr) = read_child_output(&mut daemon).await;
+    assert!(stderr.is_empty(), "clean dialog station wrote stderr: {stderr}");
     remove_tree(&profiles).await;
 }
 

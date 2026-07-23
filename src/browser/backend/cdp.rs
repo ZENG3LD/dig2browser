@@ -553,6 +553,9 @@ impl CdpBrowserBackend {
             .await
             .map_err(|e| BrowserError::Connect(e.to_string()))?;
 
+        // Never let a page dialog block the (already running) renderer.
+        let dialog_task = spawn_dialog_auto_handler(&session);
+
         self.page_count.fetch_add(1, Ordering::Relaxed);
 
         Ok(CdpPageBackend::new(
@@ -561,6 +564,7 @@ impl CdpBrowserBackend {
             Arc::clone(&self.exact_policy_claimed),
             Arc::clone(&self.browser_closing),
             None,
+            dialog_task,
         ))
     }
 
@@ -965,6 +969,11 @@ impl CdpBrowserBackend {
             .await
             .map_err(|e| BrowserError::Connect(e.to_string()))?;
 
+        // Answer JavaScript dialogs from now on — before navigate, so a dialog
+        // fired during page load (which would block the load event and hang the
+        // navigation) is handled rather than stalling the task.
+        let dialog_task = spawn_dialog_auto_handler(&session);
+
         // ── CDP-native stealth overrides ──────────────────────────────────────
         // These run at the protocol level and are more reliable than JS patching:
         // they survive property-descriptor inspection and also affect HTTP headers.
@@ -1042,6 +1051,7 @@ impl CdpBrowserBackend {
             Arc::clone(&self.exact_policy_claimed),
             Arc::clone(&self.browser_closing),
             self._process_tree.as_ref().map(Arc::clone),
+            dialog_task,
         ))
     }
 }
@@ -1529,6 +1539,10 @@ pub(crate) struct CdpPageBackend {
     exact_policy_claimed: Arc<AtomicBool>,
     browser_closing: Arc<AtomicBool>,
     owned_process_tree: Option<Arc<OwnedProcessTree>>,
+    /// Always-on handler answering this page's JavaScript dialogs so an
+    /// unanswered `alert`/`confirm`/`prompt`/`beforeunload` can never block the
+    /// renderer. Aborted on drop.
+    dialog_task: JoinHandle<()>,
 }
 
 impl CdpPageBackend {
@@ -1538,6 +1552,7 @@ impl CdpPageBackend {
         exact_policy_claimed: Arc<AtomicBool>,
         browser_closing: Arc<AtomicBool>,
         owned_process_tree: Option<Arc<OwnedProcessTree>>,
+        dialog_task: JoinHandle<()>,
     ) -> Self {
         Self {
             session,
@@ -1547,6 +1562,7 @@ impl CdpPageBackend {
             exact_policy_claimed,
             browser_closing,
             owned_process_tree,
+            dialog_task,
         }
     }
 }
@@ -2710,9 +2726,54 @@ fn modifiers_to_mask(modifiers: &[&str]) -> u32 {
 impl Drop for CdpPageBackend {
     fn drop(&mut self) {
         let _target_id = &self.target_id;
+        // Stop the dialog auto-handler; its session is going away.
+        self.dialog_task.abort();
         // Could send Target.closeTarget here, but it requires an async context.
         // The browser will GC detached targets automatically.
     }
+}
+
+/// Spawn an always-on handler that answers this session's JavaScript dialogs so
+/// a page's `alert`/`confirm`/`prompt`/`beforeunload` can never block the
+/// renderer (an unanswered dialog stalls JS, hanging navigation, eval, and
+/// capture). Policy: cancel the dialogs that offer a Cancel button
+/// (`confirm`/`prompt`) — the safe non-action — and acknowledge the rest
+/// (`alert` = OK, `beforeunload` = leave, so the engine's own navigations are
+/// not blocked). No prompt text is supplied. This is what lets an agent work a
+/// dialog-popping page without an `Evaluate` to neutralize the dialogs, and it
+/// is scoped to this session by `session_id` so it never answers another page's
+/// dialog.
+fn spawn_dialog_auto_handler(session: &CdpSession) -> JoinHandle<()> {
+    let responder = session.clone();
+    let my_session_id = session.session_id().map(str::to_owned);
+    let mut events = session.client().subscribe();
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(event) => {
+                    if event.method != "Page.javascriptDialogOpening"
+                        || event.session_id.as_deref() != my_session_id.as_deref()
+                    {
+                        continue;
+                    }
+                    let dialog_type = event
+                        .params
+                        .as_ref()
+                        .and_then(|params| params["type"].as_str())
+                        .unwrap_or_default();
+                    let accept = !matches!(dialog_type, "confirm" | "prompt");
+                    let _ = responder
+                        .call(
+                            "Page.handleJavaScriptDialog",
+                            Some(serde_json::json!({ "accept": accept })),
+                        )
+                        .await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            }
+        }
+    })
 }
 
 #[cfg(all(test, windows))]
