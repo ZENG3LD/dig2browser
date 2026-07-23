@@ -1670,7 +1670,23 @@ impl BrowserStation {
             return Err(StationError::ShuttingDown);
         }
         let count = u32::try_from(cookies.len()).unwrap_or(u32::MAX);
-        // Needs Interact to install cookies; Lifecycle to hold the worker.
+        // A prepared session is meant to persist: give any cookie without its own
+        // expiry the session TTL, so it is a *persistent* cookie Chrome writes to
+        // the on-disk store (a session cookie — no expiry — is RAM-only by browser
+        // design and could never be durable).
+        let default_expiry_unix = i64::try_from(unix_time_ms() / 1_000)
+            .unwrap_or(i64::MAX)
+            .saturating_add(i64::from(session_ttl_seconds));
+        let cookies: Vec<CookieSpec> = cookies
+            .into_iter()
+            .map(|mut cookie| {
+                if cookie.expires_unix.is_none() {
+                    cookie.expires_unix = Some(default_expiry_unix);
+                }
+                cookie
+            })
+            .collect();
+        // Needs Interact to install cookies; Lifecycle to restart the worker.
         let capabilities = CapabilitySet::new([
             Capability::L2(L2Capability::Interact),
             Capability::L3(L3Capability::Lifecycle),
@@ -1680,6 +1696,12 @@ impl BrowserStation {
         lease
             .execute(AgentCommand::SetCookies { cookies })
             .await?;
+        // Restart the browser on the same profile: the graceful close flushes the
+        // persistent cookies to the on-disk store and the relaunch reloads them
+        // from disk — so the imported session is durable on return (survives worker
+        // eviction, a fresh lease, or a station restart), not merely resident in
+        // the live worker's memory.
+        lease.execute(AgentCommand::Restart).await?;
         drop(lease);
         let expires_at_unix_ms = unix_time_ms()
             .checked_add(u64::from(session_ttl_seconds) * 1_000)

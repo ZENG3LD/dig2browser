@@ -1150,8 +1150,10 @@ async fn in_process_station_chrome_auth_cookie_reuse_e2e() {
 }
 
 // Phase B.1c acceptance: a prepared session imported from cookie material is
-// installed into the profile and transmitted by the browser on a later
-// authenticated navigation — without any headful login.
+// installed durably into the profile and transmitted by the browser on a later
+// authenticated navigation — without any headful login. import_session restarts
+// the browser internally (flush to disk + reload), so a passing check proves the
+// cookie survived a disk round-trip, i.e. it is durable, not merely RAM-resident.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn in_process_station_chrome_session_import_reuse_e2e() {
     let _serial = e2e_serial_guard().await;
