@@ -1,5 +1,9 @@
 //! Crash-safe trace event and content-addressed artifact storage.
 
+mod journal;
+
+pub use journal::MonitorJournal;
+
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -800,7 +804,7 @@ fn hex_digit(value: u8) -> Option<u8> {
     }
 }
 
-fn unix_time_ms() -> Result<u64, LedgerError> {
+pub(crate) fn unix_time_ms() -> Result<u64, LedgerError> {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| LedgerError::Corrupt("system clock precedes the Unix epoch"))?
@@ -809,7 +813,7 @@ fn unix_time_ms() -> Result<u64, LedgerError> {
 }
 
 #[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<(), LedgerError> {
+pub(crate) fn sync_directory(path: &Path) -> Result<(), LedgerError> {
     File::open(path)?.sync_all()?;
     Ok(())
 }
@@ -825,7 +829,7 @@ fn durable_rename(source: &Path, destination: &Path) -> Result<(), LedgerError> 
 }
 
 #[cfg(windows)]
-fn sync_directory(path: &Path) -> Result<(), LedgerError> {
+pub(crate) fn sync_directory(path: &Path) -> Result<(), LedgerError> {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
 

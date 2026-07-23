@@ -7,6 +7,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 mod crawl;
 mod identity;
 mod live;
+mod monitor;
 mod session;
 mod task;
 mod trace;
@@ -26,6 +27,10 @@ pub use live::{
     MAX_LIVE_CONSOLE_TEXT_BYTES, MAX_LIVE_EVENTS, MAX_LIVE_METHOD_BYTES,
     MAX_LIVE_NETWORK_PARAMS_BYTES, MAX_LIVE_SSE_EVENT_TYPE_BYTES,
     MAX_LIVE_SSE_ID_BYTES, MAX_LIVE_URL_BYTES,
+};
+pub use monitor::{
+    MonitorCursor, MonitorEvent, MonitorEventKind, MonitorFrame, MonitorStopReason,
+    MAX_MONITOR_EVENT_BYTES, MAX_MONITOR_URL_BYTES,
 };
 pub use session::{
     IdentitySessionStatus, ProfileClass, SessionHealthProbe, SessionPhase,
@@ -1856,6 +1861,7 @@ pub enum ProtocolError {
     InvalidCollectionPayload,
     InvalidCrawlPayload,
     InvalidLivePayload,
+    InvalidMonitorPayload,
 }
 
 impl std::fmt::Display for ProtocolError {
@@ -1877,6 +1883,9 @@ impl std::fmt::Display for ProtocolError {
             }
             Self::InvalidCrawlPayload => write!(formatter, "crawl payload is invalid"),
             Self::InvalidLivePayload => write!(formatter, "live event payload is invalid"),
+            Self::InvalidMonitorPayload => {
+                write!(formatter, "monitor event payload is invalid")
+            }
         }
     }
 }
