@@ -15,17 +15,62 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use dig2browser::agentic::{AgentCommand, CapabilitySet};
 use dig2browser::browser::{ConsoleEvent, DevToolsEvent, NetworkEvent, PageDevTools};
 use dig2browser_protocol::{
     BrowserPersona, LiveCursor, LiveEvent, LiveEventKind, LiveEventPage, LiveFilter,
-    LiveRequest, LiveResponse, LiveSessionId, LiveTarget, ProfileClass, MAX_LIVE_CONSOLE_LEVEL_BYTES,
+    LiveRequest, LiveResponse, LiveSessionId, LiveTarget, ProfileClass, SseEvent,
+    WebSocketDirection, WebSocketFrame, WebSocketOpcode, MAX_LIVE_CONSOLE_LEVEL_BYTES,
     MAX_LIVE_CONSOLE_TEXT_BYTES, MAX_LIVE_EVENTS, MAX_LIVE_METHOD_BYTES,
-    MAX_LIVE_NETWORK_PARAMS_BYTES, MAX_LIVE_URL_BYTES,
+    MAX_LIVE_NETWORK_PARAMS_BYTES, MAX_LIVE_SSE_EVENT_TYPE_BYTES, MAX_LIVE_SSE_ID_BYTES,
+    MAX_LIVE_URL_BYTES,
 };
 use tokio::task::JoinHandle;
 
 use crate::{BrowserLease, BrowserStation, IdentityRequest, StationError};
+
+/// Bounded cache of `requestId -> url` learned from `Network.*` events that
+/// do carry a URL (`webSocketCreated`, `requestWillBeSent`,
+/// `responseReceived`, ...), used to backfill `url` on frame-only events
+/// (`webSocketFrameSent/Received`, `eventSourceMessageReceived`) that CDP
+/// does not repeat it on. Bounded and drop-oldest like the event ring —
+/// this is a best-effort correlation aid, not a durable index, so losing an
+/// old entry under sustained load is an accepted, honest trade-off (the
+/// frame's `url` simply reads back as `None` for still-open requests whose
+/// creation event fell out of the cache).
+const MAX_LIVE_REQUEST_URL_ENTRIES: usize = 128;
+
+struct RequestUrlCache {
+    urls: HashMap<String, String>,
+    order: VecDeque<String>,
+}
+
+impl RequestUrlCache {
+    fn new() -> Self {
+        Self {
+            urls: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn remember(&mut self, request_id: &str, url: &str) {
+        if self.urls.contains_key(request_id) {
+            return;
+        }
+        if self.order.len() >= MAX_LIVE_REQUEST_URL_ENTRIES {
+            if let Some(oldest) = self.order.pop_front() {
+                self.urls.remove(&oldest);
+            }
+        }
+        self.urls.insert(request_id.to_owned(), url.to_owned());
+        self.order.push_back(request_id.to_owned());
+    }
+
+    fn lookup(&self, request_id: &str) -> Option<String> {
+        self.urls.get(request_id).cloned()
+    }
+}
 
 /// Station-wide concurrent live-session cap. Bounds worst-case retained
 /// memory alongside `MAX_LIVE_RING_CAPACITY` (each session's ring can hold
@@ -69,6 +114,7 @@ struct LiveSession {
     stopped: AtomicBool,
     sequence: AtomicU64,
     last_touched_ms: AtomicU64,
+    request_urls: StdMutex<RequestUrlCache>,
 }
 
 struct Ring {
@@ -200,6 +246,7 @@ impl LiveCaptureManager {
             stopped: AtomicBool::new(false),
             sequence: AtomicU64::new(0),
             last_touched_ms: AtomicU64::new(unix_time_ms()),
+            request_urls: StdMutex::new(RequestUrlCache::new()),
         });
         let reader_session = Arc::clone(&session);
         let reader = tokio::spawn(async move { run_reader(reader_session, devtools).await });
@@ -326,15 +373,22 @@ async fn run_reader(session: Arc<LiveSession>, mut devtools: PageDevTools) {
 }
 
 fn translate_event(session: &LiveSession, event: DevToolsEvent) -> Option<LiveEvent> {
+    let now = unix_time_ms();
     let kind = match event {
         DevToolsEvent::Network(network) => {
+            // Learn requestId -> url from every Network event that carries
+            // one, regardless of the active filter, so frame-only events
+            // (which never carry a url themselves) can still be backfilled
+            // even under `websocket_only` (which would otherwise filter out
+            // the correlating `requestWillBeSent`/`responseReceived` event).
+            remember_request_url(session, &network);
             if !session.filter.network() {
                 return None;
             }
             if session.filter.websocket_only() && !is_websocket_or_sse(&network.method) {
                 return None;
             }
-            network_event_kind(network)
+            resolve_network_kind(session, network, now)
         }
         DevToolsEvent::Console(console) => {
             if !session.filter.console() {
@@ -344,7 +398,29 @@ fn translate_event(session: &LiveSession, event: DevToolsEvent) -> Option<LiveEv
         }
     };
     let cursor = LiveCursor::new(session.sequence.fetch_add(1, Ordering::AcqRel) + 1);
-    LiveEvent::new(cursor, unix_time_ms(), kind).ok()
+    LiveEvent::new(cursor, now, kind).ok()
+}
+
+/// Route a `Network.*` event to a typed kind for the two frame-bearing
+/// WebSocket methods and the one SSE method; every other method (including
+/// WS metadata events like `webSocketCreated`/`webSocketClosed`) keeps the
+/// existing generic `Network` shape. Typed parsing itself is best-effort:
+/// if the expected CDP params shape is missing or malformed, this falls
+/// back to the generic kind rather than dropping the event.
+fn resolve_network_kind(session: &LiveSession, network: NetworkEvent, now: u64) -> LiveEventKind {
+    match network.method.as_str() {
+        "Network.webSocketFrameSent" => {
+            parse_websocket_frame(session, &network, WebSocketDirection::Sent, now)
+                .unwrap_or_else(|| network_event_kind(network))
+        }
+        "Network.webSocketFrameReceived" => {
+            parse_websocket_frame(session, &network, WebSocketDirection::Received, now)
+                .unwrap_or_else(|| network_event_kind(network))
+        }
+        "Network.eventSourceMessageReceived" => parse_sse_event(session, &network, now)
+            .unwrap_or_else(|| network_event_kind(network)),
+        _ => network_event_kind(network),
+    }
 }
 
 fn network_event_kind(network: NetworkEvent) -> LiveEventKind {
@@ -358,6 +434,99 @@ fn network_event_kind(network: NetworkEvent) -> LiveEventKind {
     }
 }
 
+/// Parse `Network.webSocketFrameSent/Received` params
+/// (`{requestId, timestamp, response: {opcode, mask, payloadData}}`) into a
+/// typed frame. Per the CDP `Network.WebSocketFrame` type, `payloadData` is
+/// the literal UTF-8 text when `opcode == 1` (text) and base64-encoded raw
+/// bytes for every other opcode. Returns `None` — asking the caller to fall
+/// back to the generic `Network` kind — if `opcode`/`payloadData` are
+/// missing or the opcode is not one of the six RFC 6455 values a real frame
+/// can carry.
+fn parse_websocket_frame(
+    session: &LiveSession,
+    network: &NetworkEvent,
+    direction: WebSocketDirection,
+    now: u64,
+) -> Option<LiveEventKind> {
+    let response = network.params.get("response")?;
+    let opcode_raw = u8::try_from(response.get("opcode")?.as_u64()?).ok()?;
+    let opcode = WebSocketOpcode::from_rfc6455(opcode_raw)?;
+    let payload_text = response.get("payloadData")?.as_str()?;
+    let (payload, truncated) = decode_websocket_payload(opcode, payload_text);
+    let url = resolve_request_url(session, network);
+    WebSocketFrame::new(direction, opcode, payload, truncated, now, url)
+        .ok()
+        .map(LiveEventKind::WebSocketFrame)
+}
+
+/// Parse `Network.eventSourceMessageReceived` params
+/// (`{requestId, timestamp, eventName, eventId, data}`) into a typed SSE
+/// event. `eventName`/`eventId` are mapped from CDP's empty-string
+/// "unset" convention to `None`. Returns `None` (generic-kind fallback) if
+/// `data` is missing.
+fn parse_sse_event(session: &LiveSession, network: &NetworkEvent, now: u64) -> Option<LiveEventKind> {
+    let data = network.params.get("data")?.as_str()?;
+    let (data, truncated) = if data.len() > MAX_LIVE_NETWORK_PARAMS_BYTES {
+        (truncate_text_payload(data, MAX_LIVE_NETWORK_PARAMS_BYTES), true)
+    } else {
+        (data.as_bytes().to_vec(), false)
+    };
+    let event_type = network
+        .params
+        .get("eventName")
+        .and_then(|value| value.as_str())
+        .filter(|name| !name.is_empty())
+        .map(|name| bounded_string(name, MAX_LIVE_SSE_EVENT_TYPE_BYTES));
+    let id = network
+        .params
+        .get("eventId")
+        .and_then(|value| value.as_str())
+        .filter(|id| !id.is_empty())
+        .map(|id| bounded_string(id, MAX_LIVE_SSE_ID_BYTES));
+    let url = resolve_request_url(session, network);
+    SseEvent::new(event_type, data, truncated, id, now, url)
+        .ok()
+        .map(LiveEventKind::SseEvent)
+}
+
+/// Decode a CDP `WebSocketFrame.payloadData` string per its documented
+/// opcode-dependent encoding, bounding the result to
+/// `MAX_LIVE_NETWORK_PARAMS_BYTES` (truncated, not dropped).
+fn decode_websocket_payload(opcode: WebSocketOpcode, payload_text: &str) -> (Vec<u8>, bool) {
+    if opcode == WebSocketOpcode::Text {
+        if payload_text.len() > MAX_LIVE_NETWORK_PARAMS_BYTES {
+            (
+                truncate_text_payload(payload_text, MAX_LIVE_NETWORK_PARAMS_BYTES),
+                true,
+            )
+        } else {
+            (payload_text.as_bytes().to_vec(), false)
+        }
+    } else {
+        let mut bytes = BASE64_STANDARD
+            .decode(payload_text)
+            .unwrap_or_else(|_| payload_text.as_bytes().to_vec());
+        if bytes.len() > MAX_LIVE_NETWORK_PARAMS_BYTES {
+            bytes.truncate(MAX_LIVE_NETWORK_PARAMS_BYTES);
+            (bytes, true)
+        } else {
+            (bytes, false)
+        }
+    }
+}
+
+/// Truncate `text` to at most `max_len` bytes at a UTF-8 char boundary.
+/// Unlike [`bounded_string`], this does not strip embedded NUL bytes — it
+/// bounds a WebSocket/SSE payload, not a protocol string field, so payload
+/// content must not be altered beyond the truncation point itself.
+fn truncate_text_payload(text: &str, max_len: usize) -> Vec<u8> {
+    let mut boundary = text.len().min(max_len);
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    text.as_bytes()[..boundary].to_vec()
+}
+
 fn console_event_kind(console: ConsoleEvent) -> LiveEventKind {
     LiveEventKind::Console {
         level: bounded_string(&console.level, MAX_LIVE_CONSOLE_LEVEL_BYTES),
@@ -367,6 +536,33 @@ fn console_event_kind(console: ConsoleEvent) -> LiveEventKind {
 
 fn is_websocket_or_sse(method: &str) -> bool {
     method.starts_with("Network.webSocket") || method.starts_with("Network.eventSource")
+}
+
+/// Cache `requestId -> url` from a `Network.*` event that carries one, best
+/// effort (a poisoned mutex is treated as "nothing learned").
+fn remember_request_url(session: &LiveSession, network: &NetworkEvent) {
+    let (Some(url), Some(request_id)) = (&network.url, network.params.get("requestId").and_then(|v| v.as_str())) else {
+        return;
+    };
+    if let Ok(mut cache) = session.request_urls.lock() {
+        cache.remember(request_id, url);
+    }
+}
+
+/// Resolve a frame-only event's url: the event's own url if CDP happened to
+/// set one, else a lookup by `requestId` in the session's correlation
+/// cache, else `None`.
+fn resolve_request_url(session: &LiveSession, network: &NetworkEvent) -> Option<String> {
+    if let Some(url) = &network.url {
+        return Some(bounded_string(url, MAX_LIVE_URL_BYTES));
+    }
+    let request_id = network.params.get("requestId").and_then(|value| value.as_str())?;
+    session
+        .request_urls
+        .lock()
+        .ok()
+        .and_then(|cache| cache.lookup(request_id))
+        .map(|url| bounded_string(&url, MAX_LIVE_URL_BYTES))
 }
 
 fn push_event(session: &LiveSession, event: LiveEvent) {
@@ -436,4 +632,79 @@ pub enum LiveError {
     Protocol(#[from] dig2browser_protocol::ProtocolError),
     #[error(transparent)]
     Station(#[from] StationError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_opcode_payload_is_literal_utf8_bytes() {
+        let (payload, truncated) = decode_websocket_payload(WebSocketOpcode::Text, "hello");
+        assert_eq!(payload, b"hello");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn binary_opcode_payload_is_base64_decoded() {
+        let encoded = BASE64_STANDARD.encode([0xDE, 0xAD, 0xBE, 0xEF]);
+        let (payload, truncated) = decode_websocket_payload(WebSocketOpcode::Binary, &encoded);
+        assert_eq!(payload, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn binary_opcode_falls_back_to_raw_bytes_when_not_valid_base64() {
+        let (payload, truncated) = decode_websocket_payload(WebSocketOpcode::Binary, "not-base64!!");
+        assert_eq!(payload, b"not-base64!!");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn oversized_payload_is_truncated_with_the_flag_set() {
+        let text = "x".repeat(MAX_LIVE_NETWORK_PARAMS_BYTES + 16);
+        let (payload, truncated) = decode_websocket_payload(WebSocketOpcode::Text, &text);
+        assert_eq!(payload.len(), MAX_LIVE_NETWORK_PARAMS_BYTES);
+        assert!(truncated);
+
+        let binary = BASE64_STANDARD.encode(vec![7_u8; MAX_LIVE_NETWORK_PARAMS_BYTES + 16]);
+        let (payload, truncated) = decode_websocket_payload(WebSocketOpcode::Binary, &binary);
+        assert_eq!(payload.len(), MAX_LIVE_NETWORK_PARAMS_BYTES);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn text_payload_truncation_snaps_to_a_char_boundary_and_keeps_nul() {
+        // 3-byte UTF-8 char ('€') straddling the requested cut point.
+        let text = format!("{}€", "a".repeat(4));
+        let truncated = truncate_text_payload(&text, 5);
+        assert!(std::str::from_utf8(&truncated).is_ok());
+        assert_eq!(truncated, b"aaaa");
+
+        // Unlike `bounded_string`, payload truncation must not strip NUL —
+        // it bounds arbitrary content, not a protocol string field.
+        let with_nul = "a\0b";
+        let kept = truncate_text_payload(with_nul, with_nul.len());
+        assert_eq!(kept, b"a\0b");
+    }
+
+    #[test]
+    fn request_url_cache_remembers_first_url_and_evicts_oldest_over_capacity() {
+        let mut cache = RequestUrlCache::new();
+        cache.remember("req-1", "https://example.test/first");
+        // A later url for the same requestId does not overwrite the first.
+        cache.remember("req-1", "https://example.test/second");
+        assert_eq!(
+            cache.lookup("req-1").as_deref(),
+            Some("https://example.test/first")
+        );
+
+        for index in 0..MAX_LIVE_REQUEST_URL_ENTRIES {
+            cache.remember(&format!("bulk-{index}"), "https://example.test/bulk");
+        }
+        // The very first entry (`req-1`) must have been evicted once the
+        // cache exceeded its bound.
+        assert_eq!(cache.lookup("req-1"), None);
+        assert!(cache.lookup(&format!("bulk-{}", MAX_LIVE_REQUEST_URL_ENTRIES - 1)).is_some());
+    }
 }

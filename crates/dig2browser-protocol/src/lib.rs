@@ -21,9 +21,11 @@ pub use crawl::{
 pub use identity::{BrowserPersona, MobilePersonaConfig, PersonaKind};
 pub use live::{
     LiveCursor, LiveEvent, LiveEventKind, LiveEventPage, LiveFilter, LiveRequest,
-    LiveResponse, LiveSessionId, LiveTarget, MAX_LIVE_CONSOLE_LEVEL_BYTES,
+    LiveResponse, LiveSessionId, LiveTarget, SseEvent, WebSocketDirection,
+    WebSocketFrame, WebSocketOpcode, MAX_LIVE_CONSOLE_LEVEL_BYTES,
     MAX_LIVE_CONSOLE_TEXT_BYTES, MAX_LIVE_EVENTS, MAX_LIVE_METHOD_BYTES,
-    MAX_LIVE_NETWORK_PARAMS_BYTES, MAX_LIVE_URL_BYTES,
+    MAX_LIVE_NETWORK_PARAMS_BYTES, MAX_LIVE_SSE_EVENT_TYPE_BYTES,
+    MAX_LIVE_SSE_ID_BYTES, MAX_LIVE_URL_BYTES,
 };
 pub use session::{
     IdentitySessionStatus, ProfileClass, SessionHealthProbe, SessionPhase,

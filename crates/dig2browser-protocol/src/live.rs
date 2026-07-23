@@ -34,6 +34,14 @@ pub const MAX_LIVE_CONSOLE_TEXT_BYTES: usize = 4 * 1024;
 /// rather than the whole event being dropped, so method/url/status metadata
 /// is never lost even when a payload tail is cut.
 pub const MAX_LIVE_NETWORK_PARAMS_BYTES: usize = 64 * 1024;
+/// SSE `event:` field bound (`Network.eventSourceMessageReceived.eventName`).
+/// SSE event-type tokens are short, application-defined identifiers, not
+/// free text, so this is far below `MAX_LIVE_NETWORK_PARAMS_BYTES`.
+pub const MAX_LIVE_SSE_EVENT_TYPE_BYTES: usize = 128;
+/// SSE `id:` field bound (`Network.eventSourceMessageReceived.eventId`). A
+/// little more generous than the event-type bound since some servers pack
+/// structured identifiers (UUIDs, composite cursors) into it.
+pub const MAX_LIVE_SSE_ID_BYTES: usize = 256;
 /// Outer bound for an encoded `LiveResponse` (dominated by `Events` pages,
 /// which can carry up to `MAX_LIVE_EVENTS` network events near the params
 /// cap). Matches `MAX_HTML_BYTES`, the existing bound for the wire channel
@@ -351,6 +359,220 @@ impl LiveRequest {
     }
 }
 
+/// WebSocket frame direction relative to the browser: `Sent` originated
+/// from the page (`Network.webSocketFrameSent`), `Received` arrived from
+/// the peer (`Network.webSocketFrameReceived`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebSocketDirection {
+    Sent,
+    Received,
+}
+
+/// WebSocket frame opcode (RFC 6455 §5.2 — the six values a real frame can
+/// carry: continuation, text, binary, close, ping, pong). An unrecognized
+/// opcode fails typed parsing rather than being coerced; the station falls
+/// back to the generic `Network` event kind for that one frame instead of
+/// dropping it (see `dig2browser-station::live`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebSocketOpcode {
+    Continuation,
+    Text,
+    Binary,
+    Close,
+    Ping,
+    Pong,
+}
+
+impl WebSocketOpcode {
+    pub const fn from_rfc6455(value: u8) -> Option<Self> {
+        match value {
+            0x0 => Some(Self::Continuation),
+            0x1 => Some(Self::Text),
+            0x2 => Some(Self::Binary),
+            0x8 => Some(Self::Close),
+            0x9 => Some(Self::Ping),
+            0xA => Some(Self::Pong),
+            _ => None,
+        }
+    }
+
+    pub const fn to_rfc6455(self) -> u8 {
+        match self {
+            Self::Continuation => 0x0,
+            Self::Text => 0x1,
+            Self::Binary => 0x2,
+            Self::Close => 0x8,
+            Self::Ping => 0x9,
+            Self::Pong => 0xA,
+        }
+    }
+}
+
+/// A single typed WebSocket frame, parsed from `Network.webSocketFrameSent
+/// /Received` instead of carried as an opaque JSON blob. `payload` is
+/// bounded to `MAX_LIVE_NETWORK_PARAMS_BYTES` — the same bound the generic
+/// `Network` params blob uses — and truncated, never dropped, on oversize;
+/// `truncated` records that. `url` is best-effort: CDP does not repeat the
+/// URL on every frame event, so the station backfills it by correlating the
+/// frame's `requestId` against an earlier event on the same request that
+/// did carry a URL (typically `Network.webSocketCreated`); it is `None` if
+/// that correlation has not been observed yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebSocketFrame {
+    direction: WebSocketDirection,
+    opcode: WebSocketOpcode,
+    payload: Vec<u8>,
+    truncated: bool,
+    ts_unix_ms: u64,
+    url: Option<String>,
+}
+
+impl WebSocketFrame {
+    pub fn new(
+        direction: WebSocketDirection,
+        opcode: WebSocketOpcode,
+        payload: Vec<u8>,
+        truncated: bool,
+        ts_unix_ms: u64,
+        url: Option<String>,
+    ) -> Result<Self, ProtocolError> {
+        let frame = Self {
+            direction,
+            opcode,
+            payload,
+            truncated,
+            ts_unix_ms,
+            url,
+        };
+        frame.validate()?;
+        Ok(frame)
+    }
+
+    pub fn direction(&self) -> WebSocketDirection {
+        self.direction
+    }
+
+    pub fn opcode(&self) -> WebSocketOpcode {
+        self.opcode
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
+    }
+
+    pub fn ts_unix_ms(&self) -> u64 {
+        self.ts_unix_ms
+    }
+
+    pub fn url(&self) -> Option<&str> {
+        self.url.as_deref()
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.payload.len() > MAX_LIVE_NETWORK_PARAMS_BYTES {
+            return Err(ProtocolError::InvalidLivePayload);
+        }
+        if let Some(url) = &self.url {
+            if url.len() > MAX_LIVE_URL_BYTES || url.contains('\0') {
+                return Err(ProtocolError::InvalidLivePayload);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A single typed server-sent event, parsed from
+/// `Network.eventSourceMessageReceived` instead of carried as an opaque
+/// JSON blob. SSE is server-push only, so unlike `WebSocketFrame` there is
+/// no direction. `event_type`/`id` are `None` when the corresponding SSE
+/// field (`event:`/`id:`) was absent — CDP reports an empty string in that
+/// case, which the station maps to `None` rather than `Some("")`. `url` is
+/// best-effort for the same reason as `WebSocketFrame::url`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SseEvent {
+    event_type: Option<String>,
+    data: Vec<u8>,
+    truncated: bool,
+    id: Option<String>,
+    ts_unix_ms: u64,
+    url: Option<String>,
+}
+
+impl SseEvent {
+    pub fn new(
+        event_type: Option<String>,
+        data: Vec<u8>,
+        truncated: bool,
+        id: Option<String>,
+        ts_unix_ms: u64,
+        url: Option<String>,
+    ) -> Result<Self, ProtocolError> {
+        let event = Self {
+            event_type,
+            data,
+            truncated,
+            id,
+            ts_unix_ms,
+            url,
+        };
+        event.validate()?;
+        Ok(event)
+    }
+
+    pub fn event_type(&self) -> Option<&str> {
+        self.event_type.as_deref()
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
+    }
+
+    pub fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+
+    pub fn ts_unix_ms(&self) -> u64 {
+        self.ts_unix_ms
+    }
+
+    pub fn url(&self) -> Option<&str> {
+        self.url.as_deref()
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.data.len() > MAX_LIVE_NETWORK_PARAMS_BYTES {
+            return Err(ProtocolError::InvalidLivePayload);
+        }
+        if let Some(event_type) = &self.event_type {
+            if event_type.is_empty()
+                || event_type.len() > MAX_LIVE_SSE_EVENT_TYPE_BYTES
+                || event_type.contains('\0')
+            {
+                return Err(ProtocolError::InvalidLivePayload);
+            }
+        }
+        if let Some(id) = &self.id {
+            if id.is_empty() || id.len() > MAX_LIVE_SSE_ID_BYTES || id.contains('\0') {
+                return Err(ProtocolError::InvalidLivePayload);
+            }
+        }
+        if let Some(url) = &self.url {
+            if url.len() > MAX_LIVE_URL_BYTES || url.contains('\0') {
+                return Err(ProtocolError::InvalidLivePayload);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One translated DevTools event family.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiveEventKind {
@@ -360,7 +582,8 @@ pub enum LiveEventKind {
         status: Option<u16>,
         /// Raw JSON-encoded CDP event params, bounded to
         /// `MAX_LIVE_NETWORK_PARAMS_BYTES`. This is where WebSocket/SSE
-        /// frame payloads live.
+        /// frame payloads live for every `Network.*` method that is not
+        /// individually parsed into a typed variant below.
         params: Vec<u8>,
         /// `true` if `params` was truncated to the bound above.
         truncated: bool,
@@ -369,6 +592,15 @@ pub enum LiveEventKind {
         level: String,
         text: String,
     },
+    /// A typed WebSocket frame, parsed from `Network.webSocketFrameSent
+    /// /Received`. Populated instead of `Network` for those two methods
+    /// only — every other `Network.*` method, including
+    /// `webSocketCreated`/`webSocketClosed`, still arrives as `Network`.
+    WebSocketFrame(WebSocketFrame),
+    /// A typed server-sent event, parsed from
+    /// `Network.eventSourceMessageReceived`. Populated instead of
+    /// `Network` for that one method only.
+    SseEvent(SseEvent),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -442,6 +674,8 @@ impl LiveEvent {
                     return Err(ProtocolError::InvalidLivePayload);
                 }
             }
+            LiveEventKind::WebSocketFrame(frame) => frame.validate()?,
+            LiveEventKind::SseEvent(event) => event.validate()?,
         }
         Ok(())
     }
@@ -480,6 +714,44 @@ impl LiveEvent {
                 output.push(0);
                 encode_bounded_string_u8(&mut output, level, MAX_LIVE_CONSOLE_LEVEL_BYTES)?;
                 encode_bounded_string_u16(&mut output, text, MAX_LIVE_CONSOLE_TEXT_BYTES)?;
+            }
+            LiveEventKind::WebSocketFrame(frame) => {
+                output.push(3);
+                output.push(0);
+                output.push(websocket_direction_to_wire(frame.direction));
+                output.push(frame.opcode.to_rfc6455());
+                output.extend_from_slice(&frame.ts_unix_ms.to_le_bytes());
+                output.push(u8::from(frame.truncated));
+                output.push(u8::from(frame.url.is_some()));
+                if let Some(url) = &frame.url {
+                    encode_bounded_string_u16(&mut output, url, MAX_LIVE_URL_BYTES)?;
+                }
+                let payload_len = u32::try_from(frame.payload.len())
+                    .map_err(|_| ProtocolError::InvalidLivePayload)?;
+                output.extend_from_slice(&payload_len.to_le_bytes());
+                output.extend_from_slice(&frame.payload);
+            }
+            LiveEventKind::SseEvent(event) => {
+                output.push(4);
+                output.push(0);
+                output.extend_from_slice(&event.ts_unix_ms.to_le_bytes());
+                output.push(u8::from(event.truncated));
+                output.push(u8::from(event.url.is_some()));
+                if let Some(url) = &event.url {
+                    encode_bounded_string_u16(&mut output, url, MAX_LIVE_URL_BYTES)?;
+                }
+                output.push(u8::from(event.event_type.is_some()));
+                if let Some(event_type) = &event.event_type {
+                    encode_bounded_string_u16(&mut output, event_type, MAX_LIVE_SSE_EVENT_TYPE_BYTES)?;
+                }
+                output.push(u8::from(event.id.is_some()));
+                if let Some(id) = &event.id {
+                    encode_bounded_string_u16(&mut output, id, MAX_LIVE_SSE_ID_BYTES)?;
+                }
+                let data_len = u32::try_from(event.data.len())
+                    .map_err(|_| ProtocolError::InvalidLivePayload)?;
+                output.extend_from_slice(&data_len.to_le_bytes());
+                output.extend_from_slice(&event.data);
             }
         }
         Ok(output)
@@ -531,12 +803,88 @@ impl LiveEvent {
                 let text = input.string_u16(MAX_LIVE_CONSOLE_TEXT_BYTES)?;
                 LiveEventKind::Console { level, text }
             }
+            3 => {
+                let direction = websocket_direction_from_wire(input.u8()?)?;
+                let opcode = WebSocketOpcode::from_rfc6455(input.u8()?)
+                    .ok_or(ProtocolError::InvalidLivePayload)?;
+                let frame_ts_unix_ms = input.u64()?;
+                let truncated = match input.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(ProtocolError::InvalidLivePayload),
+                };
+                let url = match input.u8()? {
+                    0 => None,
+                    1 => Some(input.string_u16(MAX_LIVE_URL_BYTES)?),
+                    _ => return Err(ProtocolError::InvalidLivePayload),
+                };
+                let payload_len = usize::try_from(input.u32()?)
+                    .map_err(|_| ProtocolError::InvalidLivePayload)?;
+                let payload = input.bytes(payload_len)?.to_vec();
+                LiveEventKind::WebSocketFrame(WebSocketFrame::new(
+                    direction,
+                    opcode,
+                    payload,
+                    truncated,
+                    frame_ts_unix_ms,
+                    url,
+                )?)
+            }
+            4 => {
+                let event_ts_unix_ms = input.u64()?;
+                let truncated = match input.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(ProtocolError::InvalidLivePayload),
+                };
+                let url = match input.u8()? {
+                    0 => None,
+                    1 => Some(input.string_u16(MAX_LIVE_URL_BYTES)?),
+                    _ => return Err(ProtocolError::InvalidLivePayload),
+                };
+                let event_type = match input.u8()? {
+                    0 => None,
+                    1 => Some(input.string_u16(MAX_LIVE_SSE_EVENT_TYPE_BYTES)?),
+                    _ => return Err(ProtocolError::InvalidLivePayload),
+                };
+                let id = match input.u8()? {
+                    0 => None,
+                    1 => Some(input.string_u16(MAX_LIVE_SSE_ID_BYTES)?),
+                    _ => return Err(ProtocolError::InvalidLivePayload),
+                };
+                let data_len = usize::try_from(input.u32()?)
+                    .map_err(|_| ProtocolError::InvalidLivePayload)?;
+                let data = input.bytes(data_len)?.to_vec();
+                LiveEventKind::SseEvent(SseEvent::new(
+                    event_type,
+                    data,
+                    truncated,
+                    id,
+                    event_ts_unix_ms,
+                    url,
+                )?)
+            }
             _ => return Err(ProtocolError::InvalidLivePayload),
         };
         if !input.is_empty() {
             return Err(ProtocolError::InvalidLivePayload);
         }
         Self::new(cursor, ts_unix_ms, kind)
+    }
+}
+
+fn websocket_direction_to_wire(direction: WebSocketDirection) -> u8 {
+    match direction {
+        WebSocketDirection::Sent => 0,
+        WebSocketDirection::Received => 1,
+    }
+}
+
+fn websocket_direction_from_wire(value: u8) -> Result<WebSocketDirection, ProtocolError> {
+    match value {
+        0 => Ok(WebSocketDirection::Sent),
+        1 => Ok(WebSocketDirection::Received),
+        _ => Err(ProtocolError::InvalidLivePayload),
     }
 }
 
@@ -1026,5 +1374,167 @@ mod tests {
 
         assert!(LiveFilter::from_wire(0b1000).is_err());
         assert_eq!(LiveFilter::from_wire(0b101).unwrap(), LiveFilter::new(true, false, true));
+    }
+
+    #[test]
+    fn websocket_opcode_maps_the_six_rfc6455_values_and_rejects_the_rest() {
+        let pairs = [
+            (0x0, WebSocketOpcode::Continuation),
+            (0x1, WebSocketOpcode::Text),
+            (0x2, WebSocketOpcode::Binary),
+            (0x8, WebSocketOpcode::Close),
+            (0x9, WebSocketOpcode::Ping),
+            (0xA, WebSocketOpcode::Pong),
+        ];
+        for (wire, opcode) in pairs {
+            assert_eq!(WebSocketOpcode::from_rfc6455(wire), Some(opcode));
+            assert_eq!(opcode.to_rfc6455(), wire);
+        }
+        for reserved in [0x3, 0x4, 0x5, 0x6, 0x7, 0xB, 0xF] {
+            assert_eq!(WebSocketOpcode::from_rfc6455(reserved), None);
+        }
+    }
+
+    #[test]
+    fn websocket_frame_and_sse_event_round_trip_through_live_event_and_page() {
+        let frame = LiveEvent::new(
+            LiveCursor::new(1),
+            1_784_500_000_000,
+            LiveEventKind::WebSocketFrame(
+                WebSocketFrame::new(
+                    WebSocketDirection::Received,
+                    WebSocketOpcode::Text,
+                    br#"{"tick":1}"#.to_vec(),
+                    false,
+                    1_784_500_000_000,
+                    Some("wss://example.test/stream".to_owned()),
+                )
+                .expect("websocket frame"),
+            ),
+        )
+        .expect("websocket frame event");
+        let sse = LiveEvent::new(
+            LiveCursor::new(2),
+            1_784_500_000_050,
+            LiveEventKind::SseEvent(
+                SseEvent::new(
+                    Some("price".to_owned()),
+                    b"{\"symbol\":\"BTC\"}".to_vec(),
+                    false,
+                    Some("42".to_owned()),
+                    1_784_500_000_050,
+                    None,
+                )
+                .expect("sse event"),
+            ),
+        )
+        .expect("sse event event");
+        for event in [&frame, &sse] {
+            let encoded = event.encode().expect("encode event");
+            assert_eq!(&encoded[..4], b"D2LE");
+            assert_eq!(&LiveEvent::decode(&encoded).unwrap(), event);
+        }
+        match frame.kind() {
+            LiveEventKind::WebSocketFrame(frame) => {
+                assert_eq!(frame.direction(), WebSocketDirection::Received);
+                assert_eq!(frame.opcode(), WebSocketOpcode::Text);
+                assert_eq!(frame.payload(), br#"{"tick":1}"#);
+                assert!(!frame.is_truncated());
+                assert_eq!(frame.url(), Some("wss://example.test/stream"));
+            }
+            _ => panic!("expected a websocket frame kind"),
+        }
+        match sse.kind() {
+            LiveEventKind::SseEvent(event) => {
+                assert_eq!(event.event_type(), Some("price"));
+                assert_eq!(event.id(), Some("42"));
+                assert_eq!(event.url(), None);
+                assert!(!event.is_truncated());
+            }
+            _ => panic!("expected an sse event kind"),
+        }
+
+        let page = LiveEventPage::new(session_id(), vec![frame, sse], LiveCursor::new(2), 0, true)
+            .expect("event page");
+        let response = LiveResponse::Events(page);
+        let encoded = response.encode().expect("encode response");
+        assert_eq!(&encoded[..4], b"D2LP");
+        assert_eq!(LiveResponse::decode(&encoded).unwrap(), response);
+    }
+
+    #[test]
+    fn websocket_frame_and_sse_event_bounds_and_truncation_flag_fail_closed() {
+        assert!(WebSocketFrame::new(
+            WebSocketDirection::Sent,
+            WebSocketOpcode::Binary,
+            vec![0; MAX_LIVE_NETWORK_PARAMS_BYTES + 1],
+            false,
+            1,
+            None,
+        )
+        .is_err());
+        // A truncated frame at exactly the bound, with the flag set, is valid.
+        assert!(WebSocketFrame::new(
+            WebSocketDirection::Sent,
+            WebSocketOpcode::Binary,
+            vec![0; MAX_LIVE_NETWORK_PARAMS_BYTES],
+            true,
+            1,
+            None,
+        )
+        .is_ok());
+        assert!(WebSocketFrame::new(
+            WebSocketDirection::Sent,
+            WebSocketOpcode::Text,
+            b"hi".to_vec(),
+            false,
+            1,
+            Some("not\0a\0url".to_owned()),
+        )
+        .is_err());
+
+        assert!(SseEvent::new(
+            Some(String::new()),
+            b"data".to_vec(),
+            false,
+            None,
+            1,
+            None,
+        )
+        .is_err());
+        assert!(SseEvent::new(
+            None,
+            vec![0; MAX_LIVE_NETWORK_PARAMS_BYTES + 1],
+            true,
+            None,
+            1,
+            None,
+        )
+        .is_err());
+
+        // A malformed opcode byte fails closed on decode instead of being
+        // coerced into a plausible-looking frame.
+        let frame = LiveEvent::new(
+            LiveCursor::new(1),
+            1,
+            LiveEventKind::WebSocketFrame(
+                WebSocketFrame::new(
+                    WebSocketDirection::Sent,
+                    WebSocketOpcode::Ping,
+                    Vec::new(),
+                    false,
+                    1,
+                    None,
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let mut encoded = frame.encode().unwrap();
+        // Byte layout: magic(4) + version(2) + cursor(8) + ts(8) + tag(1) +
+        // reserved(1) + direction(1) + opcode(1) -> opcode is byte index 25.
+        assert_eq!(encoded[25], WebSocketOpcode::Ping.to_rfc6455());
+        encoded[25] = 0x7; // reserved opcode
+        assert!(LiveEvent::decode(&encoded).is_err());
     }
 }

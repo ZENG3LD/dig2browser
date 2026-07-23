@@ -15,10 +15,10 @@ containment-test-hooks = ["dig2browser/containment-test-hooks"]
 crawler-test-hooks = []
 geckodriver-test-hooks = ["dig2browser/geckodriver-test-hooks"]
 runtime-test-hooks = ["dig2browser/runtime-test-hooks"]
-tls-test-hooks = ["dep:base64"]
+tls-test-hooks = []
 
 [dependencies]
-base64 = { version = "0.22", optional = true }
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 dig2browser = { path = "../.." }
 dig2browser-client = { path = "../dig2browser-client" }
