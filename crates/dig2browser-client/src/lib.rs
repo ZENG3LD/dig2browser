@@ -19,8 +19,8 @@ pub use dig2browser_protocol::{
     CrawlStatus, EngineFamily, EvidenceCapture, FailureClass,
     IdentitySessionStatus, InterruptedReason, LiveCursor, LiveEvent, LiveEventKind,
     LiveEventPage, LiveFilter, LiveRequest, LiveResponse, LiveSessionId, LiveTarget,
-    MobilePersonaConfig, MonitorCursor, MonitorEvent, MonitorEventKind, MonitorFrame,
-    MonitorStopReason, PersonaKind,
+    MobilePersonaConfig, MonitorCursor, MonitorEvent, MonitorEventKind, MonitorEventPage,
+    MonitorFrame, MonitorRequest, MonitorResponse, MonitorStopReason, PersonaKind,
     PageArtifact,
     PersonaCompiler, PersonaDeviceClass, PersonaMode, PersonaPreset, ProfileClass,
     ResolvedRuntimeRecord, ResponseStatus, RouteRef, RouteRefError, RuntimeFeature,
@@ -550,6 +550,98 @@ impl StationClient {
         }
     }
 
+    /// Begin a durable monitor: like a live capture, but every WebSocket frame
+    /// is persisted (CAS + append-only journal) so it survives a station
+    /// restart. Returns the station-minted monitor id. Requires the station
+    /// operator's `--allow-durable-write`.
+    pub async fn begin_durable_monitor(
+        &self,
+        profile_id: impl Into<String>,
+        profile_class: ProfileClass,
+        persona: BrowserPersona,
+        url: impl Into<String>,
+        filter: LiveFilter,
+    ) -> Result<String, ClientError> {
+        let request = WorkerRequest::begin_monitor(
+            self.take_request_id(),
+            profile_id,
+            MonitorRequest::Begin {
+                profile_class,
+                persona,
+                url: url.into(),
+                filter,
+            },
+        )
+        .map_err(|_| ClientError::InvalidMonitorRequest)?;
+        match require_monitor_response(&self.call(request).await?)? {
+            MonitorResponse::Accepted { monitor_id } => Ok(monitor_id),
+            _ => Err(ClientError::InvalidResponse),
+        }
+    }
+
+    /// Read a page of a durable monitor's records (metadata only; frame payloads
+    /// are fetched via [`read_durable_frame`](Self::read_durable_frame)). Works
+    /// after a restart. Requires `--allow-durable-read`.
+    pub async fn read_durable_monitor(
+        &self,
+        monitor_id: impl Into<String>,
+        cursor: MonitorCursor,
+        limit: u8,
+    ) -> Result<MonitorEventPage, ClientError> {
+        let request = WorkerRequest::monitor(
+            self.take_request_id(),
+            MonitorRequest::Read {
+                monitor_id: monitor_id.into(),
+                cursor,
+                limit,
+            },
+        )
+        .map_err(|_| ClientError::InvalidMonitorRequest)?;
+        match require_monitor_response(&self.call(request).await?)? {
+            MonitorResponse::Events(page) => Ok(page),
+            _ => Err(ClientError::InvalidResponse),
+        }
+    }
+
+    /// Read one recorded frame's payload back from the CAS, byte-exact.
+    pub async fn read_durable_frame(
+        &self,
+        monitor_id: impl Into<String>,
+        artifact: ArtifactRef,
+    ) -> Result<Vec<u8>, ClientError> {
+        let request = WorkerRequest::monitor(
+            self.take_request_id(),
+            MonitorRequest::ReadFrame {
+                monitor_id: monitor_id.into(),
+                artifact,
+            },
+        )
+        .map_err(|_| ClientError::InvalidMonitorRequest)?;
+        match require_monitor_response(&self.call(request).await?)? {
+            MonitorResponse::Frame { payload } => Ok(payload),
+            _ => Err(ClientError::InvalidResponse),
+        }
+    }
+
+    /// Stop a resident durable monitor (appends a clean terminal `Stopped`).
+    /// Requires `--allow-durable-write`.
+    pub async fn stop_durable_monitor(
+        &self,
+        monitor_id: impl Into<String>,
+    ) -> Result<(), ClientError> {
+        let request = WorkerRequest::monitor(
+            self.take_request_id(),
+            MonitorRequest::Stop {
+                monitor_id: monitor_id.into(),
+            },
+        )
+        .map_err(|_| ClientError::InvalidMonitorRequest)?;
+        match require_monitor_response(&self.call(request).await?)? {
+            MonitorResponse::Stopped { .. } => Ok(()),
+            _ => Err(ClientError::InvalidResponse),
+        }
+    }
+
     /// Run a public-profile task while periodically yielding for lease
     /// heartbeats or cooperative cancellation. Cancellation disconnects the
     /// pipe so a late task reply cannot desynchronize the next request.
@@ -1064,6 +1156,50 @@ impl BlockingStationClient {
             .block_on(self.client.stop_live_capture(session_id))
     }
 
+    pub fn begin_durable_monitor(
+        &self,
+        profile_id: impl Into<String>,
+        profile_class: ProfileClass,
+        persona: BrowserPersona,
+        url: impl Into<String>,
+        filter: LiveFilter,
+    ) -> Result<String, ClientError> {
+        self.runtime.block_on(self.client.begin_durable_monitor(
+            profile_id,
+            profile_class,
+            persona,
+            url,
+            filter,
+        ))
+    }
+
+    pub fn read_durable_monitor(
+        &self,
+        monitor_id: impl Into<String>,
+        cursor: MonitorCursor,
+        limit: u8,
+    ) -> Result<MonitorEventPage, ClientError> {
+        self.runtime
+            .block_on(self.client.read_durable_monitor(monitor_id, cursor, limit))
+    }
+
+    pub fn read_durable_frame(
+        &self,
+        monitor_id: impl Into<String>,
+        artifact: ArtifactRef,
+    ) -> Result<Vec<u8>, ClientError> {
+        self.runtime
+            .block_on(self.client.read_durable_frame(monitor_id, artifact))
+    }
+
+    pub fn stop_durable_monitor(
+        &self,
+        monitor_id: impl Into<String>,
+    ) -> Result<(), ClientError> {
+        self.runtime
+            .block_on(self.client.stop_durable_monitor(monitor_id))
+    }
+
     pub fn identity_status(
         &self,
         profile_id: impl Into<String>,
@@ -1258,6 +1394,13 @@ fn require_live_response(response: &WorkerResponse) -> Result<LiveResponse, Clie
         .map_err(|_| ClientError::InvalidResponse)
 }
 
+fn require_monitor_response(response: &WorkerResponse) -> Result<MonitorResponse, ClientError> {
+    require_ok(response)?;
+    response
+        .decode_monitor_response()
+        .map_err(|_| ClientError::InvalidResponse)
+}
+
 fn runtime_satisfies_contract(
     runtime: &ResolvedRuntimeRecord,
     contract: &TaskRuntimeContract,
@@ -1336,6 +1479,8 @@ pub enum ClientError {
     InvalidCrawlRequest,
     #[error("invalid live event request")]
     InvalidLiveRequest,
+    #[error("invalid durable monitor request")]
+    InvalidMonitorRequest,
     #[error("failed to create station client runtime: {0}")]
     Runtime(#[source] std::io::Error),
     #[error("station rejected request with {status:?}: {message}")]

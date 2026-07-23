@@ -20,8 +20,9 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use dig2browser::agentic::{AgentCommand, CapabilitySet};
 use dig2browser::browser::{DevToolsEvent, NetworkEvent, PageDevTools};
 use dig2browser_protocol::{
-    BrowserPersona, LiveFilter, MonitorCursor, MonitorEvent, MonitorFrame, MonitorStopReason,
-    ProfileClass, WebSocketDirection, WebSocketOpcode, MAX_LIVE_NETWORK_PARAMS_BYTES,
+    ArtifactRef, BrowserPersona, LiveFilter, MonitorCursor, MonitorEvent, MonitorEventPage,
+    MonitorFrame, MonitorStopReason, ProfileClass, ProtocolError, WebSocketDirection,
+    WebSocketOpcode, MAX_LIVE_NETWORK_PARAMS_BYTES,
 };
 use dig2browser_trace::{LedgerError, MonitorJournal, MonitorSink, TraceLedger};
 use tokio::task::JoinHandle;
@@ -35,6 +36,7 @@ const JOURNAL_EXTENSION: &str = "journal";
 /// Owns the durable-monitor content-addressed store and journal directory, plus
 /// the set of live (resident) monitors. Constructed once per station over a
 /// monitor root; on open it reconciles any journal a previous run left open.
+#[derive(Clone)]
 pub struct DurableMonitorManager {
     inner: Arc<Inner>,
 }
@@ -164,6 +166,26 @@ impl DurableMonitorManager {
         Ok(journal.read(cursor, limit))
     }
 
+    /// [`read`](Self::read) wrapped as a wire [`MonitorEventPage`] — records
+    /// after `cursor`, with the next cursor and whether the page reaches the
+    /// journal's terminal record.
+    pub fn read_page(
+        &self,
+        monitor_id: &str,
+        cursor: MonitorCursor,
+        limit: usize,
+    ) -> Result<MonitorEventPage, MonitorError> {
+        let events = self.read(monitor_id, cursor, limit)?;
+        let next_cursor = events.last().map_or(cursor, MonitorEvent::cursor);
+        let terminal = events.last().is_some_and(MonitorEvent::is_terminal);
+        Ok(MonitorEventPage::new(
+            monitor_id.to_owned(),
+            events,
+            next_cursor,
+            terminal,
+        )?)
+    }
+
     /// Read a recorded frame's payload back from the CAS (byte-exact, hash
     /// re-validated); an empty frame yields an empty payload. Works whether or
     /// not the monitor is resident — the CAS is shared and always available.
@@ -174,9 +196,17 @@ impl DurableMonitorManager {
         }
     }
 
-    /// Stop a resident monitor: append a terminal `Stopped(Requested)`, abort its
-    /// reader, and release its lease.
-    pub fn stop(&self, monitor_id: &str) -> Result<(), MonitorError> {
+    /// Read a frame payload directly by its CAS reference (the wire path, where
+    /// the client already holds the `ArtifactRef` from a records page).
+    pub fn read_frame_by_ref(&self, artifact: &ArtifactRef) -> Result<Vec<u8>, MonitorError> {
+        Ok(self.inner.ledger.read_orphan_artifact(artifact)?)
+    }
+
+    /// Stop a resident monitor: append a terminal `Stopped(Requested)`, then
+    /// abort AND await its reader so the journal handle (and its exclusive lock)
+    /// is fully released before returning — a subsequent [`read`](Self::read) of
+    /// the now-non-resident monitor opens the journal cleanly.
+    pub async fn stop(&self, monitor_id: &str) -> Result<(), MonitorError> {
         let session = lock(&self.inner.sessions)?.remove(monitor_id);
         let Some(session) = session else {
             return Err(MonitorError::SessionNotFound);
@@ -184,7 +214,14 @@ impl DurableMonitorManager {
         if let Ok(mut sink) = session.sink.lock() {
             let _ = sink.stop(MonitorStopReason::Requested, unix_time_ms());
         }
-        stop_session(&session);
+        session.stopped.store(true, Ordering::Release);
+        let handle = lock(&session.reader)?.take();
+        if let Some(handle) = handle {
+            handle.abort();
+            let _ = handle.await;
+        }
+        // The reader has released its session Arc; dropping the local `session`
+        // on return releases the last one, closing the journal + its lock.
         Ok(())
     }
 
@@ -377,6 +414,8 @@ pub enum MonitorError {
     StatePoisoned,
     #[error("durable monitor storage error: {0}")]
     Ledger(#[from] LedgerError),
+    #[error("durable monitor protocol error: {0}")]
+    Protocol(#[from] ProtocolError),
     #[error(transparent)]
     Station(#[from] StationError),
 }

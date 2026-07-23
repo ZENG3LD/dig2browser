@@ -109,6 +109,11 @@ struct Cli {
         help = "Own this durable crawl root and resume unfinished crawl jobs"
     )]
     crawl_root: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Own this durable monitor root (<root>/cas + <root>/journals) and reconcile crash-left-open monitors; gated by --allow-durable-read/write"
+    )]
+    monitor_root: Option<PathBuf>,
     #[arg(long, default_value_t = 16)]
     max_resident: usize,
     #[arg(long, default_value_t = 32)]
@@ -522,6 +527,9 @@ async fn run(cli: Cli) -> Result<DaemonReport, DaemonError> {
         }
         if let Some(crawl_root) = cli.crawl_root {
             server_config = server_config.crawl_root(crawl_root)?;
+        }
+        if let Some(monitor_root) = cli.monitor_root {
+            server_config = server_config.monitor_root(monitor_root)?;
         }
         let station = BrowserStation::new(station_config);
         report_station_diagnostic(
@@ -1080,6 +1088,10 @@ impl DaemonError {
             // manager's shutdown-time lease drain, not a boot-time
             // misconfiguration — same class as a station shutdown failure.
             Self::Server(ServerError::Live(_)) => "station_shutdown_failure",
+            // A durable-monitor error at boot is a monitor-root setup failure
+            // (open/reconcile); at shutdown it is a lease-drain failure — both
+            // surface as the monitor root being unavailable.
+            Self::Server(ServerError::Monitor(_)) => "monitor_root_unavailable",
             Self::Server(ServerError::Station(_)) => "station_shutdown_failure",
         }
     }

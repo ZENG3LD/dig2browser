@@ -12,9 +12,10 @@ use dig2browser::agentic::{
 use dig2browser_protocol::{
     read_worker_request, validate_pipe_suffix, write_worker_response,
     CaptureCompleteness, CollectionRequest, CollectionResponse, CollectionTask,
-    CollectionTaskResult, CrawlRequest, EvidenceCapture, FailureClass, ProfileClass,
-    RequestKind, ResolvedRuntimeRecord, ResponseStatus, StationStatus, TaskCapturePolicy,
-    TaskReply, TaskStep, WorkerRequest, WorkerResponse, PROTOCOL_VERSION,
+    CollectionTaskResult, CrawlRequest, EvidenceCapture, FailureClass, MonitorRequest,
+    MonitorResponse, ProfileClass, RequestKind, ResolvedRuntimeRecord, ResponseStatus,
+    StationStatus, TaskCapturePolicy, TaskReply, TaskStep, WorkerRequest, WorkerResponse,
+    PROTOCOL_VERSION,
 };
 use dig2browser_trace::LedgerError;
 use tokio::sync::{mpsc, watch};
@@ -26,6 +27,7 @@ use crate::{
     },
     crawl::{CrawlError, CrawlManager},
     live::{LiveCaptureManager, LiveError},
+    monitor::{DurableMonitorManager, MonitorError},
     BrowserLease, BrowserStation, BrowserTask, BrowserTaskStep, IdentityRequest,
     RuntimeRegistryError, RuntimeRequirements, RuntimeSelector, StationError,
     StationFleetStatus,
@@ -187,6 +189,7 @@ pub struct ServerConfig {
     allow_session_health: bool,
     trace_root: Option<PathBuf>,
     crawl_root: Option<PathBuf>,
+    monitor_root: Option<PathBuf>,
     allow_durable_read: bool,
     allow_durable_write: bool,
     allow_crawl_read: bool,
@@ -225,6 +228,7 @@ impl ServerConfig {
             allow_session_health: false,
             trace_root: None,
             crawl_root: None,
+            monitor_root: None,
             allow_durable_read: false,
             allow_durable_write: false,
             allow_crawl_read: false,
@@ -285,6 +289,19 @@ impl ServerConfig {
             return Err(ConfigError::InvalidCrawlRoot);
         }
         self.crawl_root = Some(root);
+        Ok(self)
+    }
+
+    /// Durable-monitor root: `<root>/cas` (shared content-addressed store) +
+    /// `<root>/journals` (one append-only journal per monitor). Enables the
+    /// `DurableMonitor` request family; admission is gated per-operation by
+    /// `--allow-durable-read` / `--allow-durable-write`.
+    pub fn monitor_root(mut self, root: impl Into<PathBuf>) -> Result<Self, ConfigError> {
+        let root = root.into();
+        if !root.is_absolute() {
+            return Err(ConfigError::InvalidTraceRoot);
+        }
+        self.monitor_root = Some(root);
         Ok(self)
     }
 
@@ -425,6 +442,15 @@ async fn run_windows_server(
     // (cheap, in-memory); `--allow-live-events` gates admission per-request
     // below, not construction.
     let live = LiveCaptureManager::open(station.clone());
+    // A durable monitor persists to disk, so (like collections) it is only
+    // constructed when a monitor root is configured; `open` reconciles any
+    // journal a previous run left open. Admission is gated per-operation by
+    // `--allow-durable-read` / `--allow-durable-write` below.
+    let monitors = config
+        .monitor_root
+        .as_ref()
+        .map(|root| DurableMonitorManager::open(station.clone(), root))
+        .transpose()?;
     let mut connections = JoinSet::new();
     let mut first_instance = true;
     let mut remote_stop = false;
@@ -481,6 +507,7 @@ async fn run_windows_server(
                     collections: collections.clone(),
                     crawls: crawls.clone(),
                     live: live.clone(),
+                    monitor: monitors.clone(),
                     telemetry: Arc::clone(&telemetry),
                     remote_shutdown: remote_shutdown.clone(),
                     allow_remote_shutdown: config.allow_remote_shutdown,
@@ -574,6 +601,7 @@ struct ConnectionContext {
     collections: Option<CollectionManager>,
     crawls: Option<CrawlManager>,
     live: LiveCaptureManager,
+    monitor: Option<DurableMonitorManager>,
     telemetry: Arc<ServerTelemetry>,
     remote_shutdown: mpsc::Sender<()>,
     allow_remote_shutdown: bool,
@@ -591,6 +619,7 @@ async fn serve_connection(
         collections,
         crawls,
         live,
+        monitor,
         telemetry,
         remote_shutdown,
         allow_remote_shutdown,
@@ -710,6 +739,9 @@ async fn serve_connection(
                 ResponseStatus::Invalid,
                 "session import disabled",
             ),
+            RequestKind::DurableMonitor => {
+                monitor_request(monitor.as_ref(), &request, task_permissions).await
+            }
             RequestKind::Shutdown if allow_remote_shutdown => {
                 WorkerResponse::empty(&request, ResponseStatus::Ok)
             }
@@ -902,6 +934,115 @@ fn live_error_response(request: &WorkerRequest, error: &LiveError) -> WorkerResp
             (ResponseStatus::Protocol, "live event state invalid")
         }
         _ => (ResponseStatus::Unavailable, "live capture unavailable"),
+    };
+    WorkerResponse::failure(request, status, message)
+}
+
+async fn monitor_request(
+    manager: Option<&DurableMonitorManager>,
+    request: &WorkerRequest,
+    permissions: TaskPermissions,
+) -> WorkerResponse {
+    let Some(operation) = request.monitor.as_ref() else {
+        return WorkerResponse::failure(
+            request,
+            ResponseStatus::Invalid,
+            "durable monitor request missing",
+        );
+    };
+    let Some(manager) = manager else {
+        return WorkerResponse::failure(
+            request,
+            ResponseStatus::Unavailable,
+            "durable monitoring unavailable",
+        );
+    };
+    // Write operations (start/stop a monitor) need `--allow-durable-write`; read
+    // operations (page records, fetch a frame) need `--allow-durable-read`.
+    let permitted = match operation {
+        MonitorRequest::Begin { .. } | MonitorRequest::Stop { .. } => permissions.durable_write,
+        MonitorRequest::Read { .. } | MonitorRequest::ReadFrame { .. } => permissions.durable_read,
+    };
+    if !permitted {
+        return WorkerResponse::failure(
+            request,
+            ResponseStatus::Invalid,
+            "durable monitoring disabled",
+        );
+    }
+    let result = match operation {
+        MonitorRequest::Begin {
+            profile_class,
+            persona,
+            url,
+            filter,
+        } => manager
+            .begin(
+                &request.profile_id,
+                *profile_class,
+                persona.clone(),
+                url.clone(),
+                *filter,
+            )
+            .await
+            .map(|monitor_id| MonitorResponse::Accepted { monitor_id }),
+        MonitorRequest::Read {
+            monitor_id,
+            cursor,
+            limit,
+        } => manager
+            .read_page(monitor_id, *cursor, usize::from(*limit))
+            .map(MonitorResponse::Events),
+        MonitorRequest::ReadFrame { artifact, .. } => manager
+            .read_frame_by_ref(artifact)
+            .map(|payload| MonitorResponse::Frame { payload }),
+        MonitorRequest::Stop { monitor_id } => manager.stop(monitor_id).await.map(|()| {
+            MonitorResponse::Stopped {
+                monitor_id: monitor_id.clone(),
+            }
+        }),
+    };
+    match result {
+        Ok(response) => WorkerResponse::monitor_response(request, &response).unwrap_or_else(|_| {
+            WorkerResponse::failure(
+                request,
+                ResponseStatus::Protocol,
+                "durable monitor response invalid",
+            )
+        }),
+        Err(error) => monitor_error_response(request, &error),
+    }
+}
+
+fn monitor_error_response(request: &WorkerRequest, error: &MonitorError) -> WorkerResponse {
+    let (status, message) = match error {
+        MonitorError::SessionNotFound => {
+            (ResponseStatus::Invalid, "durable monitor request rejected")
+        }
+        MonitorError::SessionConflict | MonitorError::AdmissionClosed => {
+            (ResponseStatus::Unavailable, "durable monitoring unavailable")
+        }
+        MonitorError::StatePoisoned | MonitorError::Protocol(_) => {
+            (ResponseStatus::Protocol, "durable monitor state invalid")
+        }
+        MonitorError::Station(
+            StationError::Identity(_)
+            | StationError::PersonaMismatch
+            | StationError::PersonaBindingRequired
+            | StationError::ProfileBindingMismatch
+            | StationError::ProfileBindingRequired
+            | StationError::PersonaRuntimeMismatch
+            | StationError::IdentityClassMismatch
+            | StationError::IdentityClassBindingRequired
+            | StationError::InvalidPersona
+            | StationError::CapabilityDenied
+            | StationError::Worker(WorkerError::InvalidInput)
+            | StationError::Route(_),
+        ) => (ResponseStatus::Invalid, "durable monitor request rejected"),
+        _ => (
+            ResponseStatus::Unavailable,
+            "durable monitoring unavailable",
+        ),
     };
     WorkerResponse::failure(request, status, message)
 }
@@ -2043,6 +2184,8 @@ pub enum ServerError {
     Crawl(#[from] CrawlError),
     #[error(transparent)]
     Live(#[from] LiveError),
+    #[error(transparent)]
+    Monitor(#[from] MonitorError),
     #[error("crawl root requires a trace root")]
     CrawlTraceRequired,
     #[error(transparent)]

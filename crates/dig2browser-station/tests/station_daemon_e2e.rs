@@ -1621,6 +1621,129 @@ fn frame_records(records: &[MonitorEvent]) -> Vec<&MonitorFrame> {
         .collect()
 }
 
+// P1.2 Part B slice 4 acceptance: the durable-monitor IPC wire family, driven by
+// a real out-of-process client through the named pipe. Begin a durable monitor,
+// page its records, read a frame payload back from the CAS, and stop — all over
+// D2MQ/D2MP — proving the codec + dispatch + `--allow-durable-*` gates end to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stationd_durable_monitor_wire_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let ws_fixture = WebSocketFixture::start().await;
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-stationd-durable-wire-e2e-{unique}");
+    let base = e2e_temp_base().join(format!("dig2browser-stationd-durable-wire-e2e-{unique}"));
+    let profiles = base.join("profiles");
+    let monitor_root = base.join("monitors");
+    std::fs::create_dir_all(&profiles).expect("create durable-wire profiles");
+    std::fs::create_dir_all(&monitor_root).expect("create durable-wire monitor root");
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+    let mut daemon =
+        spawn_stationd_for_durable_monitor(stationd, &pipe_name, &profiles, &monitor_root);
+
+    let client = StationClient::connect(
+        ClientConfig::new(&pipe_name, Duration::from_secs(15), Duration::from_secs(90))
+            .expect("valid durable-wire client config"),
+    )
+    .await
+    .expect("connect durable-wire station client");
+
+    let page_url = fixture.url(&format!("/live-ws-page-{}", ws_fixture.port));
+    let mut monitor_id = None;
+    for attempt in 0..8 {
+        match client
+            .begin_durable_monitor(
+                "durable-wire-profile",
+                ProfileClass::Public,
+                BrowserPersona::desktop_default(),
+                page_url.clone(),
+                LiveFilter::new(true, true, false),
+            )
+            .await
+        {
+            Ok(id) => {
+                monitor_id = Some(id);
+                break;
+            }
+            Err(ClientError::Remote {
+                status: ResponseStatus::Unavailable,
+                ..
+            }) if attempt < 7 => {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+            }
+            Err(error) => panic!("begin durable monitor over wire: {error:?}"),
+        }
+    }
+    let monitor_id = monitor_id.expect("begin durable monitor over wire after retries");
+
+    // Page records until both directions are captured; keep a received frame's ref.
+    let mut received_artifact = None;
+    let mut saw_sent = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline && (received_artifact.is_none() || !saw_sent) {
+        let page = client
+            .read_durable_monitor(&monitor_id, MonitorCursor::START, 64)
+            .await
+            .expect("read durable monitor over wire");
+        for frame in frame_records(page.events()) {
+            match frame.direction() {
+                WebSocketDirection::Received => {
+                    if received_artifact.is_none() {
+                        received_artifact = frame.artifact().cloned();
+                    }
+                }
+                WebSocketDirection::Sent => saw_sent = true,
+            }
+        }
+        if received_artifact.is_none() || !saw_sent {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }
+    let received_artifact =
+        received_artifact.expect("a received frame with a CAS reference over the wire");
+    assert!(saw_sent, "page-send frame not captured over the wire");
+
+    // Fetch the frame payload back from the CAS over the wire.
+    let payload = client
+        .read_durable_frame(&monitor_id, received_artifact)
+        .await
+        .expect("read durable frame payload over wire");
+    assert!(
+        String::from_utf8_lossy(&payload).contains("\"tick\""),
+        "unexpected durable frame payload over wire: {}",
+        String::from_utf8_lossy(&payload)
+    );
+
+    // Stop over the wire; a subsequent read shows the terminal page.
+    client
+        .stop_durable_monitor(&monitor_id)
+        .await
+        .expect("stop durable monitor over wire");
+    let after = client
+        .read_durable_monitor(&monitor_id, MonitorCursor::START, 64)
+        .await
+        .expect("read stopped durable monitor over wire");
+    assert!(after.is_terminal(), "monitor not terminal after stop");
+    assert!(
+        matches!(
+            after.events().last().map(MonitorEvent::kind),
+            Some(MonitorEventKind::Stopped(MonitorStopReason::Requested))
+        ),
+        "last record after stop is not Stopped(Requested)"
+    );
+
+    client.shutdown().await.expect("request durable-wire station drain");
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("durable-wire station exit timeout")
+        .expect("wait for durable-wire station");
+    assert!(status.success(), "durable-wire station failed: {status}");
+    let (_, stderr) = read_child_output(&mut daemon).await;
+    assert!(stderr.is_empty(), "clean durable-wire station wrote stderr: {stderr}");
+    drop(ws_fixture);
+    remove_tree(&base).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stationd_compiles_personas_binds_routes_and_validates_probe_e2e() {
     let _serial = e2e_serial_guard().await;
@@ -3377,6 +3500,45 @@ fn spawn_stationd_for_runtime(
         true,
         false,
     )
+}
+
+fn spawn_stationd_for_durable_monitor(
+    stationd: &str,
+    pipe_name: &str,
+    profiles: &Path,
+    monitor_root: &Path,
+) -> tokio::process::Child {
+    let mut command = tokio::process::Command::new(stationd);
+    command.args([
+        "--pipe-name",
+        pipe_name,
+        "--profiles-root",
+        profiles.to_str().expect("profiles path is UTF-8"),
+        "--monitor-root",
+        monitor_root.to_str().expect("monitor root is UTF-8"),
+        "--runtime",
+        "chrome",
+        "--max-resident",
+        "2",
+        "--max-in-flight",
+        "4",
+        "--max-connections",
+        "8",
+        "--timeout-seconds",
+        "90",
+        "--drain-seconds",
+        "15",
+        "--allow-remote-shutdown",
+        "--allow-durable-read",
+        "--allow-durable-write",
+    ]);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn durable-monitor station daemon")
 }
 
 fn spawn_stationd_for_live_events(

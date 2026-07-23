@@ -29,8 +29,9 @@ pub use live::{
     MAX_LIVE_SSE_ID_BYTES, MAX_LIVE_URL_BYTES,
 };
 pub use monitor::{
-    MonitorCursor, MonitorEvent, MonitorEventKind, MonitorFrame, MonitorStopReason,
-    MAX_MONITOR_EVENT_BYTES, MAX_MONITOR_URL_BYTES,
+    validate_monitor_id, MonitorCursor, MonitorEvent, MonitorEventKind, MonitorEventPage,
+    MonitorFrame, MonitorRequest, MonitorResponse, MonitorStopReason, MAX_MONITOR_EVENT_BYTES,
+    MAX_MONITOR_FRAME_BYTES, MAX_MONITOR_ID_BYTES, MAX_MONITOR_PAGE_EVENTS, MAX_MONITOR_URL_BYTES,
 };
 pub use session::{
     IdentitySessionStatus, ProfileClass, SessionHealthProbe, SessionPhase,
@@ -104,6 +105,7 @@ pub enum RequestKind {
     Crawl = 12,
     LiveEvents = 13,
     ImportSession = 14,
+    DurableMonitor = 15,
 }
 
 impl RequestKind {
@@ -123,6 +125,7 @@ impl RequestKind {
             12 => Ok(Self::Crawl),
             13 => Ok(Self::LiveEvents),
             14 => Ok(Self::ImportSession),
+            15 => Ok(Self::DurableMonitor),
             _ => Err(ProtocolError::InvalidRequest),
         }
     }
@@ -142,6 +145,7 @@ pub struct WorkerRequest {
     pub collection: Option<CollectionRequest>,
     pub crawl: Option<CrawlRequest>,
     pub live: Option<LiveRequest>,
+    pub monitor: Option<MonitorRequest>,
 }
 
 impl WorkerRequest {
@@ -159,6 +163,7 @@ impl WorkerRequest {
             collection: None,
             crawl: None,
             live: None,
+            monitor: None,
         }
     }
 
@@ -210,6 +215,7 @@ impl WorkerRequest {
             collection: None,
             crawl: None,
             live: None,
+            monitor: None,
         }
     }
 
@@ -227,6 +233,7 @@ impl WorkerRequest {
             collection: None,
             crawl: None,
             live: None,
+            monitor: None,
         }
     }
 
@@ -248,6 +255,7 @@ impl WorkerRequest {
             collection: None,
             crawl: None,
             live: None,
+            monitor: None,
         }
     }
 
@@ -270,6 +278,7 @@ impl WorkerRequest {
             collection: None,
             crawl: None,
             live: None,
+            monitor: None,
         }
     }
 
@@ -287,6 +296,7 @@ impl WorkerRequest {
             collection: None,
             crawl: None,
             live: None,
+            monitor: None,
         }
     }
 
@@ -309,6 +319,7 @@ impl WorkerRequest {
             collection: None,
             crawl: None,
             live: None,
+            monitor: None,
         }
     }
 
@@ -334,6 +345,7 @@ impl WorkerRequest {
             collection: None,
             crawl: None,
             live: None,
+            monitor: None,
         }
     }
 
@@ -358,6 +370,7 @@ impl WorkerRequest {
             collection: Some(collection),
             crawl: None,
             live: None,
+            monitor: None,
         };
         request.validate()?;
         Ok(request)
@@ -383,6 +396,7 @@ impl WorkerRequest {
             collection: Some(collection),
             crawl: None,
             live: None,
+            monitor: None,
         };
         request.validate()?;
         Ok(request)
@@ -409,6 +423,7 @@ impl WorkerRequest {
             collection: None,
             crawl: Some(crawl),
             live: None,
+            monitor: None,
         };
         request.validate()?;
         Ok(request)
@@ -434,6 +449,7 @@ impl WorkerRequest {
             collection: None,
             crawl: Some(crawl),
             live: None,
+            monitor: None,
         };
         request.validate()?;
         Ok(request)
@@ -460,6 +476,7 @@ impl WorkerRequest {
             collection: None,
             crawl: None,
             live: Some(live),
+            monitor: None,
         };
         request.validate()?;
         Ok(request)
@@ -482,6 +499,57 @@ impl WorkerRequest {
             collection: None,
             crawl: None,
             live: Some(live),
+            monitor: None,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn begin_monitor(
+        request_id: u64,
+        profile_id: impl Into<String>,
+        monitor: MonitorRequest,
+    ) -> Result<Self, ProtocolError> {
+        if !monitor.is_begin() {
+            return Err(ProtocolError::InvalidMonitorPayload);
+        }
+        let request = Self {
+            kind: RequestKind::DurableMonitor,
+            request_id,
+            profile_id: profile_id.into(),
+            url: String::new(),
+            task: None,
+            persona: None,
+            profile_class: None,
+            session_update: None,
+            session_probe: None,
+            collection: None,
+            crawl: None,
+            live: None,
+            monitor: Some(monitor),
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn monitor(request_id: u64, monitor: MonitorRequest) -> Result<Self, ProtocolError> {
+        if monitor.is_begin() {
+            return Err(ProtocolError::InvalidMonitorPayload);
+        }
+        let request = Self {
+            kind: RequestKind::DurableMonitor,
+            request_id,
+            profile_id: String::new(),
+            url: String::new(),
+            task: None,
+            persona: None,
+            profile_class: None,
+            session_update: None,
+            session_probe: None,
+            collection: None,
+            crawl: None,
+            live: None,
+            monitor: Some(monitor),
         };
         request.validate()?;
         Ok(request)
@@ -513,6 +581,7 @@ impl WorkerRequest {
             collection: None,
             crawl: None,
             live: None,
+            monitor: None,
         }
     }
 
@@ -612,6 +681,16 @@ impl WorkerRequest {
         } else {
             None
         };
+        let monitor_payload = if self.kind == RequestKind::DurableMonitor {
+            Some(
+                self.monitor
+                    .as_ref()
+                    .ok_or(ProtocolError::InvalidRequest)?
+                    .encode()?,
+            )
+        } else {
+            None
+        };
         let body = task_payload
             .as_deref()
             .or(session_payload.as_deref())
@@ -621,6 +700,7 @@ impl WorkerRequest {
             .or(collection_payload.as_deref())
             .or(crawl_payload.as_deref())
             .or(live_payload.as_deref())
+            .or(monitor_payload.as_deref())
             .unwrap_or(self.url.as_bytes());
         let url_len = u32::try_from(body.len()).map_err(|_| ProtocolError::InvalidRequest)?;
         let total = REQUEST_HEADER_BYTES
@@ -651,6 +731,9 @@ impl WorkerRequest {
             return Err(ProtocolError::InvalidRequest);
         }
         if self.kind != RequestKind::LiveEvents && self.live.is_some() {
+            return Err(ProtocolError::InvalidRequest);
+        }
+        if self.kind != RequestKind::DurableMonitor && self.monitor.is_some() {
             return Err(ProtocolError::InvalidRequest);
         }
         match self.kind {
@@ -851,6 +934,29 @@ impl WorkerRequest {
                     .ok_or(ProtocolError::InvalidRequest)?;
                 live.validate()?;
                 if live.is_begin() {
+                    validate_profile_id(&self.profile_id)
+                } else if self.profile_id.is_empty() {
+                    Ok(())
+                } else {
+                    Err(ProtocolError::InvalidRequest)
+                }
+            }
+            RequestKind::DurableMonitor => {
+                if !self.url.is_empty()
+                    || self.task.is_some()
+                    || self.persona.is_some()
+                    || self.profile_class.is_some()
+                    || self.session_update.is_some()
+                    || self.session_probe.is_some()
+                {
+                    return Err(ProtocolError::InvalidRequest);
+                }
+                let monitor = self
+                    .monitor
+                    .as_ref()
+                    .ok_or(ProtocolError::InvalidRequest)?;
+                monitor.validate()?;
+                if monitor.is_begin() {
                     validate_profile_id(&self.profile_id)
                 } else if self.profile_id.is_empty() {
                     Ok(())
@@ -1143,6 +1249,30 @@ impl WorkerResponse {
             return Err(ProtocolError::InvalidLivePayload);
         }
         LiveResponse::decode(&self.html)
+    }
+
+    pub fn monitor_response(
+        request: &WorkerRequest,
+        result: &MonitorResponse,
+    ) -> Result<Self, ProtocolError> {
+        let mut response = Self::empty(request, ResponseStatus::Ok);
+        response.html = result.encode()?;
+        response.validate()?;
+        Ok(response)
+    }
+
+    pub fn decode_monitor_response(&self) -> Result<MonitorResponse, ProtocolError> {
+        if self.kind != RequestKind::DurableMonitor
+            || self.status != ResponseStatus::Ok
+            || self.http_status.is_some()
+            || !self.final_url.is_empty()
+            || !self.title.is_empty()
+            || !self.error.is_empty()
+            || !self.png.is_empty()
+        {
+            return Err(ProtocolError::InvalidMonitorPayload);
+        }
+        MonitorResponse::decode(&self.html)
     }
 
     pub fn decode_collection_response(&self) -> Result<CollectionResponse, ProtocolError> {
@@ -1581,6 +1711,7 @@ where
             collection: Some(CollectionRequest::decode(body)?),
             crawl: None,
             live: None,
+            monitor: None,
         };
         request.validate()?;
         return Ok(Some(request));
@@ -1599,6 +1730,7 @@ where
             collection: None,
             crawl: Some(CrawlRequest::decode(body)?),
             live: None,
+            monitor: None,
         };
         request.validate()?;
         return Ok(Some(request));
@@ -1617,6 +1749,26 @@ where
             collection: None,
             crawl: None,
             live: Some(LiveRequest::decode(body)?),
+            monitor: None,
+        };
+        request.validate()?;
+        return Ok(Some(request));
+    }
+    if kind == RequestKind::DurableMonitor {
+        let request = WorkerRequest {
+            kind,
+            request_id,
+            profile_id,
+            url: String::new(),
+            task: None,
+            persona: None,
+            profile_class: None,
+            session_update: None,
+            session_probe: None,
+            collection: None,
+            crawl: None,
+            live: None,
+            monitor: Some(MonitorRequest::decode(body)?),
         };
         request.validate()?;
         return Ok(Some(request));
@@ -1652,6 +1804,7 @@ where
             collection: None,
             crawl: None,
             live: None,
+            monitor: None,
         };
         request.validate()?;
         return Ok(Some(request));
@@ -1687,6 +1840,7 @@ where
         collection: None,
         crawl: None,
         live: None,
+        monitor: None,
     };
     request.validate()?;
     Ok(Some(request))
