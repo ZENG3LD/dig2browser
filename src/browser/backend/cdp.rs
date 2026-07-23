@@ -1622,6 +1622,60 @@ impl CdpPageBackend {
             download,
         }
     }
+
+    /// Resolve a frame-piercing compound selector. A selector may address an
+    /// element inside a **same-origin** `<iframe>` by chaining segments with
+    /// `>>>`: each segment before the last selects a frame owner, whose content
+    /// document becomes the context for the next segment. Returns the document
+    /// node id the final segment must be queried within, plus that final
+    /// segment. A plain selector (no `>>>`) resolves against the top document,
+    /// exactly as before.
+    ///
+    /// Cross-origin (out-of-process) frames live in a separate CDP session and
+    /// are not reachable this way — such a descent fails closed with a
+    /// not-found error rather than silently crossing into the wrong document.
+    async fn resolve_frame_context(
+        &self,
+        selector: &str,
+    ) -> Result<(i64, String), BrowserError> {
+        let doc = self
+            .session
+            .get_document()
+            .await
+            .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+        let mut segments: Vec<&str> = selector.split(">>>").map(str::trim).collect();
+        if segments.iter().any(|segment| segment.is_empty()) {
+            return Err(BrowserError::Other(format!(
+                "invalid frame selector: {selector}"
+            )));
+        }
+        // `split` always yields at least one element.
+        let last = segments.pop().expect("selector has a final segment").to_owned();
+
+        let mut context = doc.node_id;
+        for frame_selector in segments {
+            let frame_node = self
+                .session
+                .query_selector(context, frame_selector)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?
+                .ok_or_else(|| {
+                    BrowserError::Other(format!("frame not found: {frame_selector}"))
+                })?;
+            context = self
+                .session
+                .content_document_node_id(frame_node)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?
+                .ok_or_else(|| {
+                    BrowserError::Other(format!(
+                        "not a same-origin frame with a reachable document: {frame_selector}"
+                    ))
+                })?;
+        }
+        Ok((context, last))
+    }
 }
 
 struct CdpPageRequestPolicy {
@@ -1822,15 +1876,11 @@ impl PageBackend for CdpPageBackend {
                 .await
                 .map_err(|e| BrowserError::Other(e.to_string()))?;
 
-            let doc = self
-                .session
-                .get_document()
-                .await
-                .map_err(|e| BrowserError::Other(e.to_string()))?;
+            let (context, last) = self.resolve_frame_context(selector).await?;
 
             let node_id = self
                 .session
-                .query_selector(doc.node_id, selector)
+                .query_selector(context, &last)
                 .await
                 .map_err(|e| BrowserError::Other(e.to_string()))?
                 .ok_or_else(|| {
@@ -1867,15 +1917,11 @@ impl PageBackend for CdpPageBackend {
                 .await
                 .map_err(|e| BrowserError::Other(e.to_string()))?;
 
-            let doc = self
-                .session
-                .get_document()
-                .await
-                .map_err(|e| BrowserError::Other(e.to_string()))?;
+            let (context, last) = self.resolve_frame_context(selector).await?;
 
             let node_ids = self
                 .session
-                .query_selector_all(doc.node_id, selector)
+                .query_selector_all(context, &last)
                 .await
                 .map_err(|e| BrowserError::Other(e.to_string()))?;
 

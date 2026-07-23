@@ -176,6 +176,26 @@ impl CdpSession {
         Ok(())
     }
 
+    /// Return the content-document node id of a frame-owner node (an
+    /// `<iframe>`), or `None` if the node owns no reachable content document
+    /// (e.g. it is not a frame, or the frame is cross-origin / out-of-process
+    /// and lives in a separate CDP session). Uses `DOM.describeNode` with
+    /// `pierce` so a same-origin frame's document is included.
+    pub async fn content_document_node_id(
+        &self,
+        node_id: i64,
+    ) -> Result<Option<i64>, CdpError> {
+        let result = self
+            .call(
+                "DOM.describeNode",
+                Some(json!({ "nodeId": node_id, "pierce": true })),
+            )
+            .await?;
+        Ok(result["node"]["contentDocument"]["nodeId"]
+            .as_i64()
+            .filter(|id| *id != 0))
+    }
+
     /// Set the files selected by a file `<input>` node (`DOM.setFileInputFiles`).
     /// `files` are absolute local paths the browser process reads itself; no
     /// bytes flow through this call.
