@@ -1,8 +1,8 @@
 # dig2browser
 
-Stealth browser automation library for Rust with **Web Bot Auth** support. Custom CDP + WebDriver + BiDi backends — zero external browser-automation dependencies.
+Anti-detection browser automation library for Rust with **Web Bot Auth** support. Custom CDP + WebDriver + BiDi backends — zero external browser-automation dependencies.
 
-Multi-browser support: **Chrome**, **Edge**, **Firefox**. Built-in anti-detection with 16 stealth scripts, cookie management (Chrome DPAPI + Firefox plaintext), and agent-friendly DevTools access.
+Multi-browser support: **Chrome**, **Edge**, **Firefox**. Built-in anti-detection via 16 dedicated scripts, cookie management (Chrome DPAPI + Firefox plaintext), and agent-friendly DevTools access.
 
 ## Why
 
@@ -55,7 +55,7 @@ use dig2browser::{StealthBrowser, LaunchConfig, BrowserPreference};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Auto-detects Chrome/Edge, launches with stealth
+    // Auto-detects Chrome/Edge, launches with anti-detection enabled
     let browser = StealthBrowser::launch().await?;
 
     let page = browser.new_page("https://example.com").await?;
@@ -153,7 +153,7 @@ while let Some(event) = devtools.next_event().await {
 
 ## Features
 
-### Stealth (16 scripts, auto-injected)
+### Anti-detection (16 scripts, auto-injected)
 
 - `navigator.webdriver` → `false`
 - `window.chrome` mock
@@ -212,7 +212,7 @@ std::fs::write("page.pdf", &pdf)?;
 
 ## Web Bot Auth
 
-Cryptographic bot identity using [RFC 9421 HTTP Message Signatures](https://datatracker.ietf.org/doc/html/rfc9421). Instead of stealth evasion, your crawler proves its identity to CDN providers (Cloudflare, Akamai, DataDome, HUMAN Security, AWS) with Ed25519 signatures.
+Cryptographic bot identity using [RFC 9421 HTTP Message Signatures](https://datatracker.ietf.org/doc/html/rfc9421). Instead of anti-detection scripting, your crawler proves its identity to CDN providers (Cloudflare, Akamai, DataDome, HUMAN Security, AWS) with Ed25519 signatures.
 
 One implementation covers all providers — they all support the same [Web Bot Auth standard](https://developers.cloudflare.com/bots/reference/bot-verification/web-bot-auth/).
 
@@ -322,7 +322,7 @@ Firefox-equivalent of CDP capabilities:
 
 ## Browser Support
 
-| Browser | Protocol | Stealth | Status |
+| Browser | Protocol | Anti-detection | Status |
 |---------|----------|---------|--------|
 | Chrome | CDP | Full (pre-nav injection) | Production |
 | Edge | CDP | Full (pre-nav injection) | Production |
@@ -340,7 +340,7 @@ cargo run --bin keygen -- keys/my-bot.key
 
 ### `dev-fetch` — DevTools in your terminal
 
-Fetch a URL through the stealth browser and inspect everything — no code needed.
+Fetch a URL through the browser and inspect everything — no code needed.
 
 ```bash
 # Basic: fetch URL, show title/size/time
@@ -370,7 +370,7 @@ dev-fetch https://yandex.cloud --profile /tmp/dig2crawl-profiles/yandex.cloud --
 
 | Flag | Description |
 |------|-------------|
-| `--fingerprint <PATH>` | JSON fingerprint config (browser, locale, timezone, viewport, stealth level) |
+| `--fingerprint <PATH>` | JSON fingerprint config (browser, locale, timezone, viewport, anti-detection level) |
 | `--headed` | Visible browser window |
 | `--wait-selector <CSS>` | Wait for element before capturing |
 | `--save-html <PATH>` | Save HTML to file |
@@ -487,7 +487,7 @@ For Firefox/BiDi: geckodriver manages Firefox lifecycle. `DELETE /session` tells
 - [x] Custom CDP client (WebSocket, JSON-RPC)
 - [x] Custom WebDriver client (W3C REST)
 - [x] Custom BiDi client (WebSocket)
-- [x] 16 stealth scripts with auto-injection
+- [x] 16 anti-detection scripts with auto-injection
 - [x] Cookie reading (Chrome DPAPI, Firefox plaintext)
 - [x] Browser auto-detection (Chrome, Edge, Firefox)
 - [x] Element interaction (find, click, type, text, attribute, bounding box)

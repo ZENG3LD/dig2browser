@@ -124,7 +124,7 @@ Cargo автоматически делегирует `dig2-wasm-test` кото�
 - Driver SHA verification
 - Concurrent test runs (one driver per invocation)
 - BiDi protocol (WebDriver classic достаточно)
-- Stealth features (we control the test page, not scraping)
+- Anti-detection features (we control the test page, not scraping)
 
 ## Сторонние тулы для inspiration
 
