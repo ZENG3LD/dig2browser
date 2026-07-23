@@ -214,6 +214,16 @@ fn serve_connection(mut stream: TcpStream) -> std::io::Result<()> {
     if marker == "force-close" {
         return Ok(());
     }
+    if requested_marker == "download-file" {
+        // A non-HTML attachment response: a browser navigating here (or
+        // following a download link) triggers a real download.
+        let body = "dig2browser download payload";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"report.txt\"\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{body}",
+            body.len()
+        );
+        return stream.write_all(response.as_bytes());
+    }
     let script = if requested_marker == "auth-bootstrap" {
         "<script>localStorage.setItem('dig2browser_auth_e2e','present');document.cookie='dig2browser_auth_e2e=cookie-secret; Path=/; Max-Age=3600';setTimeout(()=>location.href='/auth-check',50)</script>".to_owned()
     } else if requested_marker == "auth-check" {
@@ -262,6 +272,8 @@ ws.onmessage=(event)=>{{document.title='ws-recv';}};\
             // A file input whose change handler records the picked file's name,
             // so a successful UploadFile is observable over the wire.
             "file-upload" => "<input type=\"file\" id=\"f\"><span id=\"picked\">none</span><script>document.getElementById('f').addEventListener('change',function(e){document.getElementById('picked').textContent='picked:'+(e.target.files[0]?e.target.files[0].name:'');});</script>",
+            // A download link (the download attribute forces same-origin download).
+            "download-page" => "<a id=\"dl\" href=\"/download-file\" download=\"report.txt\">get</a>",
             _ => "",
         }
     );
@@ -2031,6 +2043,82 @@ async fn stationd_upload_file_sets_input_from_local_path_e2e() {
     let (_, stderr) = read_child_output(&mut daemon).await;
     assert!(stderr.is_empty(), "clean upload station wrote stderr: {stderr}");
     remove_tree(&base).await;
+}
+
+// A.4.4 acceptance: the WaitForDownload step captures a file the page triggers
+// to download (via CDP Browser download events + setDownloadBehavior), returning
+// its suggested filename and bytes, behind its own default-deny gate
+// --allow-downloads. Navigates a page with a download link, clicks it, and waits
+// for the download — asserting the reply carries the right filename and bytes,
+// all over the wire (the browser wrote the file; the station read it back).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stationd_wait_for_download_captures_a_triggered_download_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-stationd-download-e2e-{unique}");
+    let profiles = e2e_temp_base().join(format!(
+        "dig2browser-stationd-download-e2e-{unique}"
+    ));
+    std::fs::create_dir_all(&profiles).expect("create download profiles root");
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+    let mut daemon = spawn_stationd_downloads(stationd, &pipe_name, &profiles);
+
+    let client = StationClient::connect(
+        ClientConfig::new(&pipe_name, Duration::from_secs(15), Duration::from_secs(90))
+            .expect("valid download client config"),
+    )
+    .await
+    .expect("connect download station client");
+
+    let url = fixture.url("/download-page");
+    let task = CollectionTask::new(vec![
+        TaskStep::Navigate { url: url.clone() },
+        TaskStep::ClickSelector {
+            selector: "#dl".to_owned(),
+        },
+        TaskStep::WaitForDownload {
+            timeout: Duration::from_secs(15),
+        },
+    ])
+    .expect("valid download task");
+    let mut result = None;
+    for attempt in 0..8 {
+        match client.run_task("download-profile", task.clone()).await {
+            Ok(value) => {
+                result = Some(value);
+                break;
+            }
+            Err(ClientError::Remote {
+                status: ResponseStatus::Unavailable,
+                ..
+            }) if attempt < 7 => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            other => panic!("download task failed: {other:?}"),
+        }
+    }
+    let result = result.expect("download task after retries");
+    assert_eq!(result.replies().len(), 3);
+    let TaskReply::Download {
+        suggested_filename,
+        bytes,
+    } = &result.replies()[2]
+    else {
+        panic!("expected Download reply, got {:?}", result.replies()[2]);
+    };
+    assert_eq!(suggested_filename, "report.txt");
+    assert_eq!(bytes.as_slice(), b"dig2browser download payload");
+
+    client.shutdown().await.expect("request download station drain");
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("download station exit timeout")
+        .expect("wait for download station");
+    assert!(status.success(), "download station failed: {status}");
+    let (_, stderr) = read_child_output(&mut daemon).await;
+    assert!(stderr.is_empty(), "clean download station wrote stderr: {stderr}");
+    remove_tree(&profiles).await;
 }
 
 fn frame_records(records: &[MonitorEvent]) -> Vec<&MonitorFrame> {
@@ -4178,6 +4266,44 @@ fn spawn_stationd_for_runtime_with_routes(
             allow_headful_auth: false,
         },
     )
+}
+
+/// A station that permits interactive tasks + downloads (no scripted gate) — so
+/// a click-then-WaitForDownload flow can run end to end.
+fn spawn_stationd_downloads(
+    stationd: &str,
+    pipe_name: &str,
+    profiles: &Path,
+) -> tokio::process::Child {
+    let mut command = tokio::process::Command::new(stationd);
+    command.args([
+        "--pipe-name",
+        pipe_name,
+        "--profiles-root",
+        profiles.to_str().expect("profiles path is UTF-8"),
+        "--runtime",
+        "chrome",
+        "--max-resident",
+        "1",
+        "--max-in-flight",
+        "4",
+        "--max-connections",
+        "8",
+        "--timeout-seconds",
+        "90",
+        "--drain-seconds",
+        "15",
+        "--allow-remote-shutdown",
+        "--allow-interactive-tasks",
+        "--allow-downloads",
+    ]);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn downloads station daemon")
 }
 
 /// A station that permits ONLY file upload — no interactive/scripted gates — so
