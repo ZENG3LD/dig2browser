@@ -59,17 +59,19 @@ pub enum MonitorStopReason {
     Interrupted(InterruptedReason),
 }
 
-/// A committed frame's durable metadata. The payload bytes are NOT here — they
-/// are stored content-addressed in the trace CAS and referenced by `artifact`
-/// (whose media type carries the frame encoding). `direction`/`opcode` mirror
-/// the live [`crate::WebSocketFrame`]; `truncated` records that the payload was
-/// bounded before it was committed.
+/// A committed frame's durable metadata. The payload bytes are NOT here — a
+/// non-empty payload is stored content-addressed in the trace CAS and referenced
+/// by `artifact` (media type `ApplicationOctetStream`; the opcode carries the
+/// text-vs-binary semantics). An **empty** frame (an empty text frame, a
+/// bodyless ping/pong) has no CAS object and carries `artifact = None`.
+/// `direction`/`opcode` mirror the live [`crate::WebSocketFrame`]; `truncated`
+/// records that the payload was bounded before it was committed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MonitorFrame {
     direction: WebSocketDirection,
     opcode: WebSocketOpcode,
     truncated: bool,
-    artifact: ArtifactRef,
+    artifact: Option<ArtifactRef>,
 }
 
 impl MonitorFrame {
@@ -77,11 +79,14 @@ impl MonitorFrame {
         direction: WebSocketDirection,
         opcode: WebSocketOpcode,
         truncated: bool,
-        artifact: ArtifactRef,
+        artifact: Option<ArtifactRef>,
     ) -> Result<Self, ProtocolError> {
-        // ArtifactRef::new already rejects a zero digest / zero length, so any
-        // constructed reference is valid; keep the constructor fallible for
-        // symmetry with the rest of the family and future invariants.
+        // An empty-payload frame legitimately has no CAS object; a truncated
+        // frame, by contrast, was bounded from a non-empty payload, so it must
+        // reference the bytes that were kept.
+        if truncated && artifact.is_none() {
+            return Err(ProtocolError::InvalidMonitorPayload);
+        }
         Ok(Self {
             direction,
             opcode,
@@ -102,8 +107,9 @@ impl MonitorFrame {
         self.truncated
     }
 
-    pub fn artifact(&self) -> &ArtifactRef {
-        &self.artifact
+    /// The CAS reference to the frame's payload, or `None` for an empty frame.
+    pub fn artifact(&self) -> Option<&ArtifactRef> {
+        self.artifact.as_ref()
     }
 }
 
@@ -189,7 +195,10 @@ impl MonitorEvent {
                 output.push(websocket_direction_to_wire(frame.direction));
                 output.push(frame.opcode.to_rfc6455());
                 output.push(u8::from(frame.truncated));
-                encode_artifact_ref(&mut output, &frame.artifact);
+                output.push(u8::from(frame.artifact.is_some()));
+                if let Some(artifact) = &frame.artifact {
+                    encode_artifact_ref(&mut output, artifact);
+                }
             }
             MonitorEventKind::Stopped(reason) => {
                 output.push(3);
@@ -230,7 +239,11 @@ impl MonitorEvent {
                 let opcode = WebSocketOpcode::from_rfc6455(input.u8()?)
                     .ok_or(ProtocolError::InvalidMonitorPayload)?;
                 let truncated = decode_flag(input.u8()?)?;
-                let artifact = decode_artifact_ref(&mut input)?;
+                let artifact = match input.u8()? {
+                    0 => None,
+                    1 => Some(decode_artifact_ref(&mut input)?),
+                    _ => return Err(ProtocolError::InvalidMonitorPayload),
+                };
                 MonitorEventKind::FrameCommitted(MonitorFrame::new(
                     direction, opcode, truncated, artifact,
                 )?)
@@ -315,6 +328,7 @@ fn artifact_media_type_to_wire(media_type: ArtifactMediaType) -> u8 {
     match media_type {
         ArtifactMediaType::TextHtmlUtf8 => 1,
         ArtifactMediaType::ImagePng => 2,
+        ArtifactMediaType::ApplicationOctetStream => 3,
     }
 }
 
@@ -322,6 +336,7 @@ fn artifact_media_type_from_wire(value: u8) -> Result<ArtifactMediaType, Protoco
     match value {
         1 => Ok(ArtifactMediaType::TextHtmlUtf8),
         2 => Ok(ArtifactMediaType::ImagePng),
+        3 => Ok(ArtifactMediaType::ApplicationOctetStream),
         _ => Err(ProtocolError::InvalidMonitorPayload),
     }
 }
@@ -463,12 +478,27 @@ mod tests {
                         WebSocketDirection::Received,
                         WebSocketOpcode::Text,
                         true,
-                        artifact(),
+                        Some(artifact()),
                     )
                     .expect("frame"),
                 ),
             )
             .expect("frame committed"),
+            MonitorEvent::new(
+                MonitorCursor::new(5),
+                1_784_500_000_250,
+                MonitorEventKind::FrameCommitted(
+                    // An empty frame carries no CAS reference.
+                    MonitorFrame::new(
+                        WebSocketDirection::Sent,
+                        WebSocketOpcode::Ping,
+                        false,
+                        None,
+                    )
+                    .expect("empty frame"),
+                ),
+            )
+            .expect("empty frame committed"),
             MonitorEvent::new(
                 MonitorCursor::new(3),
                 1_784_500_000_100,
@@ -541,7 +571,7 @@ mod tests {
                     WebSocketDirection::Sent,
                     WebSocketOpcode::Ping,
                     false,
-                    artifact(),
+                    Some(artifact()),
                 )
                 .expect("frame"),
             ),
@@ -552,6 +582,12 @@ mod tests {
         assert_eq!(frame_bytes[25], WebSocketOpcode::Ping.to_rfc6455());
         frame_bytes[25] = 0x7;
         assert!(MonitorEvent::decode(&frame_bytes).is_err());
+
+        // A truncated frame with no artifact is a contradiction and is rejected.
+        assert!(matches!(
+            MonitorFrame::new(WebSocketDirection::Sent, WebSocketOpcode::Text, true, None),
+            Err(ProtocolError::InvalidMonitorPayload)
+        ));
 
         // Trailing garbage past a complete record fails closed.
         let mut trailing = stopped.encode().expect("encode");

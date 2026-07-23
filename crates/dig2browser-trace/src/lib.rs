@@ -1,8 +1,10 @@
 //! Crash-safe trace event and content-addressed artifact storage.
 
 mod journal;
+mod sink;
 
 pub use journal::MonitorJournal;
+pub use sink::MonitorSink;
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions, TryLockError};

@@ -142,14 +142,14 @@ impl MonitorJournal {
         )
     }
 
-    /// Append a captured frame's metadata; its payload is already in the CAS,
-    /// referenced by `artifact`.
+    /// Append a captured frame's metadata; a non-empty payload is already in the
+    /// CAS, referenced by `artifact` (`None` for an empty frame).
     pub fn commit_frame(
         &mut self,
         direction: WebSocketDirection,
         opcode: WebSocketOpcode,
         truncated: bool,
-        artifact: ArtifactRef,
+        artifact: Option<ArtifactRef>,
         timestamp_unix_ms: u64,
     ) -> Result<MonitorEvent, LedgerError> {
         let frame = MonitorFrame::new(direction, opcode, truncated, artifact)?;
@@ -454,7 +454,7 @@ mod tests {
                     WebSocketDirection::Received,
                     WebSocketOpcode::Text,
                     false,
-                    artifact(1),
+                    Some(artifact(1)),
                     11,
                 )
                 .expect("frame");
@@ -502,7 +502,7 @@ mod tests {
                 WebSocketDirection::Sent,
                 WebSocketOpcode::Text,
                 false,
-                artifact(2),
+                Some(artifact(2)),
                 5,
             ),
             Err(LedgerError::InvalidTransition(_))
@@ -521,7 +521,7 @@ mod tests {
                 WebSocketDirection::Sent,
                 WebSocketOpcode::Text,
                 false,
-                artifact(3),
+                Some(artifact(3)),
                 9,
             ),
             Err(LedgerError::InvalidTransition(_))
@@ -533,7 +533,7 @@ mod tests {
                 WebSocketDirection::Sent,
                 WebSocketOpcode::Text,
                 false,
-                artifact(4),
+                Some(artifact(4)),
                 13,
             ),
             Err(LedgerError::InvalidTransition(_))
@@ -553,7 +553,7 @@ mod tests {
                     WebSocketDirection::Received,
                     WebSocketOpcode::Text,
                     false,
-                    artifact(5),
+                    Some(artifact(5)),
                     11,
                 )
                 .expect("frame");
@@ -590,7 +590,7 @@ mod tests {
                     WebSocketDirection::Received,
                     WebSocketOpcode::Text,
                     false,
-                    artifact(6),
+                    Some(artifact(6)),
                     11,
                 )
                 .expect("frame");
@@ -623,7 +623,7 @@ mod tests {
                 WebSocketDirection::Sent,
                 WebSocketOpcode::Text,
                 false,
-                artifact(7),
+                Some(artifact(7)),
                 21,
             )
             .is_err());

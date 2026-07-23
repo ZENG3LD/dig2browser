@@ -968,6 +968,12 @@ fn verify_receipt_artifact(
     let max_len = match artifact.media_type() {
         ArtifactMediaType::TextHtmlUtf8 => MAX_HTML_BYTES,
         ArtifactMediaType::ImagePng => MAX_PNG_BYTES,
+        // A collection receipt only ever carries HTML / viewport-PNG artifacts;
+        // the opaque monitor-frame media type belongs to the durable-monitor CAS
+        // path, so seeing it in a receipt means the receipt is not one we wrote.
+        ArtifactMediaType::ApplicationOctetStream => {
+            return Err(CollectionError::CorruptReceipt)
+        }
     };
     if capacity == 0 || capacity > max_len {
         return Err(CollectionError::CorruptReceipt);

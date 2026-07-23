@@ -60,6 +60,12 @@ pub enum ArtifactRole {
 pub enum ArtifactMediaType {
     TextHtmlUtf8,
     ImagePng,
+    /// Opaque bytes (`application/octet-stream`) — the media type for a durable
+    /// monitor's captured WebSocket/SSE frame payload, whose text-vs-binary
+    /// semantics are carried out-of-band by the frame's opcode in the monitor
+    /// journal record, not by this media type. Never produced by the
+    /// finite-task collection/crawl path.
+    ApplicationOctetStream,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1247,6 +1253,7 @@ fn artifact_media_type_to_wire(media_type: ArtifactMediaType) -> u8 {
     match media_type {
         ArtifactMediaType::TextHtmlUtf8 => 1,
         ArtifactMediaType::ImagePng => 2,
+        ArtifactMediaType::ApplicationOctetStream => 3,
     }
 }
 
@@ -1256,6 +1263,7 @@ fn artifact_media_type_from_wire(
     match value {
         1 => Ok(ArtifactMediaType::TextHtmlUtf8),
         2 => Ok(ArtifactMediaType::ImagePng),
+        3 => Ok(ArtifactMediaType::ApplicationOctetStream),
         _ => Err(ProtocolError::InvalidCollectionPayload),
     }
 }
