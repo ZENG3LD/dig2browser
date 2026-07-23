@@ -1712,6 +1712,12 @@ impl PageBackend for CdpPageBackend {
     ) -> BoxFuture<'a, Result<(), BrowserError>> {
         Box::pin(async move {
             for cookie in cookies {
+                // Chrome rejects a cookie set with only a bare domain and no URL
+                // context (e.g. from about:blank). Synthesize a request-URI from
+                // the cookie's host + secure flag; cookies are port-agnostic, so a
+                // portless URL matches any port of that host.
+                let host = cookie.domain.trim_start_matches('.');
+                let scheme = if cookie.is_secure { "https" } else { "http" };
                 let cdp_cookie = crate::cdp::CdpCookie {
                     name: cookie.name.clone(),
                     value: cookie.value.clone(),
@@ -1720,6 +1726,7 @@ impl PageBackend for CdpPageBackend {
                     secure: cookie.is_secure,
                     http_only: cookie.is_httponly,
                     expires: cookie.expires_utc.map(|t| t as f64),
+                    url: Some(format!("{scheme}://{host}/")),
                 };
                 self.session
                     .set_cookie(cdp_cookie)

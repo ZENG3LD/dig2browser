@@ -16,7 +16,14 @@ pub struct CdpCookie {
     pub path: String,
     pub secure: bool,
     pub http_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires: Option<f64>,
+    /// Request-URI context for `Network.setCookie`. Chrome rejects a cookie set
+    /// with only a bare domain and no page/URL context (e.g. from `about:blank`),
+    /// so cookie installation supplies a synthesized `scheme://host/`. Absent on
+    /// `Network.getCookies` results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 impl CdpSession {

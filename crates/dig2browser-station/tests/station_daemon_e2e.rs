@@ -1149,6 +1149,69 @@ async fn in_process_station_chrome_auth_cookie_reuse_e2e() {
     remove_tree(&profiles).await;
 }
 
+// Phase B.1c acceptance: a prepared session imported from cookie material is
+// installed into the profile and transmitted by the browser on a later
+// authenticated navigation — without any headful login.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_process_station_chrome_session_import_reuse_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let unique = uuid::Uuid::new_v4();
+    let profiles = e2e_temp_base().join(format!(
+        "dig2browser-in-process-import-e2e-{unique}"
+    ));
+    let profiles_owner = ProfilesRootOwnership::acquire(&profiles)
+        .expect("own in-process import profiles root");
+    let config = StationConfig::new(profiles_owner.root(), 2, 2)
+        .expect("valid in-process import station config")
+        .with_runtime_selector(RuntimeSelector::Exact(RuntimeKind::Chrome));
+    let station = BrowserStation::new(config);
+    let identity = StationIdentityRequest::authenticated_persona(
+        "in-process-import-profile",
+        BrowserPersona::desktop_default(),
+    );
+
+    // The prepared session: the same marker cookie the fixture's /auth-check
+    // looks for, host-only for the fixture host (localhost). Built directly as a
+    // CookieSpec — the portable file parser is unit-tested separately.
+    let cookies = vec![dig2browser::agentic::CookieSpec {
+        name: "dig2browser_auth_e2e".to_owned(),
+        value: "cookie-secret".to_owned(),
+        domain: "localhost".to_owned(),
+        path: "/".to_owned(),
+        secure: false,
+        http_only: false,
+        expires_unix: None,
+    }];
+
+    let imported = station
+        .import_session(identity.clone(), cookies, 60)
+        .await
+        .expect("import prepared session");
+    assert_eq!(imported, 1);
+
+    // Reuse proof: the fixture only renders auth-check-ok when the request
+    // carried the cookie, so a Ready phase means the imported cookie was both
+    // installed and transmitted by the browser.
+    let status = station
+        .check_auth_session(
+            identity,
+            SessionHealthProbe {
+                url: fixture.url("/auth-check"),
+                ready_selector: "[data-daemon-e2e='auth-check-ok']".to_owned(),
+                reauth_selector: "[data-daemon-e2e='auth-check-missing']".to_owned(),
+                ready_ttl_seconds: 60,
+            },
+        )
+        .await
+        .expect("check imported session");
+    assert_eq!(status.phase, SessionPhase::Ready);
+
+    station.shutdown().await.expect("shutdown in-process import station");
+    drop(profiles_owner);
+    remove_tree(&profiles).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stationd_compiles_personas_binds_routes_and_validates_probe_e2e() {
     let _serial = e2e_serial_guard().await;
