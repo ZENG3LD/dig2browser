@@ -16,6 +16,7 @@
 //! unit-tested end-to-end (record → reopen → read payloads back from the CAS).
 
 use std::path::Path;
+use std::sync::Arc;
 
 use dig2browser_protocol::{
     ArtifactMediaType, LiveFilter, MonitorCursor, MonitorEvent, MonitorFrame, MonitorStopReason,
@@ -25,18 +26,20 @@ use dig2browser_protocol::{
 use crate::{LedgerError, MonitorJournal, TraceLedger};
 
 /// A durable monitor sink over a shared [`TraceLedger`] CAS and its own
-/// append-only [`MonitorJournal`]. Owns the journal (single writer); borrows the
-/// ledger, which is the single writer of the shared content-addressed store.
-pub struct MonitorSink<'ledger> {
-    ledger: &'ledger TraceLedger,
+/// append-only [`MonitorJournal`]. Owns the journal (single writer) and holds a
+/// shared handle to the ledger, which is the single writer of the shared
+/// content-addressed store. The ledger is an `Arc` (not a borrow) so a sink can
+/// be moved into a long-lived capture task.
+pub struct MonitorSink {
+    ledger: Arc<TraceLedger>,
     journal: MonitorJournal,
 }
 
-impl<'ledger> MonitorSink<'ledger> {
+impl MonitorSink {
     /// Open a sink over `ledger`'s CAS and a journal at `journal_path`,
     /// reconciling a journal a crash left open (see [`MonitorJournal::open_at`]).
     pub fn open_at(
-        ledger: &'ledger TraceLedger,
+        ledger: Arc<TraceLedger>,
         journal_path: impl AsRef<Path>,
         successor_timestamp_unix_ms: u64,
     ) -> Result<Self, LedgerError> {
@@ -49,7 +52,7 @@ impl<'ledger> MonitorSink<'ledger> {
     /// Open a sink WITHOUT reconciling the journal — the caller inspects
     /// [`is_terminal`](Self::is_terminal) and decides to resume or reconcile.
     pub fn open_deferred(
-        ledger: &'ledger TraceLedger,
+        ledger: Arc<TraceLedger>,
         journal_path: impl AsRef<Path>,
     ) -> Result<Self, LedgerError> {
         Ok(Self {
@@ -138,6 +141,7 @@ mod tests {
     use dig2browser_protocol::MonitorEventKind;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TestRoot(PathBuf);
@@ -176,8 +180,8 @@ mod tests {
         let root = TestRoot::new("durable");
         // Record a text frame, an empty frame, and a binary frame, then stop.
         {
-            let ledger = TraceLedger::open_at(root.ledger_root(), 1).expect("ledger");
-            let mut sink = MonitorSink::open_at(&ledger, root.journal(), 1).expect("sink");
+            let ledger = Arc::new(TraceLedger::open_at(root.ledger_root(), 1).expect("ledger"));
+            let mut sink = MonitorSink::open_at(ledger.clone(), root.journal(), 1).expect("sink");
             sink.start("wss://example.test/feed".to_owned(), LiveFilter::all(), 10)
                 .expect("start");
             sink.record_frame(
@@ -209,8 +213,8 @@ mod tests {
 
         // Reopen over the same CAS + journal; a fresh process would see exactly
         // this — the durability the RAM ring cannot provide.
-        let ledger = TraceLedger::open_at(root.ledger_root(), 99).expect("reopen ledger");
-        let sink = MonitorSink::open_at(&ledger, root.journal(), 99).expect("reopen sink");
+        let ledger = Arc::new(TraceLedger::open_at(root.ledger_root(), 99).expect("reopen ledger"));
+        let sink = MonitorSink::open_at(ledger.clone(), root.journal(), 99).expect("reopen sink");
         assert!(sink.is_terminal());
         assert_eq!(sink.record_count(), 5); // start + 3 frames + stop
 
@@ -242,8 +246,8 @@ mod tests {
     #[test]
     fn identical_frame_payloads_dedup_in_the_cas() {
         let root = TestRoot::new("dedup");
-        let ledger = TraceLedger::open_at(root.ledger_root(), 1).expect("ledger");
-        let mut sink = MonitorSink::open_at(&ledger, root.journal(), 1).expect("sink");
+        let ledger = Arc::new(TraceLedger::open_at(root.ledger_root(), 1).expect("ledger"));
+        let mut sink = MonitorSink::open_at(ledger.clone(), root.journal(), 1).expect("sink");
         sink.start("wss://example.test/feed".to_owned(), LiveFilter::all(), 10)
             .expect("start");
         sink.record_frame(WebSocketDirection::Received, WebSocketOpcode::Text, b"heartbeat", false, 11)
@@ -268,16 +272,16 @@ mod tests {
     fn a_crash_left_open_sink_is_reconciled_and_recorded_frames_survive() {
         let root = TestRoot::new("crash");
         {
-            let ledger = TraceLedger::open_at(root.ledger_root(), 1).expect("ledger");
-            let mut sink = MonitorSink::open_at(&ledger, root.journal(), 1).expect("sink");
+            let ledger = Arc::new(TraceLedger::open_at(root.ledger_root(), 1).expect("ledger"));
+            let mut sink = MonitorSink::open_at(ledger.clone(), root.journal(), 1).expect("sink");
             sink.start("wss://example.test/feed".to_owned(), LiveFilter::all(), 10)
                 .expect("start");
             sink.record_frame(WebSocketDirection::Received, WebSocketOpcode::Text, b"partial", false, 11)
                 .expect("frame");
             // No stop — drop simulates a crash.
         }
-        let ledger = TraceLedger::open_at(root.ledger_root(), 50).expect("reopen ledger");
-        let sink = MonitorSink::open_at(&ledger, root.journal(), 50).expect("reopen sink");
+        let ledger = Arc::new(TraceLedger::open_at(root.ledger_root(), 50).expect("reopen ledger"));
+        let sink = MonitorSink::open_at(ledger.clone(), root.journal(), 50).expect("reopen sink");
         assert!(sink.is_terminal());
         let records = sink.read(MonitorCursor::START, 64);
         assert_eq!(records.len(), 3); // start + frame + synthetic stop

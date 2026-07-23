@@ -15,7 +15,8 @@ use dig2browser_client::{
     ClientError, CollectionId, CollectionTask, ControlTransport, CrawlCursor,
     CrawlEvent, CrawlEventKind, CrawlJobId, CrawlPhase, CrawlSpec, EngineFamily, FailureClass,
     IdentitySessionStatus, InterruptedReason, LiveCursor, LiveEventKind, LiveFilter,
-    LiveTarget, MobilePersonaConfig, PersonaPreset,
+    LiveTarget, MobilePersonaConfig, MonitorCursor, MonitorEvent, MonitorEventKind,
+    MonitorFrame, MonitorStopReason, PersonaPreset,
     ProfileClass, ResponseStatus, RouteRef, RuntimeFeature, RuntimeKind,
     RuntimeRequirements, RuntimeSelector, SessionHealthProbe, SessionPhase,
     SessionStateUpdate, StationClient, StationStatus, SupportLevel,
@@ -25,8 +26,8 @@ use dig2browser_client::{
 };
 use dig2browser_probe::ProbeTranscriptV1;
 use dig2browser_station::{
-    BrowserStation, IdentityRequest as StationIdentityRequest, ProfilesRootOwnership,
-    StationConfig,
+    BrowserStation, DurableMonitorManager, IdentityRequest as StationIdentityRequest,
+    ProfilesRootOwnership, StationConfig,
 };
 use tokio::io::AsyncReadExt;
 
@@ -1445,6 +1446,179 @@ async fn stationd_live_websocket_capture_streams_typed_frames_e2e() {
     assert!(stderr.is_empty(), "clean live-ws station wrote stderr: {stderr}");
     drop(ws_fixture);
     remove_tree(&profiles).await;
+}
+
+// P1.2 Part B slice 6 acceptance: a durable monitor's captured WebSocket frames
+// survive a station restart. Station A begins a durable monitor and captures real
+// frames (payloads to the CAS, metadata to the journal, fsync per frame), then is
+// abandoned (the crash end state: locks released, journal non-terminal). A fresh
+// Station B reconciles the crash-left-open journal, replays the durable records
+// from a cursor, and reads the frame payloads back from the CAS byte-exact — the
+// durability the live RAM ring cannot provide.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn durable_monitor_survives_station_restart_and_resumes_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let ws_fixture = WebSocketFixture::start().await;
+    let unique = uuid::Uuid::new_v4();
+    let base = e2e_temp_base().join(format!("dig2browser-durable-monitor-e2e-{unique}"));
+    let profiles = base.join("profiles");
+    let monitor_root = base.join("monitors");
+    std::fs::create_dir_all(&monitor_root).expect("create monitor root");
+    let profiles_owner =
+        ProfilesRootOwnership::acquire(&profiles).expect("own durable-monitor profiles root");
+    let config = StationConfig::new(profiles_owner.root(), 2, 2)
+        .expect("valid durable-monitor station config")
+        .with_runtime_selector(RuntimeSelector::Exact(RuntimeKind::Chrome));
+    let page_url = fixture.url(&format!("/live-ws-page-{}", ws_fixture.port));
+    let persona = BrowserPersona::desktop_default();
+
+    // --- Station A: begin a durable monitor and capture frames in both directions ---
+    let monitor_id = {
+        let station = BrowserStation::new(config.clone());
+        let manager =
+            DurableMonitorManager::open(station, &monitor_root).expect("open durable manager A");
+
+        // A cold browser launch can transiently fail the initial navigation; retry
+        // begin a few times, as a real caller would.
+        let mut monitor_id = None;
+        for attempt in 0..8 {
+            match manager
+                .begin(
+                    "durable-monitor-profile",
+                    ProfileClass::Public,
+                    persona.clone(),
+                    page_url.clone(),
+                    LiveFilter::new(true, true, false),
+                )
+                .await
+            {
+                Ok(id) => {
+                    monitor_id = Some(id);
+                    break;
+                }
+                Err(_) if attempt < 7 => {
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                }
+                Err(error) => panic!("begin durable monitor: {error:?}"),
+            }
+        }
+        let monitor_id = monitor_id.expect("begin durable monitor after retries");
+
+        // Wait until both a Received (server push) and a Sent (page send) frame
+        // have been captured durably.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut saw_received = false;
+        let mut saw_sent = false;
+        while tokio::time::Instant::now() < deadline && !(saw_received && saw_sent) {
+            let records = manager
+                .read(&monitor_id, MonitorCursor::START, 64)
+                .expect("read resident durable monitor");
+            for frame in frame_records(&records) {
+                match frame.direction() {
+                    WebSocketDirection::Received => saw_received = true,
+                    WebSocketDirection::Sent => saw_sent = true,
+                }
+            }
+            if !(saw_received && saw_sent) {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+        assert!(
+            saw_received && saw_sent,
+            "durable monitor did not capture both frame directions before restart"
+        );
+
+        // Simulate a crash: release the monitor without a clean stop (journal left
+        // non-terminal, locks released), then drop the manager + station.
+        manager
+            .abandon(Duration::from_secs(5))
+            .await
+            .expect("abandon durable monitor");
+        drop(manager);
+        monitor_id
+    };
+
+    // --- Station B (restart): reconcile + resume from the durable journal + CAS ---
+    let station_b = BrowserStation::new(config.clone());
+    let manager_b =
+        DurableMonitorManager::open(station_b, &monitor_root).expect("open durable manager B");
+
+    // The crash-left-open journal was reconciled on open — it is now terminal.
+    assert!(
+        manager_b
+            .is_terminal(&monitor_id)
+            .expect("query terminal after restart"),
+        "durable monitor journal was not reconciled on restart"
+    );
+
+    let records = manager_b
+        .read(&monitor_id, MonitorCursor::START, 64)
+        .expect("read durable monitor after restart");
+    assert!(records[0].is_start(), "first record is not Started");
+    assert!(
+        matches!(
+            records.last().map(MonitorEvent::kind),
+            Some(MonitorEventKind::Stopped(MonitorStopReason::Interrupted(
+                InterruptedReason::SuccessorReconciliation
+            )))
+        ),
+        "last record is not the reconciliation Stopped"
+    );
+
+    let frames = frame_records(&records);
+    assert!(!frames.is_empty(), "no durable frames survived the restart");
+
+    // Read frame payloads back from the CAS byte-exact — the durability proof.
+    let received = frames
+        .iter()
+        .find(|frame| frame.direction() == WebSocketDirection::Received)
+        .expect("a received frame survived");
+    let received_payload = manager_b
+        .frame_payload(received)
+        .expect("received payload from CAS");
+    assert!(
+        String::from_utf8_lossy(&received_payload).contains("\"tick\""),
+        "unexpected durable received payload: {}",
+        String::from_utf8_lossy(&received_payload)
+    );
+    let sent = frames
+        .iter()
+        .find(|frame| frame.direction() == WebSocketDirection::Sent)
+        .expect("a sent frame survived");
+    assert_eq!(
+        manager_b.frame_payload(sent).expect("sent payload from CAS"),
+        b"hello-from-page"
+    );
+
+    // Resume from a cursor: reading after the first frame's cursor omits it.
+    let first_frame_cursor = records
+        .iter()
+        .find(|event| matches!(event.kind(), MonitorEventKind::FrameCommitted(_)))
+        .map(MonitorEvent::cursor)
+        .expect("a frame cursor");
+    let tail = manager_b
+        .read(&monitor_id, first_frame_cursor, 64)
+        .expect("cursored read after restart");
+    assert!(
+        tail.iter().all(|event| event.cursor().value() > first_frame_cursor.value()),
+        "cursored read returned records at or before the cursor"
+    );
+
+    drop(manager_b);
+    drop(ws_fixture);
+    drop(profiles_owner);
+    remove_tree(&base).await;
+}
+
+fn frame_records(records: &[MonitorEvent]) -> Vec<&MonitorFrame> {
+    records
+        .iter()
+        .filter_map(|event| match event.kind() {
+            MonitorEventKind::FrameCommitted(frame) => Some(frame),
+            _ => None,
+        })
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

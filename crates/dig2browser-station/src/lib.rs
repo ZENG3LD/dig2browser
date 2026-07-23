@@ -47,6 +47,7 @@ mod crawl;
 mod egress;
 pub mod ipc;
 mod live;
+mod monitor;
 mod route;
 pub mod runtime;
 mod session_import;
@@ -65,6 +66,7 @@ pub use egress::{
     EgressReport,
 };
 pub use live::LiveError;
+pub use monitor::{DurableMonitorManager, MonitorError};
 pub use route::{
     EgressRouteError, RouteDescriptor, RouteRegistry, RouteRegistryError,
     RouteTransport,
