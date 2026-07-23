@@ -2607,9 +2607,17 @@ fn bridge_cdp_event(event: crate::cdp::CdpEvent) -> Option<DevToolsEvent> {
     match event.method.as_str() {
         m if m.starts_with("Network.") => {
             let params = event.params.unwrap_or(serde_json::Value::Null);
+            // `response.url`/`request.url` cover normal HTTP flows; WebSocket
+            // lifecycle events (`Network.webSocketCreated`,
+            // `webSocketWillSendHandshakeRequest`) carry the endpoint URL at
+            // the top level instead, and the frame events
+            // (`webSocketFrameSent/Received`) carry none — so surfacing the
+            // top-level `url` here is what lets the station correlate a
+            // frame back to its `wss://` endpoint by `requestId`.
             let url = params["response"]["url"]
                 .as_str()
                 .or_else(|| params["request"]["url"].as_str())
+                .or_else(|| params["url"].as_str())
                 .map(|s| s.to_owned());
             let status = params["response"]["status"].as_u64().map(|s| s as u16);
             Some(DevToolsEvent::Network(NetworkEvent {

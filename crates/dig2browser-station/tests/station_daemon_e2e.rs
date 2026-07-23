@@ -14,13 +14,14 @@ use dig2browser_client::{
     ArtifactMediaType, ArtifactRef, ArtifactRole, BrowserPersona, ClientConfig,
     ClientError, CollectionId, CollectionTask, ControlTransport, CrawlCursor,
     CrawlEvent, CrawlEventKind, CrawlJobId, CrawlPhase, CrawlSpec, EngineFamily, FailureClass,
-    IdentitySessionStatus, InterruptedReason, MobilePersonaConfig, PersonaPreset,
+    IdentitySessionStatus, InterruptedReason, LiveCursor, LiveEventKind, LiveFilter,
+    LiveTarget, MobilePersonaConfig, PersonaPreset,
     ProfileClass, ResponseStatus, RouteRef, RuntimeFeature, RuntimeKind,
     RuntimeRequirements, RuntimeSelector, SessionHealthProbe, SessionPhase,
     SessionStateUpdate, StationClient, StationStatus, SupportLevel,
     TaskCapturePolicy, TaskReply, TaskRuntimeContract, TaskStep,
     TerminalOutcome, TraceCursor, TraceEvent, TraceEventKind,
-    PROTOCOL_VERSION,
+    WebSocketDirection, WebSocketOpcode, PROTOCOL_VERSION,
 };
 use dig2browser_probe::ProbeTranscriptV1;
 use dig2browser_station::{
@@ -85,6 +86,80 @@ impl Drop for FixtureServer {
     }
 }
 
+/// An async WebSocket fixture for the live-capture E2E. It completes the
+/// RFC 6455 handshake via tokio-tungstenite, pushes a text frame to each
+/// connecting browser (surfacing as `Network.webSocketFrameReceived`), and
+/// reads the page's own frame (surfacing as `Network.webSocketFrameSent`),
+/// keeping the socket open with periodic pushes until the page/browser goes
+/// away. Bound to an ephemeral port; the page script dials it by port.
+struct WebSocketFixture {
+    port: u16,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl WebSocketFixture {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind websocket fixture");
+        let port = listener
+            .local_addr()
+            .expect("websocket fixture address")
+            .port();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let _ = serve_websocket(stream).await;
+                });
+            }
+        });
+        Self { port, handle }
+    }
+}
+
+impl Drop for WebSocketFixture {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+async fn serve_websocket(
+    stream: tokio::net::TcpStream,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let mut ws = tokio_tungstenite::accept_async(stream).await?;
+    // Push once immediately so a `Received` frame is available promptly, then
+    // keep pushing so the station's reader reliably catches one after its
+    // devtools subscription attaches.
+    ws.send(Message::Text("{\"tick\":0}".to_owned().into())).await?;
+    let mut tick: u64 = 0;
+    loop {
+        tokio::select! {
+            incoming = ws.next() => match incoming {
+                Some(Ok(message)) if message.is_close() => break,
+                Some(Ok(_)) => {}
+                Some(Err(_)) | None => break,
+            },
+            _ = tokio::time::sleep(Duration::from_millis(300)) => {
+                tick += 1;
+                if ws
+                    .send(Message::Text(format!("{{\"tick\":{tick}}}").into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn serve_connection(mut stream: TcpStream) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     let mut request = Vec::with_capacity(4096);
@@ -146,6 +221,19 @@ fn serve_connection(mut stream: TcpStream) -> std::io::Result<()> {
         )
     } else if requested_marker == "persona-probe" {
         persona_probe_script(&request)
+    } else if let Some(ws_port) = requested_marker.strip_prefix("live-ws-page-") {
+        // Open a WebSocket to the live-capture fixture after a short delay so
+        // the station's devtools subscription (attached right after Navigate
+        // returns) is guaranteed active before any frame is exchanged — the
+        // page sends one frame on open (recorded as webSocketFrameSent) and
+        // the server pushes frames back (webSocketFrameReceived).
+        format!(
+            "<script>setTimeout(()=>{{\
+const ws=new WebSocket('ws://localhost:{ws_port}/');\
+ws.onopen=()=>ws.send('hello-from-page');\
+ws.onmessage=(event)=>{{document.title='ws-recv';}};\
+}},400)</script>"
+        )
     } else {
         String::new()
     };
@@ -1211,6 +1299,151 @@ async fn in_process_station_chrome_session_import_reuse_e2e() {
 
     station.shutdown().await.expect("shutdown in-process import station");
     drop(profiles_owner);
+    remove_tree(&profiles).await;
+}
+
+// P1.1 acceptance: an agent starts a live monitor over the pipe and reads a
+// page's real WebSocket traffic — both directions, typed, with the endpoint
+// url correlated — without hand-rolling any browser plumbing. This is the
+// exact "consumer had to hand-write a WebSocket monitor" crutch the live
+// capability exists to remove, proven against real Chrome and a real WS peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stationd_live_websocket_capture_streams_typed_frames_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let ws_fixture = WebSocketFixture::start().await;
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-stationd-live-ws-e2e-{unique}");
+    let profiles = e2e_temp_base().join(format!(
+        "dig2browser-stationd-live-ws-e2e-{unique}"
+    ));
+    std::fs::create_dir_all(&profiles).expect("create live-ws profiles root");
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+    let mut daemon = spawn_stationd_for_live_events(stationd, &pipe_name, &profiles);
+
+    let client = StationClient::connect(
+        ClientConfig::new(
+            &pipe_name,
+            Duration::from_secs(15),
+            Duration::from_secs(90),
+        )
+        .expect("valid live-ws client config"),
+    )
+    .await
+    .expect("connect live-ws station client");
+
+    let page_url = fixture.url(&format!("/live-ws-page-{}", ws_fixture.port));
+    // websocket_only: frame traffic without the full HTTP/XHR firehose.
+    // A cold browser launch can occasionally fail the initial navigation
+    // (RuntimeError::Navigation), surfaced as an Unavailable begin — the same
+    // transient any station navigation can hit — so retry a few times here,
+    // as a real client would.
+    let mut session = None;
+    for attempt in 0..8 {
+        match client
+            .begin_live_capture(
+                "live-ws-profile",
+                LiveTarget::Navigate {
+                    url: page_url.clone(),
+                },
+                LiveFilter::new(true, true, false),
+            )
+            .await
+        {
+            Ok(id) => {
+                session = Some(id);
+                break;
+            }
+            Err(ClientError::Remote {
+                status: ResponseStatus::Unavailable,
+                ..
+            }) if attempt < 7 => {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+            }
+            Err(error) => panic!("begin live websocket capture: {error:?}"),
+        }
+    }
+    let session = session.expect("begin live websocket capture after retries");
+
+    // Drain the cursored feed until both frame directions are observed.
+    let mut cursor = LiveCursor::START;
+    let mut received_frame: Option<(WebSocketOpcode, Vec<u8>, Option<String>)> = None;
+    let mut sent_frame: Option<(WebSocketOpcode, Vec<u8>)> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline
+        && (received_frame.is_none() || sent_frame.is_none())
+    {
+        let page = client
+            .read_live_events(session, cursor, 64)
+            .await
+            .expect("read live events");
+        assert!(
+            page.is_active(),
+            "live session ended before both frames were captured"
+        );
+        for event in page.events() {
+            if let LiveEventKind::WebSocketFrame(frame) = event.kind() {
+                match frame.direction() {
+                    WebSocketDirection::Received => {
+                        received_frame.get_or_insert_with(|| {
+                            (
+                                frame.opcode(),
+                                frame.payload().to_vec(),
+                                frame.url().map(str::to_owned),
+                            )
+                        });
+                    }
+                    WebSocketDirection::Sent => {
+                        sent_frame.get_or_insert_with(|| {
+                            (frame.opcode(), frame.payload().to_vec())
+                        });
+                    }
+                }
+            }
+        }
+        cursor = page.next_cursor();
+        if received_frame.is_none() || sent_frame.is_none() {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }
+
+    let (recv_opcode, recv_payload, recv_url) =
+        received_frame.expect("server->page WebSocket frame captured over the pipe");
+    assert_eq!(recv_opcode, WebSocketOpcode::Text);
+    assert!(
+        String::from_utf8_lossy(&recv_payload).contains("\"tick\""),
+        "unexpected received payload: {}",
+        String::from_utf8_lossy(&recv_payload)
+    );
+    // The url backfill (via webSocketCreated's top-level url) resolves the
+    // frame endpoint even though CDP omits the url on the frame events.
+    let recv_url = recv_url.expect("received frame carries the correlated ws endpoint url");
+    assert!(
+        recv_url.contains(&format!("localhost:{}", ws_fixture.port)),
+        "unexpected frame endpoint url: {recv_url}"
+    );
+
+    let (sent_opcode, sent_payload) =
+        sent_frame.expect("page->server WebSocket frame captured over the pipe");
+    assert_eq!(sent_opcode, WebSocketOpcode::Text);
+    assert_eq!(sent_payload, b"hello-from-page");
+
+    client
+        .stop_live_capture(session)
+        .await
+        .expect("stop live capture");
+    // After Stop the session is removed, so a further Read is rejected.
+    assert!(client.read_live_events(session, cursor, 64).await.is_err());
+
+    client.shutdown().await.expect("request live-ws station drain");
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("live-ws station daemon exit timeout")
+        .expect("wait for live-ws station daemon");
+    assert!(status.success(), "live-ws station daemon failed: {status}");
+    let (_, stderr) = read_child_output(&mut daemon).await;
+    assert!(stderr.is_empty(), "clean live-ws station wrote stderr: {stderr}");
+    drop(ws_fixture);
     remove_tree(&profiles).await;
 }
 
@@ -2970,6 +3203,41 @@ fn spawn_stationd_for_runtime(
         true,
         false,
     )
+}
+
+fn spawn_stationd_for_live_events(
+    stationd: &str,
+    pipe_name: &str,
+    profiles: &Path,
+) -> tokio::process::Child {
+    let mut command = tokio::process::Command::new(stationd);
+    command.args([
+        "--pipe-name",
+        pipe_name,
+        "--profiles-root",
+        profiles.to_str().expect("profiles path is UTF-8"),
+        "--runtime",
+        "chrome",
+        "--max-resident",
+        "2",
+        "--max-in-flight",
+        "4",
+        "--max-connections",
+        "8",
+        "--timeout-seconds",
+        "90",
+        "--drain-seconds",
+        "15",
+        "--allow-remote-shutdown",
+        "--allow-live-events",
+    ]);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn live-events station daemon")
 }
 
 fn spawn_stationd_for_firefox(
