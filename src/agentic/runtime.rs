@@ -1,12 +1,16 @@
 use futures::future::BoxFuture;
 
-use crate::browser::{DevToolsEvent, NetworkEvent, PageDevTools, StealthBrowser, StealthPage};
+use crate::browser::{
+    Cookie, CookieJar, DevToolsEvent, NetworkEvent, PageDevTools, StealthBrowser, StealthPage,
+};
 use crate::detect::{BrowserPreference, BrowserProfile, LaunchConfig};
 use crate::identity::{BrowserBackend, DevicePersona, IdentityProfile};
 use crate::process_isolation::BrowserProcessIsolation;
 use crate::stealth::StealthConfig;
 
-use super::contract::{CaptureArtifact, CapturePolicy, DocumentState, RuntimeFailureKind};
+use super::contract::{
+    CaptureArtifact, CapturePolicy, CookieSpec, DocumentState, RuntimeFailureKind,
+};
 use super::mobile::MobileLayout;
 use super::navigation::NavigationPolicy;
 
@@ -56,6 +60,14 @@ pub trait BrowserRuntime: Send + 'static {
     /// returns an independent subscription — it does not disturb the
     /// runtime's own internal DevTools use (HTTP-status tracking).
     fn subscribe_devtools(&mut self) -> BoxFuture<'_, RuntimeResult<PageDevTools>> {
+        Box::pin(async { Err(RuntimeError::new(RuntimeFailureKind::Protocol)) })
+    }
+
+    /// Install cookies into the running session (CDP `Network.setCookie`).
+    /// Default reports the surface as unsupported; only [`RealBrowserRuntime`]
+    /// overrides it.
+    fn set_cookies(&mut self, cookies: Vec<CookieSpec>) -> BoxFuture<'_, RuntimeResult<()>> {
+        let _ = cookies;
         Box::pin(async { Err(RuntimeError::new(RuntimeFailureKind::Protocol)) })
     }
 }
@@ -519,6 +531,29 @@ impl BrowserRuntime for RealBrowserRuntime {
                 .devtools()
                 .await
                 .map_err(|_| RuntimeError::new(RuntimeFailureKind::Protocol))
+        })
+    }
+
+    fn set_cookies(&mut self, cookies: Vec<CookieSpec>) -> BoxFuture<'_, RuntimeResult<()>> {
+        Box::pin(async move {
+            let jar = CookieJar(
+                cookies
+                    .into_iter()
+                    .map(|cookie| Cookie {
+                        name: cookie.name,
+                        value: cookie.value,
+                        domain: cookie.domain,
+                        path: cookie.path,
+                        is_secure: cookie.secure,
+                        is_httponly: cookie.http_only,
+                        expires_utc: cookie.expires_unix,
+                    })
+                    .collect(),
+            );
+            self.page()?
+                .set_cookies(&jar)
+                .await
+                .map_err(|_| RuntimeError::new(RuntimeFailureKind::Interaction))
         })
     }
 }

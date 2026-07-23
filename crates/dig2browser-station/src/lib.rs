@@ -49,6 +49,10 @@ pub mod ipc;
 mod live;
 mod route;
 pub mod runtime;
+// `parse_session_cookies` is consumed by the Phase B.1c import flow (not yet
+// wired); the allow is removed when that flow lands.
+#[allow(dead_code)]
+mod session_import;
 #[cfg(windows)]
 mod windows_containment;
 #[cfg(windows)]

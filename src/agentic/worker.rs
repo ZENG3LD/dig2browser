@@ -11,7 +11,8 @@ use crate::stealth::StealthConfig;
 
 use super::contract::{
     validate_selector, AgentCommand, AgentReply, BrowserSnapshot, Capability, CapabilitySet,
-    ContractError, DocumentState, ElementRef, L3Capability, RuntimeFailureKind, WorkerLifecycle,
+    ContractError, CookieSpec, DocumentState, ElementRef, L3Capability, RuntimeFailureKind,
+    WorkerLifecycle,
 };
 use super::mobile::MobileLayout;
 use super::navigation::NavigationPolicy;
@@ -22,6 +23,11 @@ const MAX_KEY_BYTES: usize = 64;
 const MAX_TEXT_BYTES: usize = 64 * 1024;
 const MAX_SCRIPT_BYTES: usize = 64 * 1024;
 const MAX_SCRIPT_RESULT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_IMPORT_COOKIES: usize = 512;
+const MAX_COOKIE_NAME_BYTES: usize = 4 * 1024;
+const MAX_COOKIE_VALUE_BYTES: usize = 8 * 1024;
+const MAX_COOKIE_DOMAIN_BYTES: usize = 256;
+const MAX_COOKIE_PATH_BYTES: usize = 4 * 1024;
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
 const MIN_COMMAND_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_COMMAND_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -724,6 +730,13 @@ async fn handle_command(
             })
         }
         AgentCommand::Capture { policy } => runtime.capture(policy).await.map(AgentReply::Capture),
+        AgentCommand::SetCookies { cookies } => {
+            validate_cookies(&cookies)?;
+            runtime
+                .set_cookies(cookies)
+                .await
+                .map(|_| AgentReply::Acknowledged)
+        }
         AgentCommand::Restart => {
             return restart_runtime(runtime, snapshot, snapshots)
                 .await
@@ -846,6 +859,28 @@ fn validate_finite(values: &[f64]) -> Result<(), WorkerError> {
     }
 }
 
+fn validate_cookies(cookies: &[CookieSpec]) -> Result<(), WorkerError> {
+    if cookies.is_empty() || cookies.len() > MAX_IMPORT_COOKIES {
+        return Err(WorkerError::InvalidInput);
+    }
+    for cookie in cookies {
+        if cookie.name.is_empty()
+            || cookie.name.len() > MAX_COOKIE_NAME_BYTES
+            || cookie.value.len() > MAX_COOKIE_VALUE_BYTES
+            || cookie.domain.is_empty()
+            || cookie.domain.len() > MAX_COOKIE_DOMAIN_BYTES
+            || cookie.path.len() > MAX_COOKIE_PATH_BYTES
+            || cookie.name.contains('\0')
+            || cookie.value.contains('\0')
+            || cookie.domain.contains('\0')
+            || cookie.path.contains('\0')
+        {
+            return Err(WorkerError::InvalidInput);
+        }
+    }
+    Ok(())
+}
+
 fn validate_element_epoch(element: &ElementRef, current_epoch: u64) -> Result<(), WorkerError> {
     if element.page_epoch() == current_epoch {
         Ok(())
@@ -958,6 +993,34 @@ mod tests {
         CaptureArtifact, CapturePolicy, L2Capability, L3Capability, RuntimeFailureKind,
     };
     use crate::agentic::runtime::{BrowserRuntime, RuntimeResult};
+
+    fn cookie(name: &str, value: &str) -> CookieSpec {
+        CookieSpec {
+            name: name.to_owned(),
+            value: value.to_owned(),
+            domain: ".example.test".to_owned(),
+            path: "/".to_owned(),
+            secure: true,
+            http_only: true,
+            expires_unix: None,
+        }
+    }
+
+    #[test]
+    fn validate_cookies_bounds_and_rejects_malformed() {
+        assert!(validate_cookies(&[cookie("sid", "abc")]).is_ok());
+        assert!(validate_cookies(&[]).is_err());
+        assert!(validate_cookies(&[cookie("", "abc")]).is_err());
+        let mut no_domain = cookie("sid", "abc");
+        no_domain.domain = String::new();
+        assert!(validate_cookies(&[no_domain]).is_err());
+        assert!(validate_cookies(&[cookie("sid", "a\0b")]).is_err());
+        let many = vec![cookie("sid", "abc"); MAX_IMPORT_COOKIES + 1];
+        assert!(validate_cookies(&many).is_err());
+        let mut big = cookie("sid", "");
+        big.value = "x".repeat(MAX_COOKIE_VALUE_BYTES + 1);
+        assert!(validate_cookies(&[big]).is_err());
+    }
 
     #[derive(Default)]
     struct FakeState {

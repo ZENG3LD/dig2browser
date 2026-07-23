@@ -8,8 +8,8 @@ mod worker;
 
 pub use contract::{
     AgentCommand, AgentReply, BrowserSnapshot, Capability, CapabilitySet, CaptureArtifact,
-    CapturePolicy, ContractError, DocumentState, ElementRef, L1Capability, L2Capability,
-    L3Capability, RuntimeFailureKind, WorkerLifecycle, MAX_CAPABILITIES,
+    CapturePolicy, ContractError, CookieSpec, DocumentState, ElementRef, L1Capability,
+    L2Capability, L3Capability, RuntimeFailureKind, WorkerLifecycle, MAX_CAPABILITIES,
 };
 pub use mobile::{MobileLayout, MobileLayoutError};
 pub use navigation::{

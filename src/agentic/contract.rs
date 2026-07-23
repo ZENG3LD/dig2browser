@@ -177,6 +177,35 @@ pub enum CaptureArtifact {
     },
 }
 
+/// A single cookie to install into a session. Mirrors `crate::cookies::Cookie`
+/// but lives in the agentic contract (which is `PartialEq`). `value` is secret
+/// material and is redacted from `Debug`.
+#[derive(Clone, PartialEq)]
+pub struct CookieSpec {
+    pub name: String,
+    pub value: String,
+    pub domain: String,
+    pub path: String,
+    pub secure: bool,
+    pub http_only: bool,
+    pub expires_unix: Option<i64>,
+}
+
+impl std::fmt::Debug for CookieSpec {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CookieSpec")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .field("domain", &self.domain)
+            .field("path", &self.path)
+            .field("secure", &self.secure)
+            .field("http_only", &self.http_only)
+            .field("expires_unix", &self.expires_unix)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentCommand {
     ClickAt {
@@ -214,6 +243,12 @@ pub enum AgentCommand {
     Capture {
         policy: CapturePolicy,
     },
+    /// Install a set of cookies into the running session (CDP `Network.setCookie`).
+    /// Used by the station's gated session-import flow; never derived from a
+    /// consumer task step.
+    SetCookies {
+        cookies: Vec<CookieSpec>,
+    },
     Restart,
     Shutdown,
 }
@@ -233,6 +268,7 @@ impl AgentCommand {
             Self::Evaluate { .. } => Capability::L2(L2Capability::Evaluate),
             Self::Navigate { .. } => Capability::L3(L3Capability::Navigate),
             Self::Capture { .. } => Capability::L3(L3Capability::Capture),
+            Self::SetCookies { .. } => Capability::L2(L2Capability::Interact),
             Self::Restart | Self::Shutdown => Capability::L3(L3Capability::Lifecycle),
         }
     }
