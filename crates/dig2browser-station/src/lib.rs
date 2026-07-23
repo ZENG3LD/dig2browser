@@ -496,7 +496,6 @@ fn runtime_requirements(
             }
         }
     }
-    features.push(RuntimeFeature::PersistentProfile);
     features.push(match persona.kind() {
         PersonaKind::Desktop => RuntimeFeature::DesktopWeb,
         PersonaKind::Mobile => RuntimeFeature::MobileWebEmulation,
@@ -510,10 +509,7 @@ fn runtime_requirements(
 fn task_runtime_requirements(
     task: &BrowserTask,
 ) -> Result<RuntimeRequirements, RuntimeRequirementsError> {
-    let mut features = vec![
-        RuntimeFeature::Lifecycle,
-        RuntimeFeature::PersistentProfile,
-    ];
+    let mut features = vec![RuntimeFeature::Lifecycle];
     let mut add = |feature| {
         if !features.contains(&feature) {
             features.push(feature);
@@ -1101,7 +1097,12 @@ impl BrowserStation {
         additional_requirements: Option<&RuntimeRequirements>,
     ) -> Result<BrowserLease, StationError> {
         let requirements = runtime_requirements(&capabilities, identity.persona(), false)?;
+        let identity_requirements =
+            authenticated_identity_runtime_requirements(&identity)?;
         let mut requirement_sets = vec![&requirements];
+        if let Some(identity_requirements) = identity_requirements.as_ref() {
+            requirement_sets.push(identity_requirements);
+        }
         if let Some(additional) = additional_requirements {
             requirement_sets.push(additional);
         }
@@ -1417,10 +1418,17 @@ impl BrowserStation {
             identity.persona(),
             true,
         )?;
-        let runtime = self.inner.config.runtime_registry.prepare(
-            selector,
-            &requirements,
-        )?;
+        let identity_requirements =
+            authenticated_identity_runtime_requirements(&identity)?;
+        let mut requirement_sets = vec![&requirements];
+        if let Some(identity_requirements) = identity_requirements.as_ref() {
+            requirement_sets.push(identity_requirements);
+        }
+        let runtime = self
+            .inner
+            .config
+            .runtime_registry
+            .prepare_all(selector, &requirement_sets)?;
         if self.inner.config.navigation_policy.is_exact()
             && (!runtime.supports_exact_page_request_policy()
                 || !runtime.supports_station_egress()
