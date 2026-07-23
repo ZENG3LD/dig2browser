@@ -38,6 +38,11 @@ pub const MAX_UPLOAD_PATH_BYTES: usize = 4_096;
 pub const MAX_DOWNLOAD_BYTES: usize = 32 * 1024 * 1024;
 /// Upper bound on a `TaskReply::Download`'s suggested filename.
 pub const MAX_DOWNLOAD_FILENAME_BYTES: usize = 1_024;
+/// Upper bound on tabs returned by a `ListTabs` step's `TaskReply::Tabs`.
+pub const MAX_TABS: usize = 256;
+/// Upper bound on a `TabInfo`'s target id, and on the `id` carried by a
+/// `SwitchToTab` step.
+pub const MAX_TAB_ID_BYTES: usize = 1_024;
 const MAX_KEY_BYTES: usize = 64;
 const MAX_TEXT_BYTES: usize = 64 * 1024;
 const MAX_SCRIPT_BYTES: usize = 64 * 1024;
@@ -140,6 +145,25 @@ pub enum TaskStep {
     /// `--allow-file-upload`. `timeout` counts against the same cumulative
     /// wait budget as `Wait`/`WaitForSelector` (`MAX_TASK_WAIT`).
     WaitForDownload { timeout: Duration },
+    /// Enumerate the browser's open page targets (tabs/windows) as typed
+    /// `{id, url, title}` records (`TaskReply::Tabs`), so an agent can observe
+    /// and pick among tabs a page opened itself (`target=_blank`,
+    /// `window.open`, an OAuth popup).
+    ///
+    /// Inspect-only: it runs a fixed CDP `Target.getTargets` read (never a
+    /// consumer script), so it needs only `L2::Inspect` and is ungated — every
+    /// tab observed is already within the agent's own browser lease.
+    ListTabs,
+    /// Make the target identified by `id` (from a prior `ListTabs`) the
+    /// worker's active page.
+    ///
+    /// Lifecycle (`L3::Lifecycle`): swapping which page subsequent selector/
+    /// script/capture steps operate on is a browser-lifecycle operation, the
+    /// same footing as `Restart`. Ungated — every tab is already within the
+    /// agent's own browser lease. Invalidates any `ElementRef` resolved
+    /// against the previous tab (the worker bumps its page epoch, exactly as
+    /// `Navigate` does).
+    SwitchToTab { id: String },
 }
 
 /// A document load milestone (`document.readyState`), ordered
@@ -388,6 +412,10 @@ impl CollectionTask {
                         return Err(ProtocolError::InvalidTaskPayload);
                     }
                 }
+                TaskStep::ListTabs => {}
+                TaskStep::SwitchToTab { id } => {
+                    validate_text(id, MAX_TAB_ID_BYTES, false)?;
+                }
             }
         }
         Ok(())
@@ -488,6 +516,13 @@ impl CollectionTask {
                         .map_err(|_| ProtocolError::InvalidTaskPayload)?;
                     output.extend_from_slice(&millis.to_le_bytes());
                 }
+                TaskStep::ListTabs => {
+                    output.push(16);
+                }
+                TaskStep::SwitchToTab { id } => {
+                    output.push(17);
+                    put_u16_bytes(&mut output, id.as_bytes())?;
+                }
             }
         }
         if output.len() > MAX_REQUEST_BYTES {
@@ -564,6 +599,10 @@ impl CollectionTask {
                 },
                 15 => TaskStep::WaitForDownload {
                     timeout: Duration::from_millis(input.u64()?),
+                },
+                16 => TaskStep::ListTabs,
+                17 => TaskStep::SwitchToTab {
+                    id: input.utf8_u16()?,
                 },
                 _ => return Err(ProtocolError::InvalidTaskPayload),
             };
@@ -801,6 +840,48 @@ impl InteractiveElement {
     }
 }
 
+/// One open page target (tab/window) discovered by `ListTabs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabInfo {
+    id: String,
+    url: String,
+    title: String,
+}
+
+impl TabInfo {
+    pub fn new(id: String, url: String, title: String) -> Result<Self, ProtocolError> {
+        let tab = Self { id, url, title };
+        tab.validate()?;
+        Ok(tab)
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.id.is_empty()
+            || self.id.len() > MAX_TAB_ID_BYTES
+            || self.id.contains('\0')
+            || self.url.len() > crate::MAX_FINAL_URL_BYTES
+            || self.url.contains('\0')
+            || self.title.len() > crate::MAX_TITLE_BYTES
+            || self.title.contains('\0')
+        {
+            return Err(ProtocolError::InvalidTaskResult);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskReply {
     Acknowledged,
@@ -817,6 +898,9 @@ pub enum TaskReply {
         suggested_filename: String,
         bytes: Vec<u8>,
     },
+    /// Result of a `ListTabs` step: the browser's open page targets as typed
+    /// records (bounded to `MAX_TABS`).
+    Tabs(Vec<TabInfo>),
 }
 
 /// The exact runtime identity and feature support granted for a task.
@@ -982,6 +1066,15 @@ impl CollectionTaskResult {
                     put_result_u16_bytes(&mut output, suggested_filename.as_bytes())?;
                     put_u64_bytes(&mut output, bytes)?;
                 }
+                TaskReply::Tabs(tabs) => {
+                    output.push(7);
+                    output.extend_from_slice(&(tabs.len() as u16).to_le_bytes());
+                    for tab in tabs {
+                        put_result_u16_bytes(&mut output, tab.id.as_bytes())?;
+                        put_result_u32_bytes(&mut output, tab.url.as_bytes())?;
+                        put_result_u32_bytes(&mut output, tab.title.as_bytes())?;
+                    }
+                }
             }
             if output.len() > MAX_TASK_RESULT_BYTES {
                 return Err(ProtocolError::ResponseTooLarge);
@@ -1038,6 +1131,23 @@ impl CollectionTaskResult {
                     suggested_filename: input.utf8_u16_result()?,
                     bytes: input.bytes_u64()?.to_vec(),
                 },
+                7 => {
+                    let count = usize::from(input.u16()?);
+                    if count > MAX_TABS {
+                        return Err(ProtocolError::InvalidTaskResult);
+                    }
+                    let mut tabs = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let id = input.utf8_u16_result()?;
+                        let url = input.utf8_u32_result()?;
+                        let title = input.utf8_u32_result()?;
+                        tabs.push(
+                            TabInfo::new(id, url, title)
+                                .map_err(|_| ProtocolError::InvalidTaskResult)?,
+                        );
+                    }
+                    TaskReply::Tabs(tabs)
+                }
                 _ => return Err(ProtocolError::InvalidTaskResult),
             });
         }
@@ -1080,6 +1190,14 @@ impl CollectionTaskResult {
                     validate_result_text(suggested_filename, MAX_DOWNLOAD_FILENAME_BYTES)?;
                     if bytes.len() > MAX_DOWNLOAD_BYTES {
                         return Err(ProtocolError::InvalidTaskResult);
+                    }
+                }
+                TaskReply::Tabs(tabs) => {
+                    if tabs.len() > MAX_TABS {
+                        return Err(ProtocolError::InvalidTaskResult);
+                    }
+                    for tab in tabs {
+                        tab.validate()?;
                     }
                 }
             }
@@ -1420,6 +1538,13 @@ fn put_result_u16_bytes(output: &mut Vec<u8>, value: &[u8]) -> Result<(), Protoc
 
 fn put_u32_bytes(output: &mut Vec<u8>, value: &[u8]) -> Result<(), ProtocolError> {
     let len = u32::try_from(value.len()).map_err(|_| ProtocolError::InvalidTaskPayload)?;
+    output.extend_from_slice(&len.to_le_bytes());
+    output.extend_from_slice(value);
+    Ok(())
+}
+
+fn put_result_u32_bytes(output: &mut Vec<u8>, value: &[u8]) -> Result<(), ProtocolError> {
+    let len = u32::try_from(value.len()).map_err(|_| ProtocolError::InvalidTaskResult)?;
     output.extend_from_slice(&len.to_le_bytes());
     output.extend_from_slice(value);
     Ok(())
@@ -1791,6 +1916,89 @@ mod tests {
             bytes: vec![0u8; MAX_DOWNLOAD_BYTES + 1],
         }])
         .is_err());
+    }
+
+    #[test]
+    fn list_tabs_and_switch_to_tab_round_trip_and_are_ungated() {
+        let task = CollectionTask::new(vec![
+            navigate_step(),
+            TaskStep::ListTabs,
+            TaskStep::SwitchToTab {
+                id: "7A9B2C".to_owned(),
+            },
+        ])
+        .expect("valid task");
+
+        let encoded = task.encode_payload().expect("encode task");
+        let decoded = CollectionTask::decode_payload(&encoded).expect("decode task");
+        assert_eq!(decoded, task);
+        // Neither is interaction, script, file upload, or download — no gate.
+        assert!(!task.requires_interaction());
+        assert!(!task.requires_script());
+        assert!(!task.requires_file_upload());
+        assert!(!task.requires_download());
+
+        // An empty or over-length tab id is rejected.
+        assert!(CollectionTask::new(vec![
+            navigate_step(),
+            TaskStep::SwitchToTab { id: String::new() },
+        ])
+        .is_err());
+        assert!(CollectionTask::new(vec![
+            navigate_step(),
+            TaskStep::SwitchToTab {
+                id: "a".repeat(MAX_TAB_ID_BYTES + 1),
+            },
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn tabs_reply_round_trips_and_rejects_malformed() {
+        let tabs = vec![
+            TabInfo::new(
+                "7A9B2C".to_owned(),
+                "https://example.test/".to_owned(),
+                "Example".to_owned(),
+            )
+            .expect("valid tab"),
+            TabInfo::new("popup-1".to_owned(), "about:blank".to_owned(), String::new())
+                .expect("empty title allowed"),
+        ];
+        let result = CollectionTaskResult::new(vec![
+            TaskReply::Acknowledged,
+            TaskReply::Tabs(tabs),
+        ])
+        .expect("valid result");
+
+        let encoded = result.encode().expect("encode result");
+        assert_eq!(
+            CollectionTaskResult::decode(&encoded).expect("decode result"),
+            result
+        );
+
+        // An empty id and an over-length url are both rejected.
+        assert!(TabInfo::new(
+            String::new(),
+            "https://example.test/".to_owned(),
+            String::new(),
+        )
+        .is_err());
+        assert!(TabInfo::new(
+            "id".to_owned(),
+            "a".repeat(crate::MAX_FINAL_URL_BYTES + 1),
+            String::new(),
+        )
+        .is_err());
+
+        // Over-cap tab count is rejected.
+        let too_many: Vec<TabInfo> = (0..=MAX_TABS)
+            .map(|index| {
+                TabInfo::new(format!("tab-{index}"), String::new(), String::new())
+                    .expect("valid tab")
+            })
+            .collect();
+        assert!(CollectionTaskResult::new(vec![TaskReply::Tabs(too_many)]).is_err());
     }
 
     #[test]

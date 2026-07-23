@@ -1844,6 +1844,10 @@ fn to_station_task(task: &CollectionTask) -> Result<BrowserTask, crate::TaskErro
                 TaskStep::WaitForDownload { timeout } => {
                     BrowserTaskStep::WaitForDownload { timeout: *timeout }
                 }
+                TaskStep::ListTabs => BrowserTaskStep::ListTabs,
+                TaskStep::SwitchToTab { id } => BrowserTaskStep::SwitchToTab {
+                    id: id.clone(),
+                },
             })
             .collect(),
     )
@@ -1889,6 +1893,8 @@ fn task_capabilities(task: &CollectionTask) -> CapabilitySet {
             TaskStep::Capture { .. } | TaskStep::WaitForDownload { .. } => {
                 add(Capability::L3(L3Capability::Capture))
             }
+            TaskStep::ListTabs => add(Capability::L2(L2Capability::Inspect)),
+            TaskStep::SwitchToTab { .. } => add(Capability::L3(L3Capability::Lifecycle)),
         }
     }
     CapabilitySet::new(capabilities).expect("bounded task capabilities are unique")
@@ -1948,6 +1954,11 @@ fn to_protocol_result(
                 suggested_filename,
                 bytes,
             },
+            AgentReply::Tabs(tabs) => TaskReply::Tabs(
+                tabs.into_iter()
+                    .map(|tab| dig2browser_protocol::TabInfo::new(tab.id, tab.url, tab.title))
+                    .collect::<Result<_, _>>()?,
+            ),
             AgentReply::Element(_) => {
                 return Err(dig2browser_protocol::ProtocolError::InvalidTaskResult)
             }

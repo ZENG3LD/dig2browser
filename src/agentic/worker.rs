@@ -24,6 +24,7 @@ const MAX_TEXT_BYTES: usize = 64 * 1024;
 const MAX_SCRIPT_BYTES: usize = 64 * 1024;
 const MAX_SCRIPT_RESULT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_UPLOAD_PATH_BYTES: usize = 4 * 1024;
+const MAX_TAB_ID_BYTES: usize = 1024;
 const MAX_IMPORT_COOKIES: usize = 512;
 const MAX_COOKIE_NAME_BYTES: usize = 4 * 1024;
 const MAX_COOKIE_VALUE_BYTES: usize = 8 * 1024;
@@ -772,6 +773,20 @@ async fn handle_command(
                 .set_cookies(cookies)
                 .await
                 .map(|_| AgentReply::Acknowledged)
+        }
+        AgentCommand::ListTabs => runtime.list_tabs().await.map(AgentReply::Tabs),
+        AgentCommand::SwitchToTab { id } => {
+            if id.is_empty() || id.len() > MAX_TAB_ID_BYTES || id.contains('\0') {
+                return Err(WorkerError::InvalidInput);
+            }
+            runtime.switch_to_tab(&id).await.map(|_| {
+                // Switching the active page invalidates any `ElementRef`
+                // resolved against the previous tab, exactly as `Navigate`
+                // invalidates references to the pre-navigation document.
+                snapshot.page_epoch = snapshot.page_epoch.saturating_add(1);
+                snapshot.current_origin = None;
+                AgentReply::Acknowledged
+            })
         }
         AgentCommand::Restart => {
             return restart_runtime(runtime, snapshot, snapshots)

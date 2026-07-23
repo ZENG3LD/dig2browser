@@ -310,15 +310,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let target_id = if let Some(prefix) = &cli.target {
         pages
             .iter()
-            .find(|(_, url)| url.starts_with(prefix.as_str()))
-            .map(|(id, _)| id.clone())
+            .find(|(_, url, _)| url.starts_with(prefix.as_str()))
+            .map(|(id, _, _)| id.clone())
             .ok_or_else(|| {
                 format!(
                     "no tab with URL starting with '{}'. Available:\n{}",
                     prefix,
                     pages
                         .iter()
-                        .map(|(id, url)| format!("  {id}  {url}"))
+                        .map(|(id, url, _)| format!("  {id}  {url}"))
                         .collect::<Vec<_>>()
                         .join("\n")
                 )
@@ -326,9 +326,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         pages
             .iter()
-            .find(|(_, url)| url != "about:blank" && !url.is_empty())
+            .find(|(_, url, _)| url != "about:blank" && !url.is_empty())
             .or_else(|| pages.first())
-            .map(|(id, _)| id.clone())
+            .map(|(id, _, _)| id.clone())
             .ok_or("no tabs found")?
     };
 

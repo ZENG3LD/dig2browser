@@ -366,6 +366,8 @@ pub enum BrowserTaskStep {
     SelectOption { selector: String, value: String },
     UploadFile { selector: String, path: String },
     WaitForDownload { timeout: Duration },
+    ListTabs,
+    SwitchToTab { id: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -432,6 +434,9 @@ impl BrowserTask {
                     if total_wait > MAX_TASK_WAIT {
                         return Err(TaskError::InvalidWait);
                     }
+                }
+                BrowserTaskStep::SwitchToTab { id } if id.is_empty() => {
+                    return Err(TaskError::InvalidSelector);
                 }
                 _ => {}
             }
@@ -582,6 +587,8 @@ fn task_runtime_requirements(
                 add(RuntimeFeature::DomInspect)
             }
             BrowserTaskStep::WaitForDownload { .. } => add(RuntimeFeature::CaptureState),
+            BrowserTaskStep::ListTabs => add(RuntimeFeature::DomInspect),
+            BrowserTaskStep::SwitchToTab { .. } => add(RuntimeFeature::Lifecycle),
             BrowserTaskStep::Evaluate { .. } => add(RuntimeFeature::ScriptEvaluate),
             BrowserTaskStep::Capture { policy } => {
                 add(RuntimeFeature::CaptureState);
@@ -2378,6 +2385,18 @@ impl BrowserLease {
                 .execute(AgentCommand::WaitForDownload { timeout: *timeout })
                 .await
                 .map_err(StationError::from),
+            BrowserTaskStep::ListTabs => self
+                .slot
+                .worker
+                .execute(AgentCommand::ListTabs)
+                .await
+                .map_err(StationError::from),
+            BrowserTaskStep::SwitchToTab { id } => self
+                .slot
+                .worker
+                .execute(AgentCommand::SwitchToTab { id: id.clone() })
+                .await
+                .map_err(StationError::from),
         }
     }
 
@@ -2506,6 +2525,10 @@ impl BrowserLease {
                 }
                 BrowserTaskStep::Capture { .. } | BrowserTaskStep::WaitForDownload { .. } => {
                     &[Capability::L3(L3Capability::Capture)]
+                }
+                BrowserTaskStep::ListTabs => &[Capability::L2(L2Capability::Inspect)],
+                BrowserTaskStep::SwitchToTab { .. } => {
+                    &[Capability::L3(L3Capability::Lifecycle)]
                 }
             };
             if required

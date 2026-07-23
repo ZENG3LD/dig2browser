@@ -123,8 +123,8 @@ impl StealthBrowser {
     }
 
     /// List all open page targets (tabs) in an attached/launched browser.
-    /// Returns `(target_id, url)` pairs. Only works on the CDP backend.
-    pub async fn pages(&self) -> Result<Vec<(String, String)>, BrowserError> {
+    /// Returns `(target_id, url, title)` triples. Only works on the CDP backend.
+    pub async fn pages(&self) -> Result<Vec<(String, String, String)>, BrowserError> {
         let cdp = self
             .backend
             .as_any_cdp()
@@ -134,7 +134,10 @@ impl StealthBrowser {
 
     /// Attach to an existing open tab by `target_id` (from [`StealthBrowser::pages`]).
     /// Returns a `StealthPage` connected to that tab without creating a new one.
-    /// Does NOT inject stealth scripts — the page is already running.
+    /// Applies the same CDP-native stealth overrides as a freshly opened page
+    /// (UA/Client Hints, timezone, device metrics), but does NOT inject the
+    /// JS stealth scripts — those cannot retroactively patch a document this
+    /// tab already loaded before it was attached.
     pub async fn attach_page(&self, target_id: &str) -> Result<StealthPage, BrowserError> {
         let cdp = self
             .backend

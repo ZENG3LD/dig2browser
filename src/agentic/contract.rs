@@ -121,6 +121,17 @@ impl CapabilitySet {
     }
 }
 
+/// One open page target (tab/window) discovered by `AgentCommand::ListTabs`.
+/// Mirrors the wire `TabInfo`, but is the root-crate type: the root crate
+/// does not depend on `dig2browser-protocol`, so the station types this into
+/// the protocol `TabInfo` at its boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabInfo {
+    pub id: String,
+    pub url: String,
+    pub title: String,
+}
+
 /// A DOM locator that is valid only for the page epoch in which it was resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ElementRef {
@@ -281,6 +292,14 @@ pub enum AgentCommand {
     SetCookies {
         cookies: Vec<CookieSpec>,
     },
+    /// Enumerate the browser's open page targets (tabs/windows). Backs the
+    /// ungated `ListTabs` task step.
+    ListTabs,
+    /// Make the target identified by `id` (from a prior `ListTabs`) the
+    /// worker's active page. Backs the ungated `SwitchToTab` task step.
+    SwitchToTab {
+        id: String,
+    },
     Restart,
     Shutdown,
 }
@@ -305,7 +324,10 @@ impl AgentCommand {
                 Capability::L3(L3Capability::Capture)
             }
             Self::SetCookies { .. } => Capability::L2(L2Capability::Interact),
-            Self::Restart | Self::Shutdown => Capability::L3(L3Capability::Lifecycle),
+            Self::ListTabs => Capability::L2(L2Capability::Inspect),
+            Self::SwitchToTab { .. } | Self::Restart | Self::Shutdown => {
+                Capability::L3(L3Capability::Lifecycle)
+            }
         }
     }
 }
@@ -323,6 +345,8 @@ pub enum AgentReply {
         suggested_filename: String,
         bytes: Vec<u8>,
     },
+    /// Result of `ListTabs`: the browser's open page targets.
+    Tabs(Vec<TabInfo>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

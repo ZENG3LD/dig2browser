@@ -9,7 +9,7 @@ use crate::process_isolation::BrowserProcessIsolation;
 use crate::stealth::StealthConfig;
 
 use super::contract::{
-    CaptureArtifact, CapturePolicy, CookieSpec, DocumentState, RuntimeFailureKind,
+    CaptureArtifact, CapturePolicy, CookieSpec, DocumentState, RuntimeFailureKind, TabInfo,
 };
 use super::mobile::MobileLayout;
 use super::navigation::NavigationPolicy;
@@ -125,6 +125,22 @@ pub trait BrowserRuntime: Send + 'static {
         timeout: std::time::Duration,
     ) -> BoxFuture<'_, RuntimeResult<(String, Vec<u8>)>> {
         let _ = timeout;
+        Box::pin(async { Err(RuntimeError::new(RuntimeFailureKind::Protocol)) })
+    }
+
+    /// Enumerate the browser's open page targets (tabs/windows). Default
+    /// reports the surface as unsupported; only [`RealBrowserRuntime`]
+    /// overrides it. Backs the ungated `ListTabs` task step.
+    fn list_tabs(&mut self) -> BoxFuture<'_, RuntimeResult<Vec<TabInfo>>> {
+        Box::pin(async { Err(RuntimeError::new(RuntimeFailureKind::Protocol)) })
+    }
+
+    /// Make the target identified by `id` (from a prior `list_tabs`) the
+    /// worker's active page. Default reports the surface as unsupported; only
+    /// [`RealBrowserRuntime`] overrides it. Backs the ungated `SwitchToTab`
+    /// task step.
+    fn switch_to_tab<'a>(&'a mut self, id: &'a str) -> BoxFuture<'a, RuntimeResult<()>> {
+        let _ = id;
         Box::pin(async { Err(RuntimeError::new(RuntimeFailureKind::Protocol)) })
     }
 }
@@ -710,6 +726,40 @@ impl BrowserRuntime for RealBrowserRuntime {
                 .wait_for_download(timeout)
                 .await
                 .map_err(|_| RuntimeError::new(RuntimeFailureKind::Capture))
+        })
+    }
+
+    fn list_tabs(&mut self) -> BoxFuture<'_, RuntimeResult<Vec<TabInfo>>> {
+        Box::pin(async move {
+            let browser = self
+                .browser
+                .as_ref()
+                .ok_or_else(|| RuntimeError::new(RuntimeFailureKind::Protocol))?;
+            let pages = browser
+                .pages()
+                .await
+                .map_err(|_| RuntimeError::new(RuntimeFailureKind::Capture))?;
+            Ok(pages
+                .into_iter()
+                .map(|(id, url, title)| TabInfo { id, url, title })
+                .collect())
+        })
+    }
+
+    fn switch_to_tab<'a>(&'a mut self, id: &'a str) -> BoxFuture<'a, RuntimeResult<()>> {
+        Box::pin(async move {
+            let browser = self
+                .browser
+                .as_ref()
+                .ok_or_else(|| RuntimeError::new(RuntimeFailureKind::Protocol))?;
+            let page = browser
+                .attach_page(id)
+                .await
+                .map_err(|_| RuntimeError::new(RuntimeFailureKind::Navigation))?;
+            self.page = Some(page);
+            self.devtools = None;
+            self.document_http_status = None;
+            Ok(())
         })
     }
 }

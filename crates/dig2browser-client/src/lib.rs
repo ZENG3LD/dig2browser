@@ -27,7 +27,7 @@ pub use dig2browser_protocol::{
     ResolvedRuntimeRecord, ResponseStatus, RouteRef, RouteRefError, RuntimeFeature,
     RuntimeKind, RuntimeLimitation, RuntimeRequirements, RuntimeSelector,
     SessionPhase, SessionHealthProbe, SessionStateUpdate, SseEvent, StartedTrace,
-    StationStatus, StepOutcome, StepSummary, SupportLevel, TaskCapturePolicy,
+    StationStatus, StepOutcome, StepSummary, SupportLevel, TabInfo, TaskCapturePolicy,
     TaskReply, TaskRuntimeContract, TaskStep, TerminalOutcome, TerminalTrace,
     TraceCursor, TraceEvent, TraceEventKind, TracePage, WebSocketDirection,
     WebSocketFrame, WebSocketOpcode,
@@ -37,8 +37,8 @@ pub use dig2browser_protocol::{
     MAX_LIVE_CONSOLE_LEVEL_BYTES, MAX_LIVE_CONSOLE_TEXT_BYTES,
     MAX_LIVE_EVENTS, MAX_LIVE_METHOD_BYTES, MAX_LIVE_NETWORK_PARAMS_BYTES,
     MAX_LIVE_SSE_EVENT_TYPE_BYTES, MAX_LIVE_SSE_ID_BYTES,
-    MAX_LIVE_URL_BYTES, MAX_TRACE_EVENTS, DEFAULT_STATION_PIPE, HOST_DIRECT,
-    PROTOCOL_VERSION,
+    MAX_LIVE_URL_BYTES, MAX_TAB_ID_BYTES, MAX_TABS, MAX_TRACE_EVENTS,
+    DEFAULT_STATION_PIPE, HOST_DIRECT, PROTOCOL_VERSION,
 };
 
 const MIN_TIMEOUT: Duration = Duration::from_millis(100);

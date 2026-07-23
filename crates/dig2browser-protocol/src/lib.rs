@@ -40,11 +40,12 @@ pub use session::{
 
 pub use task::{
     CaptureCompleteness, CollectionTask, CollectionTaskResult, EvidenceCapture,
-    InteractiveElement, LoadState, ResolvedRuntimeRecord, TaskCapturePolicy, TaskReply,
-    TaskRuntimeContract, TaskStep, MAX_COLLECTOR_VERSION_BYTES, MAX_DOWNLOAD_BYTES,
-    MAX_DOWNLOAD_FILENAME_BYTES, MAX_ELEMENT_NAME_BYTES,
+    InteractiveElement, LoadState, ResolvedRuntimeRecord, TabInfo, TaskCapturePolicy,
+    TaskReply, TaskRuntimeContract, TaskStep, MAX_COLLECTOR_VERSION_BYTES,
+    MAX_DOWNLOAD_BYTES, MAX_DOWNLOAD_FILENAME_BYTES, MAX_ELEMENT_NAME_BYTES,
     MAX_ELEMENT_ROLE_BYTES, MAX_INTERACTIVE_ELEMENTS, MAX_SELECTOR_BYTES,
-    MAX_TASK_RESULT_BYTES, MAX_TASK_STEPS, MAX_TASK_WAIT, MAX_UPLOAD_PATH_BYTES,
+    MAX_TAB_ID_BYTES, MAX_TABS, MAX_TASK_RESULT_BYTES, MAX_TASK_STEPS, MAX_TASK_WAIT,
+    MAX_UPLOAD_PATH_BYTES,
 };
 pub use trace::{
     ArtifactChunk, ArtifactCommitted, ArtifactMediaType, ArtifactRef,

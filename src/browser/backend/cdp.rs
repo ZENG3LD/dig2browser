@@ -511,8 +511,9 @@ impl CdpBrowserBackend {
         })
     }
 
-    /// List all open page targets (tabs). Returns `(target_id, url)` pairs.
-    pub(crate) async fn list_pages(&self) -> Result<Vec<(String, String)>, BrowserError> {
+    /// List all open page targets (tabs). Returns `(target_id, url, title)`
+    /// triples.
+    pub(crate) async fn list_pages(&self) -> Result<Vec<(String, String, String)>, BrowserError> {
         let targets = self
             .root
             .get_targets()
@@ -521,12 +522,22 @@ impl CdpBrowserBackend {
         Ok(targets
             .into_iter()
             .filter(|t| t.r#type == "page")
-            .map(|t| (t.target_id, t.url))
+            .map(|t| (t.target_id, t.url, t.title))
             .collect())
     }
 
     /// Attach to an existing page target (open tab) by its `target_id`.
-    /// Does NOT inject stealth scripts — the page is already running.
+    ///
+    /// Applies the same CDP-native stealth overrides as `open_page` (UA/
+    /// Client Hints, timezone, device metrics) — those are protocol-level and
+    /// take effect on the next navigation/paint regardless of when the
+    /// session attached. It does **not** run the JS-injected stealth scripts
+    /// (`add_script_on_new_document`): those only apply to documents created
+    /// after they are registered on a session, and this session did not exist
+    /// when the popup's current document loaded, so re-registering them here
+    /// would not retroactively patch the already-loaded page. Known
+    /// limitation of attaching to an already-running page (e.g. a
+    /// `SwitchToTab` target) rather than one this backend opened itself.
     pub(crate) async fn attach_to_existing_page(
         &self,
         target_id: &str,
@@ -557,6 +568,10 @@ impl CdpBrowserBackend {
         let dialog_task = spawn_dialog_auto_handler(&session);
 
         let download = setup_download_capture(&session, target_id).await?;
+
+        // CDP-native stealth overrides — see the doc comment above for why
+        // this does NOT cover the JS-injected scripts `open_page` also runs.
+        apply_cdp_native_stealth(&session, &self.stealth).await?;
 
         self.page_count.fetch_add(1, Ordering::Relaxed);
 
@@ -984,51 +999,7 @@ impl CdpBrowserBackend {
         // ── CDP-native stealth overrides ──────────────────────────────────────
         // These run at the protocol level and are more reliable than JS patching:
         // they survive property-descriptor inspection and also affect HTTP headers.
-
-        // User-Agent + Client Hints: sets Sec-CH-UA* HTTP headers automatically.
-        if let Some(profile) = self.stealth.resolved_profile_from_user_agent() {
-            match (profile.brands(), profile.full_version_list()) {
-                (Some(brands), Some(full_version_list)) => session
-                    .set_user_agent_with_metadata(
-                        &profile.user_agent,
-                        self.stealth.client_hints.platform(),
-                        self.stealth.client_hints.platform_version(),
-                        self.stealth.client_hints.architecture(),
-                        self.stealth.client_hints.model(),
-                        self.stealth.client_hints.mobile(),
-                        &brands,
-                        &full_version_list,
-                    )
-                    .await
-                    .map_err(|e| BrowserError::StealthInject(e.to_string()))?,
-                _ => session
-                    .set_user_agent(&profile.user_agent)
-                    .await
-                    .map_err(|e| BrowserError::StealthInject(e.to_string()))?,
-            }
-        }
-
-        // Timezone: fixes both Intl.DateTimeFormat AND new Date().toString().
-        // The JS override_timezone script only fixes Intl, missing Date.toString().
-        if let Some(tz) = &self.stealth.locale.timezone {
-            session
-                .set_timezone(tz)
-                .await
-                .map_err(|e| BrowserError::StealthInject(e.to_string()))?;
-        }
-
-        // Device metrics: screen dimensions + devicePixelRatio at browser level.
-        // Also affects CSS media queries and visual viewport, unlike JS patching.
-        let (vp_w, vp_h) = self.stealth.viewport;
-        session
-            .set_device_metrics(
-                vp_w,
-                vp_h,
-                self.stealth.device_scale_factor.get(),
-                self.stealth.client_hints.mobile(),
-            )
-            .await
-            .map_err(|e| BrowserError::StealthInject(e.to_string()))?;
+        apply_cdp_native_stealth(&session, &self.stealth).await?;
 
         // ── JS stealth scripts ────────────────────────────────────────────────
         // Injected after native overrides. Some overlap with the CDP calls above
@@ -1062,6 +1033,65 @@ impl CdpBrowserBackend {
             download,
         ))
     }
+}
+
+/// Apply the CDP-native stealth overrides (User-Agent + Client Hints,
+/// timezone, device metrics) to a session. These run at the protocol level
+/// and are more reliable than JS patching — they survive property-descriptor
+/// inspection and also affect HTTP headers. Shared by `open_page` (a freshly
+/// created target) and `attach_to_existing_page` (an already-open tab this
+/// backend did not create, e.g. a `SwitchToTab` target); see the doc comment
+/// on `attach_to_existing_page` for what this does **not** cover.
+async fn apply_cdp_native_stealth(
+    session: &CdpSession,
+    stealth: &StealthConfig,
+) -> Result<(), BrowserError> {
+    // User-Agent + Client Hints: sets Sec-CH-UA* HTTP headers automatically.
+    if let Some(profile) = stealth.resolved_profile_from_user_agent() {
+        match (profile.brands(), profile.full_version_list()) {
+            (Some(brands), Some(full_version_list)) => session
+                .set_user_agent_with_metadata(
+                    &profile.user_agent,
+                    stealth.client_hints.platform(),
+                    stealth.client_hints.platform_version(),
+                    stealth.client_hints.architecture(),
+                    stealth.client_hints.model(),
+                    stealth.client_hints.mobile(),
+                    &brands,
+                    &full_version_list,
+                )
+                .await
+                .map_err(|e| BrowserError::StealthInject(e.to_string()))?,
+            _ => session
+                .set_user_agent(&profile.user_agent)
+                .await
+                .map_err(|e| BrowserError::StealthInject(e.to_string()))?,
+        }
+    }
+
+    // Timezone: fixes both Intl.DateTimeFormat AND new Date().toString().
+    // The JS override_timezone script only fixes Intl, missing Date.toString().
+    if let Some(tz) = &stealth.locale.timezone {
+        session
+            .set_timezone(tz)
+            .await
+            .map_err(|e| BrowserError::StealthInject(e.to_string()))?;
+    }
+
+    // Device metrics: screen dimensions + devicePixelRatio at browser level.
+    // Also affects CSS media queries and visual viewport, unlike JS patching.
+    let (vp_w, vp_h) = stealth.viewport;
+    session
+        .set_device_metrics(
+            vp_w,
+            vp_h,
+            stealth.device_scale_factor.get(),
+            stealth.client_hints.mobile(),
+        )
+        .await
+        .map_err(|e| BrowserError::StealthInject(e.to_string()))?;
+
+    Ok(())
 }
 
 async fn remove_profile_dir_with_retry(path: &std::path::Path) -> Result<usize, BrowserError> {
