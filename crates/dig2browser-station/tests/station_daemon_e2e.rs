@@ -254,6 +254,7 @@ ws.onmessage=(event)=>{{document.title='ws-recv';}};\
             "session-reauth" => "<form data-session-reauth></form>",
             "persona-probe" => "<pre id=\"persona-probe-output\"></pre>",
             "interactive-elements" => "<button id=\"go\">Sign in</button><a href=\"/next\" id=\"next-link\">Next page</a><input id=\"q\" name=\"query\" placeholder=\"Search\">",
+            "select-form" => "<select id=\"country\"><option value=\"\">--</option><option value=\"US\">United States</option><option value=\"DE\">Germany</option></select><span id=\"chosen\">none</span><script>document.getElementById('country').addEventListener('change',function(e){document.getElementById('chosen').textContent='chosen:'+e.target.value;});</script>",
             _ => "",
         }
     );
@@ -1780,6 +1781,85 @@ async fn stationd_read_interactive_elements_enumerates_and_selector_resolves_e2e
     assert!(status.success(), "perceive station failed: {status}");
     let (_, stderr) = read_child_output(&mut daemon).await;
     assert!(stderr.is_empty(), "clean perceive station wrote stderr: {stderr}");
+    remove_tree(&profiles).await;
+}
+
+// A.4.1 acceptance: the SelectOption step chooses a <select> option by
+// value/label/text and fires the change event a page reacts to — moving
+// dropdown choice off the --allow-scripted-tasks gate (an agent no longer needs
+// an Evaluate to set select.value + dispatch change). Runs on a station that
+// permits interactive tasks but NOT scripted tasks, so success proves the
+// scripted gate is not required. The fixture's onchange handler writes the
+// chosen value into #chosen; reading it back (inspect-only) proves the option
+// was selected AND the change event fired, all over the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stationd_select_option_chooses_and_fires_change_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-stationd-select-e2e-{unique}");
+    let profiles = e2e_temp_base().join(format!(
+        "dig2browser-stationd-select-e2e-{unique}"
+    ));
+    std::fs::create_dir_all(&profiles).expect("create select profiles root");
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+    // Interactive tasks permitted, scripted tasks NOT — the whole point.
+    let mut daemon = spawn_stationd_interactive_only(stationd, &pipe_name, &profiles);
+
+    let client = StationClient::connect(
+        ClientConfig::new(&pipe_name, Duration::from_secs(15), Duration::from_secs(90))
+            .expect("valid select client config"),
+    )
+    .await
+    .expect("connect select station client");
+
+    let url = fixture.url("/select-form");
+    let task = CollectionTask::new(vec![
+        TaskStep::Navigate { url: url.clone() },
+        TaskStep::SelectOption {
+            selector: "#country".to_owned(),
+            value: "DE".to_owned(),
+        },
+        TaskStep::ReadSelectorText {
+            selector: "#chosen".to_owned(),
+        },
+    ])
+    .expect("valid select task");
+    // A cold browser launch can occasionally fail the first navigation
+    // (surfaced as an Unavailable task), so retry a few times.
+    let mut result = None;
+    for attempt in 0..8 {
+        match client.run_task("select-profile", task.clone()).await {
+            Ok(value) => {
+                result = Some(value);
+                break;
+            }
+            Err(ClientError::Remote {
+                status: ResponseStatus::Unavailable,
+                ..
+            }) if attempt < 7 => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            other => panic!("select task failed: {other:?}"),
+        }
+    }
+    let result = result.expect("select task after retries");
+    assert_eq!(result.replies().len(), 3);
+    assert_eq!(result.replies()[1], TaskReply::Acknowledged);
+    assert_eq!(
+        result.replies()[2],
+        TaskReply::Text("chosen:DE".to_owned()),
+        "SelectOption did not set the value and fire change"
+    );
+
+    client.shutdown().await.expect("request select station drain");
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("select station exit timeout")
+        .expect("wait for select station");
+    assert!(status.success(), "select station failed: {status}");
+    let (_, stderr) = read_child_output(&mut daemon).await;
+    assert!(stderr.is_empty(), "clean select station wrote stderr: {stderr}");
     remove_tree(&profiles).await;
 }
 
@@ -3899,6 +3979,44 @@ fn spawn_stationd_for_runtime_with_routes(
             allow_headful_auth: false,
         },
     )
+}
+
+/// A station that permits interactive tasks but NOT scripted tasks — so a step
+/// that succeeds here is proven not to need the `--allow-scripted-tasks` gate.
+fn spawn_stationd_interactive_only(
+    stationd: &str,
+    pipe_name: &str,
+    profiles: &Path,
+) -> tokio::process::Child {
+    let mut command = tokio::process::Command::new(stationd);
+    command.args([
+        "--pipe-name",
+        pipe_name,
+        "--profiles-root",
+        profiles.to_str().expect("profiles path is UTF-8"),
+        "--runtime",
+        "chrome",
+        "--max-resident",
+        "1",
+        "--max-in-flight",
+        "4",
+        "--max-connections",
+        "8",
+        "--timeout-seconds",
+        "90",
+        "--drain-seconds",
+        "15",
+        "--allow-remote-shutdown",
+        "--allow-interactive-tasks",
+        // Deliberately NO --allow-scripted-tasks: SelectOption must work without it.
+    ]);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn interactive-only station daemon")
 }
 
 fn spawn_stationd_with_task_permissions(

@@ -363,6 +363,7 @@ pub enum BrowserTaskStep {
     WaitForSelector { selector: String, timeout: Duration },
     WaitForLoadState { state: LoadState, timeout: Duration },
     ReadInteractiveElements,
+    SelectOption { selector: String, value: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -391,7 +392,8 @@ impl BrowserTask {
                 }
                 BrowserTaskStep::ClickSelector { selector }
                 | BrowserTaskStep::ReadSelectorText { selector }
-                | BrowserTaskStep::TypeSelector { selector, .. } => {
+                | BrowserTaskStep::TypeSelector { selector, .. }
+                | BrowserTaskStep::SelectOption { selector, .. } => {
                     ElementRef::new(selector, 0).map_err(|_| TaskError::InvalidSelector)?;
                 }
                 BrowserTaskStep::WaitForSelector { selector, timeout } => {
@@ -551,7 +553,8 @@ fn task_runtime_requirements(
             BrowserTaskStep::Wheel { .. } => add(RuntimeFeature::ScrollInput),
             BrowserTaskStep::KeyPress { .. } => add(RuntimeFeature::KeyboardInput),
             BrowserTaskStep::ClickSelector { .. }
-            | BrowserTaskStep::TypeSelector { .. } => {
+            | BrowserTaskStep::TypeSelector { .. }
+            | BrowserTaskStep::SelectOption { .. } => {
                 add(RuntimeFeature::DomInspect);
                 add(RuntimeFeature::DomInteract);
             }
@@ -2331,6 +2334,17 @@ impl BrowserLease {
                 .execute(AgentCommand::ReadInteractiveElements)
                 .await
                 .map_err(StationError::from),
+            BrowserTaskStep::SelectOption { selector, value } => {
+                let element = self.resolve_task_element(selector).await?;
+                self.slot
+                    .worker
+                    .execute(AgentCommand::SelectOption {
+                        element,
+                        value: value.clone(),
+                    })
+                    .await
+                    .map_err(StationError::from)
+            }
         }
     }
 
@@ -2440,7 +2454,8 @@ impl BrowserLease {
                     &[Capability::L1(L1Capability::Keyboard)]
                 }
                 BrowserTaskStep::ClickSelector { .. }
-                | BrowserTaskStep::TypeSelector { .. } => &[
+                | BrowserTaskStep::TypeSelector { .. }
+                | BrowserTaskStep::SelectOption { .. } => &[
                     Capability::L2(L2Capability::Inspect),
                     Capability::L2(L2Capability::Interact),
                 ],

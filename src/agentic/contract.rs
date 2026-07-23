@@ -231,6 +231,14 @@ pub enum AgentCommand {
         element: ElementRef,
         text: String,
     },
+    /// Choose an `<option>` of a `<select>` by value/label/text via a fixed,
+    /// station-authored script parameterized only by `value` — never a consumer
+    /// script. Fires `input`/`change` like a real gesture. Backs the
+    /// `SelectOption` task step.
+    SelectOption {
+        element: ElementRef,
+        value: String,
+    },
     ReadElementText {
         element: ElementRef,
     },
@@ -273,9 +281,9 @@ impl AgentCommand {
             | Self::ReadElementText { .. }
             | Self::ObserveDocument
             | Self::ReadInteractiveElements => Capability::L2(L2Capability::Inspect),
-            Self::ClickElement { .. } | Self::TypeElement { .. } => {
-                Capability::L2(L2Capability::Interact)
-            }
+            Self::ClickElement { .. }
+            | Self::TypeElement { .. }
+            | Self::SelectOption { .. } => Capability::L2(L2Capability::Interact),
             Self::Evaluate { .. } => Capability::L2(L2Capability::Evaluate),
             Self::Navigate { .. } => Capability::L3(L3Capability::Navigate),
             Self::Capture { .. } => Capability::L3(L3Capability::Capture),

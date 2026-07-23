@@ -1775,6 +1775,12 @@ fn to_station_task(task: &CollectionTask) -> Result<BrowserTask, crate::TaskErro
                 TaskStep::ReadInteractiveElements => {
                     BrowserTaskStep::ReadInteractiveElements
                 }
+                TaskStep::SelectOption { selector, value } => {
+                    BrowserTaskStep::SelectOption {
+                        selector: selector.clone(),
+                        value: value.clone(),
+                    }
+                }
             })
             .collect(),
     )
@@ -1801,7 +1807,9 @@ fn task_capabilities(task: &CollectionTask) -> CapabilitySet {
             TaskStep::Wait { .. } => {}
             TaskStep::Wheel { .. } => add(Capability::L1(L1Capability::Scroll)),
             TaskStep::KeyPress { .. } => add(Capability::L1(L1Capability::Keyboard)),
-            TaskStep::ClickSelector { .. } | TaskStep::TypeSelector { .. } => {
+            TaskStep::ClickSelector { .. }
+            | TaskStep::TypeSelector { .. }
+            | TaskStep::SelectOption { .. } => {
                 add(Capability::L2(L2Capability::Inspect));
                 add(Capability::L2(L2Capability::Interact));
             }

@@ -88,6 +88,19 @@ pub trait BrowserRuntime: Send + 'static {
     ) -> BoxFuture<'_, RuntimeResult<serde_json::Value>> {
         Box::pin(async { Err(RuntimeError::new(RuntimeFailureKind::Protocol)) })
     }
+
+    /// Choose an `<option>` of the `<select>` at `selector` by value/label/text
+    /// via a fixed internal script parameterized only by `value` (no consumer
+    /// script). Default reports the surface as unsupported; only
+    /// [`RealBrowserRuntime`] overrides it. Backs the `SelectOption` step.
+    fn select_option<'a>(
+        &'a mut self,
+        selector: &'a str,
+        value: &'a str,
+    ) -> BoxFuture<'a, RuntimeResult<()>> {
+        let _ = (selector, value);
+        Box::pin(async { Err(RuntimeError::new(RuntimeFailureKind::Protocol)) })
+    }
 }
 
 /// Production runtime owning exactly one browser and one page for an identity.
@@ -334,6 +347,44 @@ impl RealBrowserRuntime {
             return Err(RuntimeError::new(RuntimeFailureKind::Protocol));
         }
         Ok(parsed)
+    }
+
+    async fn select_option_inner(
+        &self,
+        selector: &str,
+        value: &str,
+    ) -> RuntimeResult<()> {
+        // Embed the caller's selector and value as JSON-escaped JS string
+        // literals; the surrounding script is fixed (station-authored), so this
+        // is parameterization, not a consumer script.
+        let selector_lit = serde_json::to_string(selector)
+            .map_err(|_| RuntimeError::new(RuntimeFailureKind::Protocol))?;
+        let value_lit = serde_json::to_string(value)
+            .map_err(|_| RuntimeError::new(RuntimeFailureKind::Protocol))?;
+        let script = format!(
+            "JSON.stringify((function(){{\
+var sel={selector_lit}, target={value_lit}, el;\
+try{{ el=document.querySelector(sel); }}catch(e){{ return false; }}\
+if(!el||String(el.tagName).toLowerCase()!=='select') return false;\
+var opts=el.options, idx=-1;\
+for(var i=0;i<opts.length;i++){{ var o=opts[i]; if(o.value===target||o.label===target||(o.text||'').trim()===target){{ idx=i; break; }} }}\
+if(idx===-1) return false;\
+el.selectedIndex=idx;\
+el.dispatchEvent(new Event('input',{{bubbles:true}}));\
+el.dispatchEvent(new Event('change',{{bubbles:true}}));\
+return true;\
+}})())"
+        );
+        let result = self
+            .page()?
+            .eval(&script)
+            .await
+            .map_err(|_| RuntimeError::new(RuntimeFailureKind::Interaction))?;
+        if result.as_str() == Some("true") {
+            Ok(())
+        } else {
+            Err(RuntimeError::new(RuntimeFailureKind::Interaction))
+        }
     }
 
     fn clear_devtools_events(&mut self) {
@@ -600,6 +651,14 @@ impl BrowserRuntime for RealBrowserRuntime {
         &mut self,
     ) -> BoxFuture<'_, RuntimeResult<serde_json::Value>> {
         Box::pin(async move { self.interactive_elements().await })
+    }
+
+    fn select_option<'a>(
+        &'a mut self,
+        selector: &'a str,
+        value: &'a str,
+    ) -> BoxFuture<'a, RuntimeResult<()>> {
+        Box::pin(async move { self.select_option_inner(selector, value).await })
     }
 }
 

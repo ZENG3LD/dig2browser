@@ -701,6 +701,16 @@ async fn handle_command(
                 .await
                 .map(|_| AgentReply::Acknowledged)
         }
+        AgentCommand::SelectOption { element, value } => {
+            validate_element_epoch(&element, snapshot.page_epoch)?;
+            if value.is_empty() || value.len() > MAX_TEXT_BYTES || value.contains('\0') {
+                return Err(WorkerError::InvalidInput);
+            }
+            runtime
+                .select_option(element.selector(), &value)
+                .await
+                .map(|_| AgentReply::Acknowledged)
+        }
         AgentCommand::ReadElementText { element } => {
             validate_element_epoch(&element, snapshot.page_epoch)?;
             runtime

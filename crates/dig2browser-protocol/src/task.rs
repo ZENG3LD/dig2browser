@@ -99,6 +99,20 @@ pub enum TaskStep {
     /// returns is directly usable by a later `ClickSelector`/`ReadSelectorText`
     /// step.
     ReadInteractiveElements,
+    /// Choose an `<option>` of the `<select>` at `selector`, matching `value`
+    /// against the option's `value` attribute, its label, or its visible text
+    /// (in that order), then firing the `input`/`change` events a real user
+    /// gesture would.
+    ///
+    /// Interaction (default-deny `--allow-interactive-tasks`, `L2::Interact`):
+    /// it drives a form control a page reacts to, the same footing as
+    /// `ClickSelector`/`TypeSelector`. It replaces the `Evaluate` an agent would
+    /// otherwise write to set `select.value` and dispatch `change` — closing the
+    /// last routine form-interaction that needed the scripted-task gate. The
+    /// operation runs a fixed, station-authored script parameterized only by the
+    /// caller's `value` (exactly as `TypeSelector` is parameterized by its text),
+    /// never a caller-supplied script.
+    SelectOption { selector: String, value: String },
 }
 
 /// A document load milestone (`document.readyState`), ordered
@@ -220,6 +234,7 @@ impl CollectionTask {
                 TaskStep::KeyPress { .. }
                     | TaskStep::ClickSelector { .. }
                     | TaskStep::TypeSelector { .. }
+                    | TaskStep::SelectOption { .. }
             )
         })
     }
@@ -308,6 +323,10 @@ impl CollectionTask {
                     }
                 }
                 TaskStep::ReadInteractiveElements => {}
+                TaskStep::SelectOption { selector, value } => {
+                    validate_selector(selector)?;
+                    validate_text(value, MAX_TEXT_BYTES, false)?;
+                }
             }
         }
         Ok(())
@@ -392,6 +411,11 @@ impl CollectionTask {
                 TaskStep::ReadInteractiveElements => {
                     output.push(12);
                 }
+                TaskStep::SelectOption { selector, value } => {
+                    output.push(13);
+                    put_u16_bytes(&mut output, selector.as_bytes())?;
+                    put_u32_bytes(&mut output, value.as_bytes())?;
+                }
             }
         }
         if output.len() > MAX_REQUEST_BYTES {
@@ -458,6 +482,10 @@ impl CollectionTask {
                     timeout: Duration::from_millis(input.u64()?),
                 },
                 12 => TaskStep::ReadInteractiveElements,
+                13 => TaskStep::SelectOption {
+                    selector: input.utf8_u16()?,
+                    value: input.utf8_u32()?,
+                },
                 _ => return Err(ProtocolError::InvalidTaskPayload),
             };
             steps.push(step);
@@ -1527,6 +1555,35 @@ mod tests {
             "x".to_owned(),
             "a".repeat(MAX_SELECTOR_BYTES + 1),
         )
+        .is_err());
+    }
+
+    #[test]
+    fn select_option_round_trips_and_is_interaction() {
+        let task = CollectionTask::new(vec![
+            navigate_step(),
+            TaskStep::SelectOption {
+                selector: "#country".to_owned(),
+                value: "US".to_owned(),
+            },
+        ])
+        .expect("valid task");
+
+        let encoded = task.encode_payload().expect("encode task");
+        let decoded = CollectionTask::decode_payload(&encoded).expect("decode task");
+        assert_eq!(decoded, task);
+        // Choosing an option drives a form control: interaction, not script.
+        assert!(task.requires_interaction());
+        assert!(!task.requires_script());
+
+        // An empty value or empty selector is rejected.
+        assert!(CollectionTask::new(vec![
+            navigate_step(),
+            TaskStep::SelectOption {
+                selector: "#country".to_owned(),
+                value: String::new(),
+            },
+        ])
         .is_err());
     }
 
