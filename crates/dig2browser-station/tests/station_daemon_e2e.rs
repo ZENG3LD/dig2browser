@@ -679,6 +679,11 @@ async fn stationd_explicit_chrome_and_edge_runtime_selection_e2e() {
         assert_eq!(resolved.engine(), EngineFamily::Chromium);
         assert_eq!(resolved.control(), ControlTransport::Cdp);
         assert!(resolved.version().is_some_and(|version| !version.is_empty()));
+        // The granted set reflects exactly what this public-profile task
+        // requests (task steps + desktop persona). PersistentProfile is
+        // authenticated-only by design (see
+        // `persistent_profile_is_strictly_authenticated_only`), so a normal
+        // `run_task` on a Public profile does not — and must not — record it.
         for feature in [
             RuntimeFeature::ScriptEvaluate,
             RuntimeFeature::Navigate,
@@ -686,7 +691,6 @@ async fn stationd_explicit_chrome_and_edge_runtime_selection_e2e() {
             RuntimeFeature::CaptureHtml,
             RuntimeFeature::CaptureViewportPng,
             RuntimeFeature::Lifecycle,
-            RuntimeFeature::PersistentProfile,
             RuntimeFeature::DesktopWeb,
         ] {
             assert!(
@@ -697,6 +701,13 @@ async fn stationd_explicit_chrome_and_edge_runtime_selection_e2e() {
                 "{runtime} did not record granted feature {feature:?}"
             );
         }
+        assert!(
+            !resolved
+                .granted()
+                .iter()
+                .any(|support| support.feature() == RuntimeFeature::PersistentProfile),
+            "{runtime} unexpectedly granted PersistentProfile on a public profile"
+        );
         assert_eq!(result.replies().len(), 3);
         let TaskReply::ScriptJson(user_agent_json) = &result.replies()[1] else {
             panic!("explicit {runtime} task did not return user agent JSON");
