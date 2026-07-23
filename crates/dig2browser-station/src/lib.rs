@@ -22,6 +22,7 @@ use dig2browser::agentic::{
     L2Capability, L3Capability, MobileLayout, NavigationPolicy, RuntimeFailureKind,
     WorkerError, WorkerLifecycle,
 };
+use dig2browser::browser::PageDevTools;
 use dig2browser::identity::{
     validate_profile_id, BrowserBackend, DevicePersona, IdentityClass,
     IdentityError, IdentityProfile, ProfileOwnershipGuard,
@@ -45,6 +46,7 @@ pub mod containment;
 mod crawl;
 mod egress;
 pub mod ipc;
+mod live;
 mod route;
 pub mod runtime;
 #[cfg(windows)]
@@ -61,6 +63,7 @@ pub use egress::{
     EgressError, EgressPeerPolicy, EgressPeerPolicyError, EgressProxy,
     EgressReport,
 };
+pub use live::LiveError;
 pub use route::{
     EgressRouteError, RouteDescriptor, RouteRegistry, RouteRegistryError,
     RouteTransport,
@@ -1931,6 +1934,28 @@ impl BrowserLease {
         let now = self.station.inner.clock.fetch_add(1, Ordering::AcqRel) + 1;
         self.slot.last_used.store(now, Ordering::Release);
         self.slot.worker.execute(command).await.map_err(Into::into)
+    }
+
+    /// Subscribe to this lease's worker's live DevTools event stream.
+    /// Requires `L3Capability::Capture`, the same lease grant `Capture`
+    /// task steps already require. This bypasses the queued `AgentCommand`
+    /// pipeline (see `BrowserWorker::subscribe_devtools`), so unlike
+    /// `execute`/`run_task` it does not take the per-identity `session_gate`
+    /// or the station-wide `command_slots` admission semaphore — it is a
+    /// cheap, side-channel subscribe, not a page-mutating command.
+    pub(crate) async fn subscribe_devtools(&self) -> Result<PageDevTools, StationError> {
+        if !self.capabilities.contains(Capability::L3(L3Capability::Capture)) {
+            return Err(StationError::CapabilityDenied);
+        }
+        let _operation = self.station.inner.operation_gate.read().await;
+        if self.station.inner.shutting_down.load(Ordering::Acquire) {
+            return Err(StationError::ShuttingDown);
+        }
+        self.slot
+            .worker
+            .subscribe_devtools()
+            .await
+            .map_err(Into::into)
     }
 
     /// Navigate and capture under one per-identity session lock so concurrent

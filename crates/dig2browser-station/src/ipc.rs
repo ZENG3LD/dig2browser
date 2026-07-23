@@ -12,10 +12,9 @@ use dig2browser::agentic::{
 use dig2browser_protocol::{
     read_worker_request, validate_pipe_suffix, write_worker_response,
     CaptureCompleteness, CollectionRequest, CollectionResponse, CollectionTask,
-    CollectionTaskResult, CrawlRequest, EvidenceCapture, FailureClass,
-    ProfileClass, RequestKind, ResolvedRuntimeRecord, ResponseStatus, StationStatus,
-    TaskCapturePolicy, TaskReply, TaskStep, WorkerRequest, WorkerResponse,
-    PROTOCOL_VERSION,
+    CollectionTaskResult, CrawlRequest, EvidenceCapture, FailureClass, ProfileClass,
+    RequestKind, ResolvedRuntimeRecord, ResponseStatus, StationStatus, TaskCapturePolicy,
+    TaskReply, TaskStep, WorkerRequest, WorkerResponse, PROTOCOL_VERSION,
 };
 use dig2browser_trace::LedgerError;
 use tokio::sync::{mpsc, watch};
@@ -26,6 +25,7 @@ use crate::{
         BeginCollection, CaptureReceiptPolicy, CollectionError, CollectionManager,
     },
     crawl::{CrawlError, CrawlManager},
+    live::{LiveCaptureManager, LiveError},
     BrowserLease, BrowserStation, BrowserTask, BrowserTaskStep, IdentityRequest,
     RuntimeRegistryError, RuntimeRequirements, RuntimeSelector, StationError,
     StationFleetStatus,
@@ -191,6 +191,7 @@ pub struct ServerConfig {
     allow_durable_write: bool,
     allow_crawl_read: bool,
     allow_crawl_write: bool,
+    allow_live_events: bool,
 }
 
 impl ServerConfig {
@@ -226,6 +227,7 @@ impl ServerConfig {
             allow_durable_write: false,
             allow_crawl_read: false,
             allow_crawl_write: false,
+            allow_live_events: false,
         })
     }
 
@@ -299,6 +301,15 @@ impl ServerConfig {
 
     pub fn allow_crawl_write(mut self, allow: bool) -> Self {
         self.allow_crawl_write = allow;
+        self
+    }
+
+    /// Gate the entire `LiveEvents` request kind. Unlike the snapshot/trace
+    /// paths, live events are raw (unsanitized real URLs and WebSocket/SSE
+    /// payloads) by design, so this is a single hard, default-deny flag
+    /// rather than a split read/write pair.
+    pub fn allow_live_events(mut self, allow: bool) -> Self {
+        self.allow_live_events = allow;
         self
     }
 
@@ -390,6 +401,10 @@ async fn run_windows_server(
     if let Some(crawls) = &crawls {
         crawls.start_runners()?;
     }
+    // Live capture carries no durable state, so it is always constructed
+    // (cheap, in-memory); `--allow-live-events` gates admission per-request
+    // below, not construction.
+    let live = LiveCaptureManager::open(station.clone());
     let mut connections = JoinSet::new();
     let mut first_instance = true;
     let mut remote_stop = false;
@@ -445,6 +460,7 @@ async fn run_windows_server(
                     station: station.clone(),
                     collections: collections.clone(),
                     crawls: crawls.clone(),
+                    live: live.clone(),
                     telemetry: Arc::clone(&telemetry),
                     remote_shutdown: remote_shutdown.clone(),
                     allow_remote_shutdown: config.allow_remote_shutdown,
@@ -459,6 +475,7 @@ async fn run_windows_server(
                         durable_write: config.allow_durable_write,
                         crawl_read: config.allow_crawl_read,
                         crawl_write: config.allow_crawl_write,
+                        live_events: config.allow_live_events,
                     },
                 };
                 connections.spawn(async move {
@@ -510,6 +527,10 @@ async fn run_windows_server(
         Some(collections) => collections.shutdown(config.drain_timeout).await,
         None => Ok(false),
     };
+    // Release every held live-capture lease before the station's own
+    // shutdown force-closes registered workers, so live sessions wind down
+    // cleanly rather than surfacing as a mid-shutdown worker loss.
+    drain_timed_out |= live.shutdown(config.drain_timeout).await?;
     let shutdown_report = station.shutdown().await?;
     drain_timed_out |= collection_shutdown?;
     Ok(ServerReport {
@@ -531,6 +552,7 @@ struct ConnectionContext {
     station: BrowserStation,
     collections: Option<CollectionManager>,
     crawls: Option<CrawlManager>,
+    live: LiveCaptureManager,
     telemetry: Arc<ServerTelemetry>,
     remote_shutdown: mpsc::Sender<()>,
     allow_remote_shutdown: bool,
@@ -547,6 +569,7 @@ async fn serve_connection(
         station,
         collections,
         crawls,
+        live,
         telemetry,
         remote_shutdown,
         allow_remote_shutdown,
@@ -605,6 +628,14 @@ async fn serve_connection(
                 )
                 .await
             }
+            RequestKind::LiveEvents if task_permissions.live_events => {
+                live_request(&live, &request).await
+            }
+            RequestKind::LiveEvents => WorkerResponse::failure(
+                &request,
+                ResponseStatus::Invalid,
+                "live events disabled",
+            ),
             RequestKind::Health => WorkerResponse::empty(&request, ResponseStatus::Ok),
             RequestKind::Status => {
                 let fleet = station.fleet_status().await;
@@ -684,6 +715,7 @@ struct TaskPermissions {
     durable_write: bool,
     crawl_read: bool,
     crawl_write: bool,
+    live_events: bool,
 }
 
 async fn crawl_request(
@@ -782,6 +814,64 @@ fn crawl_error_response(request: &WorkerRequest, error: &CrawlError) -> WorkerRe
         | CrawlError::Protocol(_)
         | CrawlError::Crawler(_) => (ResponseStatus::Protocol, "crawl state invalid"),
         _ => (ResponseStatus::Unavailable, "crawler unavailable"),
+    };
+    WorkerResponse::failure(request, status, message)
+}
+
+async fn live_request(
+    live: &LiveCaptureManager,
+    request: &WorkerRequest,
+) -> WorkerResponse {
+    let Some(operation) = request.live.as_ref() else {
+        return WorkerResponse::failure(
+            request,
+            ResponseStatus::Invalid,
+            "live event request missing",
+        );
+    };
+    match live.handle(&request.profile_id, operation.clone()).await {
+        Ok(response) => WorkerResponse::live_response(request, &response).unwrap_or_else(|_| {
+            WorkerResponse::failure(
+                request,
+                ResponseStatus::Protocol,
+                "live event response invalid",
+            )
+        }),
+        Err(error) => live_error_response(request, &error),
+    }
+}
+
+fn live_error_response(request: &WorkerRequest, error: &LiveError) -> WorkerResponse {
+    let (status, message) = match error {
+        LiveError::SessionConflict
+        | LiveError::SessionNotFound
+        | LiveError::InvalidProfileId => (ResponseStatus::Invalid, "live event request rejected"),
+        LiveError::AdmissionClosed | LiveError::AtCapacity => {
+            (ResponseStatus::Unavailable, "live capture unavailable")
+        }
+        LiveError::Station(
+            StationError::Identity(_)
+            | StationError::PersonaMismatch
+            | StationError::PersonaBindingRequired
+            | StationError::ProfileBindingMismatch
+            | StationError::ProfileBindingRequired
+            | StationError::PersonaRuntimeMismatch
+            | StationError::IdentityClassMismatch
+            | StationError::IdentityClassBindingRequired
+            | StationError::InvalidPersona
+            | StationError::CapabilityDenied
+            | StationError::Worker(WorkerError::InvalidInput)
+            | StationError::Route(_),
+        ) => (ResponseStatus::Invalid, "live event request rejected"),
+        LiveError::Station(
+            StationError::AtCapacity
+            | StationError::RuntimeSelectionBusy
+            | StationError::ShuttingDown,
+        ) => (ResponseStatus::Unavailable, "live capture unavailable"),
+        LiveError::ManagerStatePoisoned | LiveError::Protocol(_) => {
+            (ResponseStatus::Protocol, "live event state invalid")
+        }
+        _ => (ResponseStatus::Unavailable, "live capture unavailable"),
     };
     WorkerResponse::failure(request, status, message)
 }
@@ -1847,6 +1937,8 @@ pub enum ServerError {
     Collection(#[from] CollectionError),
     #[error(transparent)]
     Crawl(#[from] CrawlError),
+    #[error(transparent)]
+    Live(#[from] LiveError),
     #[error("crawl root requires a trace root")]
     CrawlTraceRequired,
     #[error(transparent)]

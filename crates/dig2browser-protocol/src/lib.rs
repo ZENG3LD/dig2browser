@@ -6,6 +6,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 mod crawl;
 mod identity;
+mod live;
 mod session;
 mod task;
 mod trace;
@@ -18,6 +19,12 @@ pub use crawl::{
     MAX_CRAWL_RETRIES, MAX_CRAWL_SEEDS, MAX_CRAWL_URL_BYTES,
 };
 pub use identity::{BrowserPersona, MobilePersonaConfig, PersonaKind};
+pub use live::{
+    LiveCursor, LiveEvent, LiveEventKind, LiveEventPage, LiveFilter, LiveRequest,
+    LiveResponse, LiveSessionId, LiveTarget, MAX_LIVE_CONSOLE_LEVEL_BYTES,
+    MAX_LIVE_CONSOLE_TEXT_BYTES, MAX_LIVE_EVENTS, MAX_LIVE_METHOD_BYTES,
+    MAX_LIVE_NETWORK_PARAMS_BYTES, MAX_LIVE_URL_BYTES,
+};
 pub use session::{
     IdentitySessionStatus, ProfileClass, SessionHealthProbe, SessionPhase,
     SessionStateUpdate,
@@ -85,6 +92,7 @@ pub enum RequestKind {
     CheckAuthSession = 10,
     Collection = 11,
     Crawl = 12,
+    LiveEvents = 13,
 }
 
 impl RequestKind {
@@ -102,6 +110,7 @@ impl RequestKind {
             10 => Ok(Self::CheckAuthSession),
             11 => Ok(Self::Collection),
             12 => Ok(Self::Crawl),
+            13 => Ok(Self::LiveEvents),
             _ => Err(ProtocolError::InvalidRequest),
         }
     }
@@ -120,6 +129,7 @@ pub struct WorkerRequest {
     pub session_probe: Option<SessionHealthProbe>,
     pub collection: Option<CollectionRequest>,
     pub crawl: Option<CrawlRequest>,
+    pub live: Option<LiveRequest>,
 }
 
 impl WorkerRequest {
@@ -136,6 +146,7 @@ impl WorkerRequest {
             session_probe: None,
             collection: None,
             crawl: None,
+            live: None,
         }
     }
 
@@ -186,6 +197,7 @@ impl WorkerRequest {
             session_probe: None,
             collection: None,
             crawl: None,
+            live: None,
         }
     }
 
@@ -202,6 +214,7 @@ impl WorkerRequest {
             session_probe: None,
             collection: None,
             crawl: None,
+            live: None,
         }
     }
 
@@ -222,6 +235,7 @@ impl WorkerRequest {
             session_probe: None,
             collection: None,
             crawl: None,
+            live: None,
         }
     }
 
@@ -243,6 +257,7 @@ impl WorkerRequest {
             session_probe: None,
             collection: None,
             crawl: None,
+            live: None,
         }
     }
 
@@ -259,6 +274,7 @@ impl WorkerRequest {
             session_probe: None,
             collection: None,
             crawl: None,
+            live: None,
         }
     }
 
@@ -280,6 +296,7 @@ impl WorkerRequest {
             session_probe: Some(probe),
             collection: None,
             crawl: None,
+            live: None,
         }
     }
 
@@ -303,6 +320,7 @@ impl WorkerRequest {
             session_probe: None,
             collection: Some(collection),
             crawl: None,
+            live: None,
         };
         request.validate()?;
         Ok(request)
@@ -327,6 +345,7 @@ impl WorkerRequest {
             session_probe: None,
             collection: Some(collection),
             crawl: None,
+            live: None,
         };
         request.validate()?;
         Ok(request)
@@ -352,6 +371,7 @@ impl WorkerRequest {
             session_probe: None,
             collection: None,
             crawl: Some(crawl),
+            live: None,
         };
         request.validate()?;
         Ok(request)
@@ -376,6 +396,55 @@ impl WorkerRequest {
             session_probe: None,
             collection: None,
             crawl: Some(crawl),
+            live: None,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn begin_live(
+        request_id: u64,
+        profile_id: impl Into<String>,
+        live: LiveRequest,
+    ) -> Result<Self, ProtocolError> {
+        if !live.is_begin() {
+            return Err(ProtocolError::InvalidLivePayload);
+        }
+        let request = Self {
+            kind: RequestKind::LiveEvents,
+            request_id,
+            profile_id: profile_id.into(),
+            url: String::new(),
+            task: None,
+            persona: None,
+            profile_class: None,
+            session_update: None,
+            session_probe: None,
+            collection: None,
+            crawl: None,
+            live: Some(live),
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
+    pub fn live(request_id: u64, live: LiveRequest) -> Result<Self, ProtocolError> {
+        if live.is_begin() {
+            return Err(ProtocolError::InvalidLivePayload);
+        }
+        let request = Self {
+            kind: RequestKind::LiveEvents,
+            request_id,
+            profile_id: String::new(),
+            url: String::new(),
+            task: None,
+            persona: None,
+            profile_class: None,
+            session_update: None,
+            session_probe: None,
+            collection: None,
+            crawl: None,
+            live: Some(live),
         };
         request.validate()?;
         Ok(request)
@@ -406,6 +475,7 @@ impl WorkerRequest {
             session_probe: None,
             collection: None,
             crawl: None,
+            live: None,
         }
     }
 
@@ -483,6 +553,16 @@ impl WorkerRequest {
         } else {
             None
         };
+        let live_payload = if self.kind == RequestKind::LiveEvents {
+            Some(
+                self.live
+                    .as_ref()
+                    .ok_or(ProtocolError::InvalidRequest)?
+                    .encode()?,
+            )
+        } else {
+            None
+        };
         let body = task_payload
             .as_deref()
             .or(session_payload.as_deref())
@@ -490,6 +570,7 @@ impl WorkerRequest {
             .or(probe_payload.as_deref())
             .or(collection_payload.as_deref())
             .or(crawl_payload.as_deref())
+            .or(live_payload.as_deref())
             .unwrap_or(self.url.as_bytes());
         let url_len = u32::try_from(body.len()).map_err(|_| ProtocolError::InvalidRequest)?;
         let total = REQUEST_HEADER_BYTES
@@ -517,6 +598,9 @@ impl WorkerRequest {
             return Err(ProtocolError::InvalidRequest);
         }
         if self.kind != RequestKind::Crawl && self.crawl.is_some() {
+            return Err(ProtocolError::InvalidRequest);
+        }
+        if self.kind != RequestKind::LiveEvents && self.live.is_some() {
             return Err(ProtocolError::InvalidRequest);
         }
         match self.kind {
@@ -675,6 +759,29 @@ impl WorkerRequest {
                     .ok_or(ProtocolError::InvalidRequest)?;
                 crawl.validate()?;
                 if crawl.is_begin() {
+                    validate_profile_id(&self.profile_id)
+                } else if self.profile_id.is_empty() {
+                    Ok(())
+                } else {
+                    Err(ProtocolError::InvalidRequest)
+                }
+            }
+            RequestKind::LiveEvents => {
+                if !self.url.is_empty()
+                    || self.task.is_some()
+                    || self.persona.is_some()
+                    || self.profile_class.is_some()
+                    || self.session_update.is_some()
+                    || self.session_probe.is_some()
+                {
+                    return Err(ProtocolError::InvalidRequest);
+                }
+                let live = self
+                    .live
+                    .as_ref()
+                    .ok_or(ProtocolError::InvalidRequest)?;
+                live.validate()?;
+                if live.is_begin() {
                     validate_profile_id(&self.profile_id)
                 } else if self.profile_id.is_empty() {
                     Ok(())
@@ -945,6 +1052,30 @@ impl WorkerResponse {
         Ok(response)
     }
 
+    pub fn live_response(
+        request: &WorkerRequest,
+        result: &LiveResponse,
+    ) -> Result<Self, ProtocolError> {
+        let mut response = Self::empty(request, ResponseStatus::Ok);
+        response.html = result.encode()?;
+        response.validate()?;
+        Ok(response)
+    }
+
+    pub fn decode_live_response(&self) -> Result<LiveResponse, ProtocolError> {
+        if self.kind != RequestKind::LiveEvents
+            || self.status != ResponseStatus::Ok
+            || self.http_status.is_some()
+            || !self.final_url.is_empty()
+            || !self.title.is_empty()
+            || !self.error.is_empty()
+            || !self.png.is_empty()
+        {
+            return Err(ProtocolError::InvalidLivePayload);
+        }
+        LiveResponse::decode(&self.html)
+    }
+
     pub fn decode_collection_response(&self) -> Result<CollectionResponse, ProtocolError> {
         if self.kind != RequestKind::Collection
             || self.status != ResponseStatus::Ok
@@ -1057,6 +1188,9 @@ impl WorkerResponse {
         }
         if self.kind == RequestKind::Crawl && self.status == ResponseStatus::Ok {
             self.decode_crawl_response()?;
+        }
+        if self.kind == RequestKind::LiveEvents && self.status == ResponseStatus::Ok {
+            self.decode_live_response()?;
         }
         if matches!(
             self.kind,
@@ -1309,6 +1443,7 @@ where
             session_probe: None,
             collection: Some(CollectionRequest::decode(body)?),
             crawl: None,
+            live: None,
         };
         request.validate()?;
         return Ok(Some(request));
@@ -1326,6 +1461,25 @@ where
             session_probe: None,
             collection: None,
             crawl: Some(CrawlRequest::decode(body)?),
+            live: None,
+        };
+        request.validate()?;
+        return Ok(Some(request));
+    }
+    if kind == RequestKind::LiveEvents {
+        let request = WorkerRequest {
+            kind,
+            request_id,
+            profile_id,
+            url: String::new(),
+            task: None,
+            persona: None,
+            profile_class: None,
+            session_update: None,
+            session_probe: None,
+            collection: None,
+            crawl: None,
+            live: Some(LiveRequest::decode(body)?),
         };
         request.validate()?;
         return Ok(Some(request));
@@ -1357,6 +1511,7 @@ where
             session_probe: Some(session_probe),
             collection: None,
             crawl: None,
+            live: None,
         };
         request.validate()?;
         return Ok(Some(request));
@@ -1391,6 +1546,7 @@ where
         session_probe: None,
         collection: None,
         crawl: None,
+        live: None,
     };
     request.validate()?;
     Ok(Some(request))
@@ -1564,6 +1720,7 @@ pub enum ProtocolError {
     InvalidSessionPayload,
     InvalidCollectionPayload,
     InvalidCrawlPayload,
+    InvalidLivePayload,
 }
 
 impl std::fmt::Display for ProtocolError {
@@ -1584,6 +1741,7 @@ impl std::fmt::Display for ProtocolError {
                 write!(formatter, "collection payload is invalid")
             }
             Self::InvalidCrawlPayload => write!(formatter, "crawl payload is invalid"),
+            Self::InvalidLivePayload => write!(formatter, "live event payload is invalid"),
         }
     }
 }
@@ -1648,6 +1806,7 @@ mod tests {
         assert_eq!(RequestKind::CheckAuthSession as u8, 10);
         assert_eq!(RequestKind::Collection as u8, 11);
         assert_eq!(RequestKind::Crawl as u8, 12);
+        assert_eq!(RequestKind::LiveEvents as u8, 13);
     }
 
     #[tokio::test]

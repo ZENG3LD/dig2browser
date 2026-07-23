@@ -17,7 +17,9 @@ pub use dig2browser_protocol::{
     CompiledPersona, ControlTransport, CrawlCounts, CrawlCursor, CrawlEvent, CrawlEventKind,
     CrawlEventPage, CrawlJobId, CrawlPhase, CrawlRequest, CrawlResponse, CrawlSpec,
     CrawlStatus, EngineFamily, EvidenceCapture, FailureClass,
-    IdentitySessionStatus, InterruptedReason, MobilePersonaConfig, PersonaKind,
+    IdentitySessionStatus, InterruptedReason, LiveCursor, LiveEvent, LiveEventKind,
+    LiveEventPage, LiveFilter, LiveRequest, LiveResponse, LiveSessionId, LiveTarget,
+    MobilePersonaConfig, PersonaKind,
     PageArtifact,
     PersonaCompiler, PersonaDeviceClass, PersonaMode, PersonaPreset, ProfileClass,
     ResolvedRuntimeRecord, ResponseStatus, RouteRef, RouteRefError, RuntimeFeature,
@@ -28,7 +30,9 @@ pub use dig2browser_protocol::{
     TraceCursor, TraceEvent, TraceEventKind, TracePage,
     MAX_ARTIFACT_CHUNK_BYTES, MAX_CRAWL_ALLOWED_ORIGINS, MAX_CRAWL_DEPTH,
     MAX_CRAWL_EVENTS, MAX_CRAWL_PAGES, MAX_CRAWL_RETRIES, MAX_CRAWL_SEEDS,
-    MAX_CRAWL_URL_BYTES, MAX_TRACE_EVENTS, DEFAULT_STATION_PIPE, HOST_DIRECT,
+    MAX_CRAWL_URL_BYTES, MAX_LIVE_CONSOLE_LEVEL_BYTES, MAX_LIVE_CONSOLE_TEXT_BYTES,
+    MAX_LIVE_EVENTS, MAX_LIVE_METHOD_BYTES, MAX_LIVE_NETWORK_PARAMS_BYTES,
+    MAX_LIVE_URL_BYTES, MAX_TRACE_EVENTS, DEFAULT_STATION_PIPE, HOST_DIRECT,
     PROTOCOL_VERSION,
 };
 
@@ -449,6 +453,96 @@ impl StationClient {
         let response = require_crawl_response(&self.call(request).await?)?;
         match response {
             CrawlResponse::Cancelled { job_id: cancelled } if cancelled == job_id => Ok(()),
+            _ => Err(ClientError::InvalidResponse),
+        }
+    }
+
+    /// Begin a raw, bounded, cursored live DevTools event subscription for
+    /// a station-owned page. Requires the station operator to have enabled
+    /// `--allow-live-events`; unlike the snapshot/trace paths, events
+    /// returned via [`read_live_events`](Self::read_live_events) carry real
+    /// URLs and WebSocket/SSE frame payloads unsanitized.
+    pub async fn begin_live_capture(
+        &self,
+        profile_id: impl Into<String>,
+        target: LiveTarget,
+        filter: LiveFilter,
+    ) -> Result<LiveSessionId, ClientError> {
+        let session_id = LiveSessionId::new(*uuid::Uuid::new_v4().as_bytes())
+            .map_err(|_| ClientError::InvalidLiveRequest)?;
+        self.begin_live_capture_with_id(profile_id, session_id, target, filter)
+            .await
+    }
+
+    pub async fn begin_live_capture_with_id(
+        &self,
+        profile_id: impl Into<String>,
+        session_id: LiveSessionId,
+        target: LiveTarget,
+        filter: LiveFilter,
+    ) -> Result<LiveSessionId, ClientError> {
+        self.begin_live_capture_with_identity(
+            profile_id,
+            session_id,
+            ProfileClass::Public,
+            BrowserPersona::desktop_default(),
+            target,
+            filter,
+        )
+        .await
+    }
+
+    pub async fn begin_live_capture_with_identity(
+        &self,
+        profile_id: impl Into<String>,
+        session_id: LiveSessionId,
+        profile_class: ProfileClass,
+        persona: BrowserPersona,
+        target: LiveTarget,
+        filter: LiveFilter,
+    ) -> Result<LiveSessionId, ClientError> {
+        let live = LiveRequest::begin(session_id, profile_class, persona, target, filter)
+            .map_err(|_| ClientError::InvalidLiveRequest)?;
+        let request = WorkerRequest::begin_live(self.take_request_id(), profile_id, live)
+            .map_err(|_| ClientError::InvalidLiveRequest)?;
+        let response = require_live_response(&self.call(request).await?)?;
+        match response {
+            LiveResponse::Accepted {
+                session_id: accepted,
+            } if accepted == session_id => Ok(session_id),
+            _ => Err(ClientError::InvalidResponse),
+        }
+    }
+
+    pub async fn read_live_events(
+        &self,
+        session_id: LiveSessionId,
+        cursor: LiveCursor,
+        limit: u8,
+    ) -> Result<LiveEventPage, ClientError> {
+        let live = LiveRequest::read(session_id, cursor, limit)
+            .map_err(|_| ClientError::InvalidLiveRequest)?;
+        let request = WorkerRequest::live(self.take_request_id(), live)
+            .map_err(|_| ClientError::InvalidLiveRequest)?;
+        let response = require_live_response(&self.call(request).await?)?;
+        let LiveResponse::Events(page) = response else {
+            return Err(ClientError::InvalidResponse);
+        };
+        if page.session_id() != session_id || page.validate_after(cursor).is_err() {
+            return Err(ClientError::InvalidResponse);
+        }
+        Ok(page)
+    }
+
+    pub async fn stop_live_capture(&self, session_id: LiveSessionId) -> Result<(), ClientError> {
+        let live = LiveRequest::stop(session_id).map_err(|_| ClientError::InvalidLiveRequest)?;
+        let request = WorkerRequest::live(self.take_request_id(), live)
+            .map_err(|_| ClientError::InvalidLiveRequest)?;
+        let response = require_live_response(&self.call(request).await?)?;
+        match response {
+            LiveResponse::Stopped {
+                session_id: stopped,
+            } if stopped == session_id => Ok(()),
             _ => Err(ClientError::InvalidResponse),
         }
     }
@@ -887,6 +981,65 @@ impl BlockingStationClient {
         self.runtime.block_on(self.client.cancel_crawl(job_id))
     }
 
+    pub fn begin_live_capture(
+        &self,
+        profile_id: impl Into<String>,
+        target: LiveTarget,
+        filter: LiveFilter,
+    ) -> Result<LiveSessionId, ClientError> {
+        self.runtime
+            .block_on(self.client.begin_live_capture(profile_id, target, filter))
+    }
+
+    pub fn begin_live_capture_with_id(
+        &self,
+        profile_id: impl Into<String>,
+        session_id: LiveSessionId,
+        target: LiveTarget,
+        filter: LiveFilter,
+    ) -> Result<LiveSessionId, ClientError> {
+        self.runtime.block_on(self.client.begin_live_capture_with_id(
+            profile_id,
+            session_id,
+            target,
+            filter,
+        ))
+    }
+
+    pub fn begin_live_capture_with_identity(
+        &self,
+        profile_id: impl Into<String>,
+        session_id: LiveSessionId,
+        profile_class: ProfileClass,
+        persona: BrowserPersona,
+        target: LiveTarget,
+        filter: LiveFilter,
+    ) -> Result<LiveSessionId, ClientError> {
+        self.runtime.block_on(self.client.begin_live_capture_with_identity(
+            profile_id,
+            session_id,
+            profile_class,
+            persona,
+            target,
+            filter,
+        ))
+    }
+
+    pub fn read_live_events(
+        &self,
+        session_id: LiveSessionId,
+        cursor: LiveCursor,
+        limit: u8,
+    ) -> Result<LiveEventPage, ClientError> {
+        self.runtime
+            .block_on(self.client.read_live_events(session_id, cursor, limit))
+    }
+
+    pub fn stop_live_capture(&self, session_id: LiveSessionId) -> Result<(), ClientError> {
+        self.runtime
+            .block_on(self.client.stop_live_capture(session_id))
+    }
+
     pub fn identity_status(
         &self,
         profile_id: impl Into<String>,
@@ -1062,6 +1215,13 @@ fn require_crawl_response(response: &WorkerResponse) -> Result<CrawlResponse, Cl
         .map_err(|_| ClientError::InvalidResponse)
 }
 
+fn require_live_response(response: &WorkerResponse) -> Result<LiveResponse, ClientError> {
+    require_ok(response)?;
+    response
+        .decode_live_response()
+        .map_err(|_| ClientError::InvalidResponse)
+}
+
 fn runtime_satisfies_contract(
     runtime: &ResolvedRuntimeRecord,
     contract: &TaskRuntimeContract,
@@ -1138,6 +1298,8 @@ pub enum ClientError {
     InvalidCollectionRequest,
     #[error("invalid crawl request")]
     InvalidCrawlRequest,
+    #[error("invalid live event request")]
+    InvalidLiveRequest,
     #[error("failed to create station client runtime: {0}")]
     Runtime(#[source] std::io::Error),
     #[error("station rejected request with {status:?}: {message}")]
@@ -1215,6 +1377,7 @@ mod tests {
         assert_eq!(RequestKind::CheckAuthSession as u8, 10);
         assert_eq!(RequestKind::Collection as u8, 11);
         assert_eq!(RequestKind::Crawl as u8, 12);
+        assert_eq!(RequestKind::LiveEvents as u8, 13);
     }
 
     #[test]

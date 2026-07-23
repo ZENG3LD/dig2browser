@@ -48,6 +48,16 @@ pub trait BrowserRuntime: Send + 'static {
         script: &'a str,
     ) -> BoxFuture<'a, RuntimeResult<serde_json::Value>>;
     fn capture(&mut self, policy: CapturePolicy) -> BoxFuture<'_, RuntimeResult<CaptureArtifact>>;
+
+    /// Subscribe to this runtime's live DevTools event stream (`Network.*`
+    /// incl. WebSocket/SSE frames, and console messages). Default
+    /// implementation reports the surface as unsupported; only
+    /// [`RealBrowserRuntime`] (CDP/BiDi-backed) overrides it. Each call
+    /// returns an independent subscription — it does not disturb the
+    /// runtime's own internal DevTools use (HTTP-status tracking).
+    fn subscribe_devtools(&mut self) -> BoxFuture<'_, RuntimeResult<PageDevTools>> {
+        Box::pin(async { Err(RuntimeError::new(RuntimeFailureKind::Protocol)) })
+    }
 }
 
 /// Production runtime owning exactly one browser and one page for an identity.
@@ -500,6 +510,15 @@ impl BrowserRuntime for RealBrowserRuntime {
                     Ok(CaptureArtifact::EvidenceViewport { state, html, png })
                 }
             }
+        })
+    }
+
+    fn subscribe_devtools(&mut self) -> BoxFuture<'_, RuntimeResult<PageDevTools>> {
+        Box::pin(async move {
+            self.page()?
+                .devtools()
+                .await
+                .map_err(|_| RuntimeError::new(RuntimeFailureKind::Protocol))
         })
     }
 }

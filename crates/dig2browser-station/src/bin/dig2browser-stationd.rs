@@ -211,6 +211,12 @@ struct Cli {
     allow_crawl_read: bool,
     #[arg(long, default_value_t = false)]
     allow_crawl_write: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Allow the RAW (unsanitized real URLs, WS/SSE frame payloads) live DevTools event subscription"
+    )]
+    allow_live_events: bool,
 }
 
 #[cfg(windows)]
@@ -495,7 +501,8 @@ async fn run(cli: Cli) -> Result<DaemonReport, DaemonError> {
         .allow_durable_read(cli.allow_durable_read)
         .allow_durable_write(cli.allow_durable_write)
         .allow_crawl_read(cli.allow_crawl_read)
-        .allow_crawl_write(cli.allow_crawl_write);
+        .allow_crawl_write(cli.allow_crawl_write)
+        .allow_live_events(cli.allow_live_events);
         if let Some(trace_root) = cli.trace_root {
             server_config = server_config.trace_root(trace_root)?;
         }
@@ -1055,6 +1062,10 @@ impl DaemonError {
                 | CrawlError::CanonicalUrl(_),
             )) => "crawl_corrupt",
             Self::Server(ServerError::Crawl(_)) => "crawl_root_unavailable",
+            // `ServerError::Live` can only arise from the live-capture
+            // manager's shutdown-time lease drain, not a boot-time
+            // misconfiguration — same class as a station shutdown failure.
+            Self::Server(ServerError::Live(_)) => "station_shutdown_failure",
             Self::Server(ServerError::Station(_)) => "station_shutdown_failure",
         }
     }

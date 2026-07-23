@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 
+use crate::browser::PageDevTools;
 use crate::detect::LaunchConfig;
 use crate::identity::IdentityProfile;
 use crate::process_isolation::BrowserProcessIsolation;
@@ -10,7 +11,7 @@ use crate::stealth::StealthConfig;
 
 use super::contract::{
     validate_selector, AgentCommand, AgentReply, BrowserSnapshot, Capability, CapabilitySet,
-    ContractError, DocumentState, ElementRef, RuntimeFailureKind, WorkerLifecycle,
+    ContractError, DocumentState, ElementRef, L3Capability, RuntimeFailureKind, WorkerLifecycle,
 };
 use super::mobile::MobileLayout;
 use super::navigation::NavigationPolicy;
@@ -60,6 +61,7 @@ impl Default for BrowserWorkerConfig {
 #[derive(Clone)]
 pub struct BrowserWorker {
     commands: mpsc::Sender<Envelope>,
+    devtools: mpsc::Sender<DevToolsRequest>,
     snapshot: watch::Receiver<BrowserSnapshot>,
     stopped: watch::Receiver<bool>,
     actor: Arc<ActorControl>,
@@ -213,6 +215,7 @@ impl BrowserWorker {
         validate_close_timeout(close_timeout)?;
         let initial = BrowserSnapshot::starting(identity.id().to_owned());
         let (commands, receiver) = mpsc::channel(queue_capacity);
+        let (devtools, devtools_requests) = mpsc::channel(4);
         let (snapshot_tx, snapshot) = watch::channel(initial.clone());
         let (stopped_tx, stopped) = watch::channel(false);
         let (emergency_tx, emergency_rx) = watch::channel(false);
@@ -223,6 +226,7 @@ impl BrowserWorker {
                 ActorContext {
                     capabilities,
                     commands: receiver,
+                    devtools_requests,
                     snapshots: snapshot_tx,
                     snapshot: initial,
                     command_timeout,
@@ -242,6 +246,7 @@ impl BrowserWorker {
         });
         Ok(Self {
             commands,
+            devtools,
             snapshot,
             stopped,
             actor,
@@ -261,6 +266,29 @@ impl BrowserWorker {
                 command,
                 reply: reply_tx,
             })
+            .await
+            .map_err(|_| WorkerError::QueueClosed)?;
+        reply_rx.await.map_err(|_| WorkerError::WorkerStopped)?
+    }
+
+    /// Subscribe to this worker's live DevTools event stream. Requires
+    /// `L3Capability::Capture` and the actor to currently be `Ready` (same
+    /// readiness gate as ordinary commands) — checked inside the actor, not
+    /// here, so it stays correct even if the actor is mid-restart.
+    ///
+    /// This is independent of the queued [`AgentCommand`]/[`AgentReply`]
+    /// pipeline (a `broadcast::Receiver` is not comparable, so it cannot be
+    /// carried as an [`AgentReply`] variant): it uses its own small
+    /// side-channel into the same single-owner actor loop. It still shares
+    /// the actor's single-threaded serialization (it cannot run concurrently
+    /// with an in-flight command and waits for one to finish), but arriving
+    /// on its own channel means it does not have to wait behind an entire
+    /// backlog of already-queued `AgentCommand`s the way a new command sent
+    /// through [`execute`](Self::execute) would.
+    pub async fn subscribe_devtools(&self) -> Result<PageDevTools, WorkerError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.devtools
+            .send(DevToolsRequest { reply: reply_tx })
             .await
             .map_err(|_| WorkerError::QueueClosed)?;
         reply_rx.await.map_err(|_| WorkerError::WorkerStopped)?
@@ -357,9 +385,22 @@ struct Envelope {
     reply: oneshot::Sender<Result<AgentReply, WorkerError>>,
 }
 
+struct DevToolsRequest {
+    reply: oneshot::Sender<Result<PageDevTools, WorkerError>>,
+}
+
+/// One unit of work delivered to the actor's main loop: either a queued
+/// [`AgentCommand`] envelope, or a devtools subscription request arriving on
+/// its own side-channel.
+enum ActorEvent {
+    Command(Envelope),
+    DevTools(DevToolsRequest),
+}
+
 struct ActorContext {
     capabilities: CapabilitySet,
     commands: mpsc::Receiver<Envelope>,
+    devtools_requests: mpsc::Receiver<DevToolsRequest>,
     snapshots: watch::Sender<BrowserSnapshot>,
     snapshot: BrowserSnapshot,
     command_timeout: Duration,
@@ -375,6 +416,7 @@ async fn run_actor(
     let ActorContext {
         capabilities,
         mut commands,
+        mut devtools_requests,
         snapshots,
         mut snapshot,
         command_timeout,
@@ -418,16 +460,32 @@ async fn run_actor(
     let mut shutdown_attempted = false;
     let mut emergency_requested = false;
     loop {
-        let envelope = tokio::select! {
+        let event = tokio::select! {
             biased;
             _ = wait_for_emergency(&mut emergency) => {
                 emergency_requested = true;
                 break;
             }
             envelope = commands.recv() => match envelope {
-                Some(envelope) => envelope,
+                Some(envelope) => ActorEvent::Command(envelope),
                 None => break,
             },
+            request = devtools_requests.recv() => match request {
+                Some(request) => ActorEvent::DevTools(request),
+                // The devtools sender is co-owned by every `BrowserWorker`
+                // clone alongside `commands` and always closes together with
+                // it; if it somehow closes first, keep serving commands.
+                None => continue,
+            },
+        };
+        let envelope = match event {
+            ActorEvent::Command(envelope) => envelope,
+            ActorEvent::DevTools(request) => {
+                let result =
+                    handle_devtools_subscription(&mut *runtime, &capabilities, &snapshot).await;
+                let _ = request.reply.send(result);
+                continue;
+            }
         };
         let is_shutdown = matches!(envelope.command, AgentCommand::Shutdown);
         shutdown_attempted |= is_shutdown
@@ -528,6 +586,21 @@ async fn emergency_close_runtime(
     snapshot.lifecycle = WorkerLifecycle::Stopped;
     snapshot.current_origin = None;
     snapshots.send_replace(snapshot.clone());
+}
+
+async fn handle_devtools_subscription(
+    runtime: &mut dyn BrowserRuntime,
+    capabilities: &CapabilitySet,
+    snapshot: &BrowserSnapshot,
+) -> Result<PageDevTools, WorkerError> {
+    let required = Capability::L3(L3Capability::Capture);
+    if !capabilities.contains(required) {
+        return Err(WorkerError::CapabilityDenied(required));
+    }
+    if snapshot.lifecycle != WorkerLifecycle::Ready {
+        return Err(WorkerError::Unavailable);
+    }
+    runtime.subscribe_devtools().await.map_err(WorkerError::from)
 }
 
 async fn handle_command(
@@ -1289,6 +1362,47 @@ mod tests {
         assert_eq!(snapshot.lifecycle, WorkerLifecycle::Ready);
         assert_eq!(snapshot.last_failure, None);
         worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn devtools_subscription_is_capability_gated_and_unsupported_by_default() {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let ungated_worker = BrowserWorker::spawn_with_runtime(
+            identity(),
+            CapabilitySet::monitoring(),
+            4,
+            FakeRuntime {
+                state: Arc::clone(&state),
+            },
+        )
+        .unwrap();
+        ungated_worker.wait_until_settled().await.unwrap();
+        // `FakeRuntime` never overrides `BrowserRuntime::subscribe_devtools`,
+        // so the default trait implementation reports it as unsupported
+        // rather than the request silently no-opping.
+        assert!(matches!(
+            ungated_worker.subscribe_devtools().await,
+            Err(WorkerError::Runtime(error))
+                if error.kind() == RuntimeFailureKind::Protocol
+        ));
+        ungated_worker.shutdown().await.unwrap();
+
+        let denied_worker = BrowserWorker::spawn_with_runtime(
+            identity(),
+            CapabilitySet::new([Capability::L3(L3Capability::Lifecycle)]).unwrap(),
+            4,
+            FakeRuntime { state },
+        )
+        .unwrap();
+        denied_worker.wait_until_settled().await.unwrap();
+        match denied_worker.subscribe_devtools().await {
+            Err(WorkerError::CapabilityDenied(capability)) => {
+                assert_eq!(capability, Capability::L3(L3Capability::Capture));
+            }
+            Err(other) => panic!("expected capability denial, got a different error: {other:?}"),
+            Ok(_) => panic!("expected capability denial, got a subscription"),
+        }
+        denied_worker.shutdown().await.unwrap();
     }
 
     #[tokio::test]
