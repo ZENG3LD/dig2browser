@@ -30,7 +30,7 @@ use dig2browser::identity::{
 use dig2browser::stealth::{ClientHintsProfile, LocaleProfile};
 use dig2browser::BrowserProcessIsolation;
 use dig2browser_protocol::{
-    BrowserPersona, IdentitySessionStatus, PersonaKind, ProfileClass,
+    BrowserPersona, IdentitySessionStatus, LoadState, PersonaKind, ProfileClass,
     SessionHealthProbe, SessionPhase, SessionStateUpdate,
 };
 use dig2browser_core::{
@@ -361,6 +361,7 @@ pub enum BrowserTaskStep {
     Evaluate { script: String },
     Capture { policy: CapturePolicy },
     WaitForSelector { selector: String, timeout: Duration },
+    WaitForLoadState { state: LoadState, timeout: Duration },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -394,6 +395,17 @@ impl BrowserTask {
                 }
                 BrowserTaskStep::WaitForSelector { selector, timeout } => {
                     ElementRef::new(selector, 0).map_err(|_| TaskError::InvalidSelector)?;
+                    if timeout.is_zero() || *timeout > MAX_TASK_WAIT {
+                        return Err(TaskError::InvalidWait);
+                    }
+                    total_wait = total_wait
+                        .checked_add(*timeout)
+                        .ok_or(TaskError::InvalidWait)?;
+                    if total_wait > MAX_TASK_WAIT {
+                        return Err(TaskError::InvalidWait);
+                    }
+                }
+                BrowserTaskStep::WaitForLoadState { timeout, .. } => {
                     if timeout.is_zero() || *timeout > MAX_TASK_WAIT {
                         return Err(TaskError::InvalidWait);
                     }
@@ -545,7 +557,8 @@ fn task_runtime_requirements(
             BrowserTaskStep::ReadSelectorText { .. } => {
                 add(RuntimeFeature::DomInspect)
             }
-            BrowserTaskStep::WaitForSelector { .. } => {
+            BrowserTaskStep::WaitForSelector { .. }
+            | BrowserTaskStep::WaitForLoadState { .. } => {
                 add(RuntimeFeature::DomInspect)
             }
             BrowserTaskStep::Evaluate { .. } => add(RuntimeFeature::ScriptEvaluate),
@@ -2216,6 +2229,9 @@ impl BrowserLease {
         if let BrowserTaskStep::WaitForSelector { selector, timeout } = step {
             return self.wait_for_selector(selector, *timeout, cancelled).await;
         }
+        if let BrowserTaskStep::WaitForLoadState { state, timeout } = step {
+            return self.wait_for_load_state(*state, *timeout, cancelled).await;
+        }
         let reply = self.execute_task_step(step).await?;
         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
             return Err(StationError::TaskCancelled);
@@ -2304,6 +2320,9 @@ impl BrowserLease {
             BrowserTaskStep::WaitForSelector { selector, timeout } => {
                 self.wait_for_selector(selector, *timeout, None).await
             }
+            BrowserTaskStep::WaitForLoadState { state, timeout } => {
+                self.wait_for_load_state(*state, *timeout, None).await
+            }
         }
     }
 
@@ -2357,6 +2376,48 @@ impl BrowserLease {
         }
     }
 
+    /// Poll `document.readyState` (via the inspect-only `ObserveDocument`
+    /// command) until it reaches at least `target` (`Interactive < Complete`),
+    /// or `timeout` elapses (`WaitTimeout`). Cancellation-aware at 100 ms
+    /// granularity, mirroring [`wait_for_selector`](Self::wait_for_selector).
+    async fn wait_for_load_state(
+        &self,
+        target: LoadState,
+        timeout: Duration,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<AgentReply, StationError> {
+        let target_rank = match target {
+            LoadState::Interactive => 1_u8,
+            LoadState::Complete => 2,
+        };
+        let deadline = Instant::now() + timeout;
+        loop {
+            if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+                return Err(StationError::TaskCancelled);
+            }
+            if let Ok(AgentReply::Text(ready)) = self
+                .slot
+                .worker
+                .execute(AgentCommand::ObserveDocument)
+                .await
+            {
+                let rank = match ready.as_str() {
+                    "complete" => 2_u8,
+                    "interactive" => 1,
+                    _ => 0,
+                };
+                if rank >= target_rank {
+                    return Ok(AgentReply::Acknowledged);
+                }
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(StationError::WaitTimeout);
+            }
+            tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
+        }
+    }
+
     fn validate_task_capabilities(&self, task: &BrowserTask) -> Result<(), StationError> {
         for step in task.steps() {
             let required: &[Capability] = match step {
@@ -2378,7 +2439,8 @@ impl BrowserLease {
                 BrowserTaskStep::ReadSelectorText { .. } => {
                     &[Capability::L2(L2Capability::Inspect)]
                 }
-                BrowserTaskStep::WaitForSelector { .. } => {
+                BrowserTaskStep::WaitForSelector { .. }
+                | BrowserTaskStep::WaitForLoadState { .. } => {
                     &[Capability::L2(L2Capability::Inspect)]
                 }
                 BrowserTaskStep::Evaluate { .. } => {

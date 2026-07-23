@@ -73,6 +73,42 @@ pub enum TaskStep {
     /// the scripted-task gate. `timeout` counts against the same cumulative
     /// wait budget as `Wait` (`MAX_TASK_WAIT`).
     WaitForSelector { selector: String, timeout: Duration },
+    /// Block until the document reaches (at least) `state`
+    /// (`document.readyState`), or `timeout` elapses.
+    ///
+    /// Inspect-only (a fixed internal `readyState` read, never a consumer
+    /// script): it lets an agent wait for a client-side navigation to settle
+    /// without racing the load and without the scripted-task gate. `timeout`
+    /// counts against the same cumulative wait budget as `Wait`
+    /// (`MAX_TASK_WAIT`).
+    WaitForLoadState { state: LoadState, timeout: Duration },
+}
+
+/// A document load milestone (`document.readyState`), ordered
+/// `Interactive < Complete`. `WaitForLoadState` blocks until the live state is
+/// at least the requested one. `loading` is not a target — it is where a
+/// document begins, so there is nothing to wait for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadState {
+    Interactive,
+    Complete,
+}
+
+impl LoadState {
+    fn to_wire(self) -> u8 {
+        match self {
+            Self::Interactive => 1,
+            Self::Complete => 2,
+        }
+    }
+
+    fn from_wire(value: u8) -> Result<Self, ProtocolError> {
+        match value {
+            1 => Ok(Self::Interactive),
+            2 => Ok(Self::Complete),
+            _ => Err(ProtocolError::InvalidTaskPayload),
+        }
+    }
 }
 
 /// Opt-in runtime selection and capability requirements for a task.
@@ -243,6 +279,17 @@ impl CollectionTask {
                         return Err(ProtocolError::InvalidTaskPayload);
                     }
                 }
+                TaskStep::WaitForLoadState { timeout, .. } => {
+                    if timeout.is_zero() {
+                        return Err(ProtocolError::InvalidTaskPayload);
+                    }
+                    total_wait = total_wait
+                        .checked_add(*timeout)
+                        .ok_or(ProtocolError::InvalidTaskPayload)?;
+                    if total_wait > MAX_TASK_WAIT {
+                        return Err(ProtocolError::InvalidTaskPayload);
+                    }
+                }
             }
         }
         Ok(())
@@ -317,6 +364,13 @@ impl CollectionTask {
                         .map_err(|_| ProtocolError::InvalidTaskPayload)?;
                     output.extend_from_slice(&millis.to_le_bytes());
                 }
+                TaskStep::WaitForLoadState { state, timeout } => {
+                    output.push(11);
+                    output.push(state.to_wire());
+                    let millis = u64::try_from(timeout.as_millis())
+                        .map_err(|_| ProtocolError::InvalidTaskPayload)?;
+                    output.extend_from_slice(&millis.to_le_bytes());
+                }
             }
         }
         if output.len() > MAX_REQUEST_BYTES {
@@ -376,6 +430,10 @@ impl CollectionTask {
                 },
                 10 => TaskStep::WaitForSelector {
                     selector: input.utf8_u16()?,
+                    timeout: Duration::from_millis(input.u64()?),
+                },
+                11 => TaskStep::WaitForLoadState {
+                    state: LoadState::from_wire(input.u8()?)?,
                     timeout: Duration::from_millis(input.u64()?),
                 },
                 _ => return Err(ProtocolError::InvalidTaskPayload),
@@ -1253,6 +1311,46 @@ mod tests {
         // Inspect-only: waiting for an element is neither interaction nor script.
         assert!(!task.requires_interaction());
         assert!(!task.requires_script());
+    }
+
+    #[test]
+    fn wait_for_load_state_round_trips_and_is_not_interaction_or_script() {
+        let task = CollectionTask::new(vec![
+            navigate_step(),
+            TaskStep::WaitForLoadState {
+                state: LoadState::Interactive,
+                timeout: Duration::from_secs(5),
+            },
+            TaskStep::WaitForLoadState {
+                state: LoadState::Complete,
+                timeout: Duration::from_secs(5),
+            },
+        ])
+        .expect("valid task");
+
+        let encoded = task.encode_payload().expect("encode task");
+        let decoded = CollectionTask::decode_payload(&encoded).expect("decode task");
+        assert_eq!(decoded, task);
+        assert!(!task.requires_interaction());
+        assert!(!task.requires_script());
+
+        // A zero timeout is rejected, and the cumulative wait budget is enforced.
+        assert!(CollectionTask::new(vec![
+            navigate_step(),
+            TaskStep::WaitForLoadState {
+                state: LoadState::Complete,
+                timeout: Duration::ZERO,
+            },
+        ])
+        .is_err());
+        assert!(CollectionTask::new(vec![
+            navigate_step(),
+            TaskStep::WaitForLoadState {
+                state: LoadState::Complete,
+                timeout: MAX_TASK_WAIT + Duration::from_millis(1),
+            },
+        ])
+        .is_err());
     }
 
     #[test]

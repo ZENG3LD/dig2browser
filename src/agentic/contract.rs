@@ -234,6 +234,10 @@ pub enum AgentCommand {
     ReadElementText {
         element: ElementRef,
     },
+    /// Observe the document's load state (`document.readyState`) via a fixed,
+    /// station-authored evaluation — inspect-only, never a consumer script.
+    /// Backs the `WaitForLoadState` task step.
+    ObserveDocument,
     Evaluate {
         script: String,
     },
@@ -259,9 +263,9 @@ impl AgentCommand {
             Self::ClickAt { .. } => Capability::L1(L1Capability::Pointer),
             Self::Wheel { .. } => Capability::L1(L1Capability::Scroll),
             Self::KeyPress { .. } => Capability::L1(L1Capability::Keyboard),
-            Self::ResolveElement { .. } | Self::ReadElementText { .. } => {
-                Capability::L2(L2Capability::Inspect)
-            }
+            Self::ResolveElement { .. }
+            | Self::ReadElementText { .. }
+            | Self::ObserveDocument => Capability::L2(L2Capability::Inspect),
             Self::ClickElement { .. } | Self::TypeElement { .. } => {
                 Capability::L2(L2Capability::Interact)
             }

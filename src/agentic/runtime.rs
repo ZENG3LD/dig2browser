@@ -70,6 +70,14 @@ pub trait BrowserRuntime: Send + 'static {
         let _ = cookies;
         Box::pin(async { Err(RuntimeError::new(RuntimeFailureKind::Protocol)) })
     }
+
+    /// Observe the document's load state (`document.readyState`, plus url/title)
+    /// via a fixed internal evaluation — no consumer script. Default reports the
+    /// surface as unsupported; only [`RealBrowserRuntime`] overrides it. Backs
+    /// the inspect-only `WaitForLoadState` task step.
+    fn observe_document(&mut self) -> BoxFuture<'_, RuntimeResult<DocumentState>> {
+        Box::pin(async { Err(RuntimeError::new(RuntimeFailureKind::Protocol)) })
+    }
 }
 
 /// Production runtime owning exactly one browser and one page for an identity.
@@ -555,6 +563,10 @@ impl BrowserRuntime for RealBrowserRuntime {
                 .await
                 .map_err(|_| RuntimeError::new(RuntimeFailureKind::Interaction))
         })
+    }
+
+    fn observe_document(&mut self) -> BoxFuture<'_, RuntimeResult<DocumentState>> {
+        Box::pin(async move { self.document_state().await })
     }
 }
 

@@ -1766,6 +1766,12 @@ fn to_station_task(task: &CollectionTask) -> Result<BrowserTask, crate::TaskErro
                         timeout: *timeout,
                     }
                 }
+                TaskStep::WaitForLoadState { state, timeout } => {
+                    BrowserTaskStep::WaitForLoadState {
+                        state: *state,
+                        timeout: *timeout,
+                    }
+                }
             })
             .collect(),
     )
@@ -1799,7 +1805,7 @@ fn task_capabilities(task: &CollectionTask) -> CapabilitySet {
             TaskStep::ReadSelectorText { .. } => {
                 add(Capability::L2(L2Capability::Inspect));
             }
-            TaskStep::WaitForSelector { .. } => {
+            TaskStep::WaitForSelector { .. } | TaskStep::WaitForLoadState { .. } => {
                 add(Capability::L2(L2Capability::Inspect));
             }
             TaskStep::Evaluate { .. } => add(Capability::L2(L2Capability::Evaluate)),

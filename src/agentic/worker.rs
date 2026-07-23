@@ -708,6 +708,10 @@ async fn handle_command(
                 .await
                 .map(AgentReply::Text)
         }
+        AgentCommand::ObserveDocument => runtime
+            .observe_document()
+            .await
+            .map(|state| AgentReply::Text(state.ready_state)),
         AgentCommand::Evaluate { script } => {
             if script.is_empty() || script.len() > MAX_SCRIPT_BYTES || script.contains('\0') {
                 return Err(WorkerError::InvalidInput);

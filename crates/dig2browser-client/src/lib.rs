@@ -17,7 +17,7 @@ pub use dig2browser_protocol::{
     CompiledPersona, ControlTransport, CrawlCounts, CrawlCursor, CrawlEvent, CrawlEventKind,
     CrawlEventPage, CrawlJobId, CrawlPhase, CrawlRequest, CrawlResponse, CrawlSpec,
     CrawlStatus, EngineFamily, EvidenceCapture, FailureClass,
-    IdentitySessionStatus, InterruptedReason, LiveCursor, LiveEvent, LiveEventKind,
+    IdentitySessionStatus, InterruptedReason, LoadState, LiveCursor, LiveEvent, LiveEventKind,
     LiveEventPage, LiveFilter, LiveRequest, LiveResponse, LiveSessionId, LiveTarget,
     MobilePersonaConfig, MonitorCursor, MonitorEvent, MonitorEventKind, MonitorEventPage,
     MonitorFrame, MonitorRequest, MonitorResponse, MonitorStopReason, PersonaKind,

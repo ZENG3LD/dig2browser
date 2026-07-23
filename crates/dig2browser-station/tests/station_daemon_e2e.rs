@@ -15,7 +15,7 @@ use dig2browser_client::{
     ClientError, CollectionId, CollectionTask, ControlTransport, CrawlCursor,
     CrawlEvent, CrawlEventKind, CrawlJobId, CrawlPhase, CrawlSpec, EngineFamily, FailureClass,
     IdentitySessionStatus, InterruptedReason, LiveCursor, LiveEventKind, LiveFilter,
-    LiveTarget, MobilePersonaConfig, MonitorCursor, MonitorEvent, MonitorEventKind,
+    LiveTarget, LoadState, MobilePersonaConfig, MonitorCursor, MonitorEvent, MonitorEventKind,
     MonitorFrame, MonitorStopReason, PersonaPreset,
     ProfileClass, ResponseStatus, RouteRef, RuntimeFeature, RuntimeKind,
     RuntimeRequirements, RuntimeSelector, SessionHealthProbe, SessionPhase,
@@ -1609,6 +1609,66 @@ async fn durable_monitor_survives_station_restart_and_resumes_e2e() {
     drop(ws_fixture);
     drop(profiles_owner);
     remove_tree(&base).await;
+}
+
+// A.2 acceptance: the inspect-only WaitForLoadState step settles a task after a
+// navigation without a blind Wait and without the scripted-task gate. Runs a task
+// that navigates, waits for readyState to reach Interactive then Complete, and
+// reads the page — proving both waits resolve (Acknowledged) over the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stationd_wait_for_load_state_settles_a_task_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-stationd-wait-load-e2e-{unique}");
+    let profiles = e2e_temp_base().join(format!(
+        "dig2browser-stationd-wait-load-e2e-{unique}"
+    ));
+    std::fs::create_dir_all(&profiles).expect("create wait-load profiles root");
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+    let mut daemon = spawn_stationd(stationd, &pipe_name, &profiles);
+
+    let client = StationClient::connect(
+        ClientConfig::new(&pipe_name, Duration::from_secs(15), Duration::from_secs(90))
+            .expect("valid wait-load client config"),
+    )
+    .await
+    .expect("connect wait-load station client");
+
+    let url = fixture.url("/settle");
+    let task = CollectionTask::new(vec![
+        TaskStep::Navigate { url: url.clone() },
+        TaskStep::WaitForLoadState {
+            state: LoadState::Interactive,
+            timeout: Duration::from_secs(10),
+        },
+        TaskStep::WaitForLoadState {
+            state: LoadState::Complete,
+            timeout: Duration::from_secs(10),
+        },
+        TaskStep::ReadSelectorText {
+            selector: "main".to_owned(),
+        },
+    ])
+    .expect("valid wait-load task");
+    let result = client
+        .run_task("wait-load-profile", task)
+        .await
+        .expect("run wait-load task");
+    assert_eq!(result.replies().len(), 4);
+    assert_eq!(result.replies()[1], TaskReply::Acknowledged);
+    assert_eq!(result.replies()[2], TaskReply::Acknowledged);
+    assert_eq!(result.replies()[3], TaskReply::Text("settle".to_owned()));
+
+    client.shutdown().await.expect("request wait-load station drain");
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("wait-load station exit timeout")
+        .expect("wait for wait-load station");
+    assert!(status.success(), "wait-load station failed: {status}");
+    let (_, stderr) = read_child_output(&mut daemon).await;
+    assert!(stderr.is_empty(), "clean wait-load station wrote stderr: {stderr}");
+    remove_tree(&profiles).await;
 }
 
 fn frame_records(records: &[MonitorEvent]) -> Vec<&MonitorFrame> {

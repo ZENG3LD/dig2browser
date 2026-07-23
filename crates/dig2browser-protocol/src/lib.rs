@@ -39,7 +39,7 @@ pub use session::{
 };
 
 pub use task::{
-    CaptureCompleteness, CollectionTask, CollectionTaskResult, EvidenceCapture,
+    CaptureCompleteness, CollectionTask, CollectionTaskResult, EvidenceCapture, LoadState,
     ResolvedRuntimeRecord, TaskCapturePolicy, TaskReply, TaskRuntimeContract,
     TaskStep, MAX_TASK_RESULT_BYTES, MAX_TASK_STEPS, MAX_TASK_WAIT,
     MAX_COLLECTOR_VERSION_BYTES, MAX_SELECTOR_BYTES,
