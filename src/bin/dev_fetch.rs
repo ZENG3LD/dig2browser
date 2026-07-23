@@ -15,8 +15,8 @@ use clap::Parser;
 use dig2browser::DevToolsEvent;
 use dig2browser::NetworkEvent;
 use dig2browser::{
-    BrowserPreference, BrowserProfile, LaunchConfig, LocaleProfile, StealthBrowser, StealthConfig,
-    StealthLevel,
+    BrowserPreference, BrowserProfile, BrowserProxy, LaunchConfig, LocaleProfile, StealthBrowser,
+    StealthConfig, StealthLevel,
 };
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -33,6 +33,10 @@ struct Cli {
     /// Path to a JSON fingerprint config file
     #[arg(long)]
     fingerprint: Option<PathBuf>,
+
+    /// Route the browser through a proxy, e.g. socks5://127.0.0.1:18080 or http://host:port
+    #[arg(long)]
+    proxy: Option<String>,
 
     /// Launch a visible browser window instead of headless
     #[arg(long)]
@@ -221,11 +225,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Viewport from stealth config feeds into LaunchConfig window size.
     let window_size = stealth.viewport;
 
+    // --proxy socks5://host:port | http://host:port  (default scheme = socks5)
+    let browser_proxy = cli.proxy.as_deref().map(|p| {
+        let addr = p.split_once("://").map(|(_, a)| a).unwrap_or(p);
+        let sa: std::net::SocketAddr = addr.parse().expect("invalid --proxy address (want host:port)");
+        if p.starts_with("http") {
+            BrowserProxy::Http(sa)
+        } else {
+            BrowserProxy::Socks5(sa)
+        }
+    });
+
     let launch = LaunchConfig {
         headless,
         window_size,
         profile,
         browser_pref,
+        browser_proxy,
         ..LaunchConfig::default()
     };
 
