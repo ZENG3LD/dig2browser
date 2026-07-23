@@ -223,6 +223,12 @@ struct Cli {
         help = "Allow the RAW (unsanitized real URLs, WS/SSE frame payloads) live DevTools event subscription"
     )]
     allow_live_events: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Allow importing a prepared session from a local file into an authenticated profile (cookie bytes are read locally, never over the pipe)"
+    )]
+    allow_session_import: bool,
 }
 
 #[cfg(windows)]
@@ -509,7 +515,8 @@ async fn run(cli: Cli) -> Result<DaemonReport, DaemonError> {
         .allow_crawl_read(cli.allow_crawl_read)
         .allow_crawl_write(cli.allow_crawl_write)
         .allow_authenticated_crawl(cli.allow_authenticated_crawl)
-        .allow_live_events(cli.allow_live_events);
+        .allow_live_events(cli.allow_live_events)
+        .allow_session_import(cli.allow_session_import);
         if let Some(trace_root) = cli.trace_root {
             server_config = server_config.trace_root(trace_root)?;
         }

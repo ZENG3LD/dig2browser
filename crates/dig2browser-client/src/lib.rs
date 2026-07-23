@@ -641,6 +641,27 @@ impl StationClient {
         require_ok(&response)
     }
 
+    /// Import a prepared session from a **local file** into an authenticated
+    /// profile. `path` is a local filesystem path the station reads itself —
+    /// the cookie material never crosses the pipe. Gated by
+    /// `--allow-session-import`; fails closed on a non-authenticated identity or
+    /// an existing public profile.
+    pub async fn import_session(
+        &self,
+        profile_id: impl Into<String>,
+        persona: BrowserPersona,
+        path: impl Into<String>,
+    ) -> Result<(), ClientError> {
+        let request = WorkerRequest::import_session(
+            self.take_request_id(),
+            profile_id,
+            persona,
+            path,
+        );
+        let response = self.call(request).await?;
+        require_ok(&response)
+    }
+
     /// Close a station-owned visible login window and release its profile back
     /// to the headless worker pool. Session readiness remains operator-set.
     pub async fn finish_auth_session(
@@ -1085,6 +1106,18 @@ impl BlockingStationClient {
         self.runtime.block_on(
             self.client
                 .begin_auth_session(profile_id, persona, url),
+        )
+    }
+
+    pub fn import_session(
+        &self,
+        profile_id: impl Into<String>,
+        persona: BrowserPersona,
+        path: impl Into<String>,
+    ) -> Result<(), ClientError> {
+        self.runtime.block_on(
+            self.client
+                .import_session(profile_id, persona, path),
         )
     }
 

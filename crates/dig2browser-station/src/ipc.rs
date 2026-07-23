@@ -193,6 +193,7 @@ pub struct ServerConfig {
     allow_crawl_write: bool,
     allow_authenticated_crawl: bool,
     allow_live_events: bool,
+    allow_session_import: bool,
 }
 
 impl ServerConfig {
@@ -230,6 +231,7 @@ impl ServerConfig {
             allow_crawl_write: false,
             allow_authenticated_crawl: false,
             allow_live_events: false,
+            allow_session_import: false,
         })
     }
 
@@ -319,6 +321,14 @@ impl ServerConfig {
     /// rather than a split read/write pair.
     pub fn allow_live_events(mut self, allow: bool) -> Self {
         self.allow_live_events = allow;
+        self
+    }
+
+    /// Allow importing a prepared session from a local file into an
+    /// authenticated profile (`RequestKind::ImportSession`). Default-deny; the
+    /// station reads the file locally, so no cookie material crosses the pipe.
+    pub fn allow_session_import(mut self, allow: bool) -> Self {
+        self.allow_session_import = allow;
         self
     }
 
@@ -486,6 +496,7 @@ async fn run_windows_server(
                         crawl_read: config.allow_crawl_read,
                         crawl_write: config.allow_crawl_write,
                         live_events: config.allow_live_events,
+                        session_import: config.allow_session_import,
                     },
                 };
                 connections.spawn(async move {
@@ -691,6 +702,14 @@ async fn serve_connection(
                 ResponseStatus::Invalid,
                 "session health disabled",
             ),
+            RequestKind::ImportSession if task_permissions.session_import => {
+                import_session(&station, &request).await
+            }
+            RequestKind::ImportSession => WorkerResponse::failure(
+                &request,
+                ResponseStatus::Invalid,
+                "session import disabled",
+            ),
             RequestKind::Shutdown if allow_remote_shutdown => {
                 WorkerResponse::empty(&request, ResponseStatus::Ok)
             }
@@ -726,6 +745,7 @@ struct TaskPermissions {
     crawl_read: bool,
     crawl_write: bool,
     live_events: bool,
+    session_import: bool,
 }
 
 async fn crawl_request(
@@ -1250,6 +1270,70 @@ async fn finish_auth_session(
             request,
             ResponseStatus::Unavailable,
             "authentication session unavailable",
+        ),
+    }
+}
+
+/// TTL applied to the `Ready` session-state written after a successful import.
+const SESSION_IMPORT_TTL_SECONDS: u32 = 24 * 60 * 60;
+
+async fn import_session(
+    station: &BrowserStation,
+    request: &WorkerRequest,
+) -> WorkerResponse {
+    let Some(persona) = request.persona.clone() else {
+        return WorkerResponse::failure(request, ResponseStatus::Invalid, "persona missing");
+    };
+    // The station reads the prepared-session file itself; `request.url` carries
+    // a local path, never cookie material.
+    let bytes = match std::fs::read(&request.url) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return WorkerResponse::failure(
+                request,
+                ResponseStatus::Invalid,
+                "session file unreadable",
+            );
+        }
+    };
+    let cookies = match crate::session_import::parse_session_cookies(&bytes) {
+        Ok(cookies) => cookies,
+        Err(_) => {
+            return WorkerResponse::failure(
+                request,
+                ResponseStatus::Invalid,
+                "session file invalid",
+            );
+        }
+    };
+    let identity = IdentityRequest::authenticated_persona(&request.profile_id, persona);
+    match station
+        .import_session(identity, cookies, SESSION_IMPORT_TTL_SECONDS)
+        .await
+    {
+        Ok(_count) => WorkerResponse::empty(request, ResponseStatus::Ok),
+        Err(
+            StationError::Identity(_)
+            | StationError::PersonaMismatch
+            | StationError::PersonaBindingRequired
+            | StationError::ProfileBindingMismatch
+            | StationError::ProfileBindingRequired
+            | StationError::PersonaRuntimeMismatch
+            | StationError::IdentityClassMismatch
+            | StationError::IdentityClassBindingRequired
+            | StationError::InvalidPersona
+            | StationError::AuthenticatedProfileRequired
+            | StationError::InvalidSessionState
+            | StationError::Worker(WorkerError::InvalidInput)
+            | StationError::Route(_),
+        ) => WorkerResponse::failure(request, ResponseStatus::Invalid, "session import rejected"),
+        Err(StationError::AuthSessionBusy | StationError::AtCapacity) => {
+            WorkerResponse::failure(request, ResponseStatus::Unavailable, "session import busy")
+        }
+        Err(_) => WorkerResponse::failure(
+            request,
+            ResponseStatus::Unavailable,
+            "session import unavailable",
         ),
     }
 }

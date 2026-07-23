@@ -18,9 +18,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dig2browser::agentic::{
     AgentCommand, AgentReply, BrowserSnapshot, BrowserWorker, BrowserWorkerConfig,
-    Capability, CapabilitySet, CaptureArtifact, CapturePolicy, ElementRef, L1Capability,
-    L2Capability, L3Capability, MobileLayout, NavigationPolicy, RuntimeFailureKind,
-    WorkerError, WorkerLifecycle,
+    Capability, CapabilitySet, CaptureArtifact, CapturePolicy, CookieSpec, ElementRef,
+    L1Capability, L2Capability, L3Capability, MobileLayout, NavigationPolicy,
+    RuntimeFailureKind, WorkerError, WorkerLifecycle,
 };
 use dig2browser::browser::PageDevTools;
 use dig2browser::identity::{
@@ -49,9 +49,6 @@ pub mod ipc;
 mod live;
 mod route;
 pub mod runtime;
-// `parse_session_cookies` is consumed by the Phase B.1c import flow (not yet
-// wired); the allow is removed when that flow lands.
-#[allow(dead_code)]
 mod session_import;
 #[cfg(windows)]
 mod windows_containment;
@@ -1647,6 +1644,55 @@ impl BrowserStation {
 
     async fn remove_auth_reservation(&self, identity: &IdentityRequest) {
         self.inner.state.lock().await.auth_sessions.remove(identity);
+    }
+
+    /// Import a prepared session: install `cookies` into the profile's own
+    /// encrypted cookie store (CDP `Network.setCookie`) under an `Authenticated`
+    /// identity, then mark the session `Ready`. The cookies are parsed from a
+    /// local file the caller supplies (`session_import::parse_session_cookies`);
+    /// their values never cross the IPC boundary. Fail-closed: a non-authenticated
+    /// identity is rejected, and an existing `Public` profile is rejected by the
+    /// profile binding — there is no silent `Public -> Authenticated` promotion.
+    /// Returns the number of cookies installed.
+    pub async fn import_session(
+        &self,
+        identity: IdentityRequest,
+        cookies: Vec<CookieSpec>,
+        session_ttl_seconds: u32,
+    ) -> Result<u32, StationError> {
+        if identity.class != IdentityClass::Authenticated {
+            return Err(StationError::AuthenticatedProfileRequired);
+        }
+        if cookies.is_empty() {
+            return Err(StationError::InvalidSessionState);
+        }
+        if self.inner.shutting_down.load(Ordering::Acquire) {
+            return Err(StationError::ShuttingDown);
+        }
+        let count = u32::try_from(cookies.len()).unwrap_or(u32::MAX);
+        // Needs Interact to install cookies; Lifecycle to hold the worker.
+        let capabilities = CapabilitySet::new([
+            Capability::L2(L2Capability::Interact),
+            Capability::L3(L3Capability::Lifecycle),
+        ])
+        .map_err(|_| StationError::InvalidSessionState)?;
+        let lease = self.lease(identity.clone(), capabilities).await?;
+        lease
+            .execute(AgentCommand::SetCookies { cookies })
+            .await?;
+        drop(lease);
+        let expires_at_unix_ms = unix_time_ms()
+            .checked_add(u64::from(session_ttl_seconds) * 1_000)
+            .ok_or(StationError::InvalidSessionState)?;
+        self.update_identity_session(
+            &identity.id,
+            SessionStateUpdate {
+                phase: SessionPhase::Ready,
+                expires_at_unix_ms: Some(expires_at_unix_ms),
+            },
+        )
+        .await?;
+        Ok(count)
     }
 
     /// Check a bound authenticated profile using two bounded DOM signals and

@@ -77,6 +77,9 @@ const AUTH_IDENTITY_MAGIC: [u8; 4] = *b"D2AI";
 const AUTH_IDENTITY_SCHEMA_VERSION: u16 = 1;
 const HEALTH_IDENTITY_MAGIC: [u8; 4] = *b"D2HI";
 const HEALTH_IDENTITY_SCHEMA_VERSION: u16 = 1;
+const IMPORT_IDENTITY_MAGIC: [u8; 4] = *b"D2II";
+const IMPORT_IDENTITY_SCHEMA_VERSION: u16 = 1;
+const MAX_SESSION_IMPORT_PATH_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -95,6 +98,7 @@ pub enum RequestKind {
     Collection = 11,
     Crawl = 12,
     LiveEvents = 13,
+    ImportSession = 14,
 }
 
 impl RequestKind {
@@ -113,6 +117,7 @@ impl RequestKind {
             11 => Ok(Self::Collection),
             12 => Ok(Self::Crawl),
             13 => Ok(Self::LiveEvents),
+            14 => Ok(Self::ImportSession),
             _ => Err(ProtocolError::InvalidRequest),
         }
     }
@@ -296,6 +301,31 @@ impl WorkerRequest {
             profile_class: Some(ProfileClass::Authenticated),
             session_update: None,
             session_probe: Some(probe),
+            collection: None,
+            crawl: None,
+            live: None,
+        }
+    }
+
+    /// Import a prepared session into an authenticated profile. `path` is a
+    /// **local filesystem path** the station reads itself — the cookie bytes
+    /// never travel on the wire.
+    pub fn import_session(
+        request_id: u64,
+        profile_id: impl Into<String>,
+        persona: BrowserPersona,
+        path: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: RequestKind::ImportSession,
+            request_id,
+            profile_id: profile_id.into(),
+            url: path.into(),
+            task: None,
+            persona: Some(persona),
+            profile_class: Some(ProfileClass::Authenticated),
+            session_update: None,
+            session_probe: None,
             collection: None,
             crawl: None,
             live: None,
@@ -521,6 +551,18 @@ impl WorkerRequest {
         } else {
             None
         };
+        let import_payload = if self.kind == RequestKind::ImportSession {
+            Some(encode_import_identity_payload(
+                self.profile_class
+                    .ok_or(ProtocolError::InvalidRequest)?,
+                self.persona
+                    .as_ref()
+                    .ok_or(ProtocolError::InvalidRequest)?,
+                &self.url,
+            )?)
+        } else {
+            None
+        };
         let probe_payload = if self.kind == RequestKind::CheckAuthSession {
             Some(encode_health_identity_payload(
                 self.profile_class
@@ -569,6 +611,7 @@ impl WorkerRequest {
             .as_deref()
             .or(session_payload.as_deref())
             .or(auth_payload.as_deref())
+            .or(import_payload.as_deref())
             .or(probe_payload.as_deref())
             .or(collection_payload.as_deref())
             .or(crawl_payload.as_deref())
@@ -713,6 +756,25 @@ impl WorkerRequest {
                     .ok_or(ProtocolError::InvalidRequest)?
                     .validate()?;
                 self.session_probe
+                    .as_ref()
+                    .ok_or(ProtocolError::InvalidRequest)?
+                    .validate()?;
+                if self.profile_class == Some(ProfileClass::Authenticated) {
+                    Ok(())
+                } else {
+                    Err(ProtocolError::InvalidRequest)
+                }
+            }
+            RequestKind::ImportSession => {
+                validate_profile_id(&self.profile_id)?;
+                if self.task.is_some()
+                    || self.session_update.is_some()
+                    || self.session_probe.is_some()
+                {
+                    return Err(ProtocolError::InvalidRequest);
+                }
+                validate_session_import_path(&self.url)?;
+                self.persona
                     .as_ref()
                     .ok_or(ProtocolError::InvalidRequest)?
                     .validate()?;
@@ -1344,6 +1406,74 @@ fn decode_auth_identity_payload(
     Ok((profile_class, persona, url))
 }
 
+fn validate_session_import_path(path: &str) -> Result<(), ProtocolError> {
+    if path.is_empty()
+        || path.len() > MAX_SESSION_IMPORT_PATH_BYTES
+        || path.contains('\0')
+    {
+        return Err(ProtocolError::InvalidRequest);
+    }
+    Ok(())
+}
+
+/// Like `encode_auth_identity_payload`, but the trailing string is a local
+/// filesystem path (the prepared-session file), not an HTTP URL.
+fn encode_import_identity_payload(
+    profile_class: ProfileClass,
+    persona: &BrowserPersona,
+    path: &str,
+) -> Result<Vec<u8>, ProtocolError> {
+    if profile_class != ProfileClass::Authenticated {
+        return Err(ProtocolError::InvalidIdentityPayload);
+    }
+    validate_session_import_path(path)?;
+    let persona = persona.encode()?;
+    let persona_len = u16::try_from(persona.len())
+        .map_err(|_| ProtocolError::InvalidIdentityPayload)?;
+    let mut payload = Vec::with_capacity(10 + persona.len() + path.len());
+    payload.extend_from_slice(&IMPORT_IDENTITY_MAGIC);
+    payload.extend_from_slice(&IMPORT_IDENTITY_SCHEMA_VERSION.to_le_bytes());
+    payload.extend_from_slice(&persona_len.to_le_bytes());
+    payload.push(profile_class as u8);
+    payload.push(0);
+    payload.extend_from_slice(&persona);
+    payload.extend_from_slice(path.as_bytes());
+    Ok(payload)
+}
+
+fn decode_import_identity_payload(
+    payload: &[u8],
+) -> Result<(ProfileClass, BrowserPersona, String), ProtocolError> {
+    if payload.len() < 10
+        || payload[..4] != IMPORT_IDENTITY_MAGIC
+        || u16::from_le_bytes(payload[4..6].try_into().unwrap())
+            != IMPORT_IDENTITY_SCHEMA_VERSION
+        || payload[9] != 0
+    {
+        return Err(ProtocolError::InvalidIdentityPayload);
+    }
+    let persona_len = usize::from(u16::from_le_bytes(payload[6..8].try_into().unwrap()));
+    let profile_class = ProfileClass::from_wire(payload[8])?;
+    if profile_class != ProfileClass::Authenticated {
+        return Err(ProtocolError::InvalidIdentityPayload);
+    }
+    let persona_end = 10usize
+        .checked_add(persona_len)
+        .ok_or(ProtocolError::InvalidIdentityPayload)?;
+    if persona_end >= payload.len() {
+        return Err(ProtocolError::InvalidIdentityPayload);
+    }
+    let (persona, consumed) = BrowserPersona::decode(&payload[10..persona_end])?;
+    if consumed != persona_len {
+        return Err(ProtocolError::InvalidIdentityPayload);
+    }
+    let path = std::str::from_utf8(&payload[persona_end..])
+        .map_err(|_| ProtocolError::InvalidIdentityPayload)?
+        .to_owned();
+    validate_session_import_path(&path)?;
+    Ok((profile_class, persona, path))
+}
+
 fn encode_health_identity_payload(
     profile_class: ProfileClass,
     persona: &BrowserPersona,
@@ -1498,6 +1628,9 @@ where
     } else if kind == RequestKind::BeginAuthSession {
         let (profile_class, persona, url) = decode_auth_identity_payload(body)?;
         (url, None, Some(persona), Some(profile_class), None)
+    } else if kind == RequestKind::ImportSession {
+        let (profile_class, persona, path) = decode_import_identity_payload(body)?;
+        (path, None, Some(persona), Some(profile_class), None)
     } else if kind == RequestKind::CheckAuthSession {
         let (profile_class, persona, session_probe) =
             decode_health_identity_payload(body)?;
@@ -1942,6 +2075,28 @@ mod tests {
                 .expect("auth health request"),
             check
         );
+    }
+
+    #[tokio::test]
+    async fn import_session_request_round_trips_carrying_a_path_not_cookies() {
+        let import = WorkerRequest::import_session(
+            84,
+            "operator-profile",
+            BrowserPersona::desktop_default(),
+            "C:/tmp/prepared-session.json",
+        );
+        let bytes = import.encode().expect("encode import session");
+        // The wire carries a path, never cookie material.
+        assert!(!bytes.windows(6).any(|window| window == b"Cookie"));
+        let mut reader = &bytes[..];
+        let decoded = read_worker_request(&mut reader)
+            .await
+            .expect("decode import session")
+            .expect("import session request");
+        assert_eq!(decoded, import);
+        assert_eq!(decoded.kind, RequestKind::ImportSession);
+        assert_eq!(decoded.url, "C:/tmp/prepared-session.json");
+        assert_eq!(decoded.profile_class, Some(ProfileClass::Authenticated));
     }
 
     #[test]
