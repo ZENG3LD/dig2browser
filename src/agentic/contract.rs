@@ -238,6 +238,12 @@ pub enum AgentCommand {
     /// station-authored evaluation — inspect-only, never a consumer script.
     /// Backs the `WaitForLoadState` task step.
     ObserveDocument,
+    /// Enumerate the page's interactive elements via a fixed, station-authored
+    /// DOM read — inspect-only, never a consumer script. Returns raw JSON
+    /// (`[{role, name, selector}, …]`) as an `AgentReply::ScriptValue`; the
+    /// station types it into `InteractiveElement` records. Backs the
+    /// `ReadInteractiveElements` task step.
+    ReadInteractiveElements,
     Evaluate {
         script: String,
     },
@@ -265,7 +271,8 @@ impl AgentCommand {
             Self::KeyPress { .. } => Capability::L1(L1Capability::Keyboard),
             Self::ResolveElement { .. }
             | Self::ReadElementText { .. }
-            | Self::ObserveDocument => Capability::L2(L2Capability::Inspect),
+            | Self::ObserveDocument
+            | Self::ReadInteractiveElements => Capability::L2(L2Capability::Inspect),
             Self::ClickElement { .. } | Self::TypeElement { .. } => {
                 Capability::L2(L2Capability::Interact)
             }

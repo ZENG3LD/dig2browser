@@ -362,6 +362,7 @@ pub enum BrowserTaskStep {
     Capture { policy: CapturePolicy },
     WaitForSelector { selector: String, timeout: Duration },
     WaitForLoadState { state: LoadState, timeout: Duration },
+    ReadInteractiveElements,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -558,7 +559,8 @@ fn task_runtime_requirements(
                 add(RuntimeFeature::DomInspect)
             }
             BrowserTaskStep::WaitForSelector { .. }
-            | BrowserTaskStep::WaitForLoadState { .. } => {
+            | BrowserTaskStep::WaitForLoadState { .. }
+            | BrowserTaskStep::ReadInteractiveElements => {
                 add(RuntimeFeature::DomInspect)
             }
             BrowserTaskStep::Evaluate { .. } => add(RuntimeFeature::ScriptEvaluate),
@@ -2323,6 +2325,12 @@ impl BrowserLease {
             BrowserTaskStep::WaitForLoadState { state, timeout } => {
                 self.wait_for_load_state(*state, *timeout, None).await
             }
+            BrowserTaskStep::ReadInteractiveElements => self
+                .slot
+                .worker
+                .execute(AgentCommand::ReadInteractiveElements)
+                .await
+                .map_err(StationError::from),
         }
     }
 
@@ -2440,7 +2448,8 @@ impl BrowserLease {
                     &[Capability::L2(L2Capability::Inspect)]
                 }
                 BrowserTaskStep::WaitForSelector { .. }
-                | BrowserTaskStep::WaitForLoadState { .. } => {
+                | BrowserTaskStep::WaitForLoadState { .. }
+                | BrowserTaskStep::ReadInteractiveElements => {
                     &[Capability::L2(L2Capability::Inspect)]
                 }
                 BrowserTaskStep::Evaluate { .. } => {

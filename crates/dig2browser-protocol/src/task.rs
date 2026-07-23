@@ -25,6 +25,12 @@ const MAX_RUNTIME_FEATURES: usize = 16;
 const MAX_RUNTIME_LIMITATIONS: usize = 8;
 const MAX_RUNTIME_VERSION_BYTES: usize = 128;
 pub const MAX_SELECTOR_BYTES: usize = 4_096;
+/// Upper bound on elements returned by one `ReadInteractiveElements` step.
+pub const MAX_INTERACTIVE_ELEMENTS: usize = 256;
+/// Upper bound on an interactive element's `role` label.
+pub const MAX_ELEMENT_ROLE_BYTES: usize = 64;
+/// Upper bound on an interactive element's accessible `name`.
+pub const MAX_ELEMENT_NAME_BYTES: usize = 1_024;
 const MAX_KEY_BYTES: usize = 64;
 const MAX_TEXT_BYTES: usize = 64 * 1024;
 const MAX_SCRIPT_BYTES: usize = 64 * 1024;
@@ -82,6 +88,17 @@ pub enum TaskStep {
     /// counts against the same cumulative wait budget as `Wait`
     /// (`MAX_TASK_WAIT`).
     WaitForLoadState { state: LoadState, timeout: Duration },
+    /// Enumerate the page's interactive elements (`a`, `button`, `input`,
+    /// `select`, `textarea`, `[role]`) as typed `{role, name, selector}`
+    /// records, so an agent can pick a target without shipping a consumer
+    /// script.
+    ///
+    /// Inspect-only: it runs a fixed, station-authored `readyState`-style DOM
+    /// read (never a caller-supplied script), so it needs only `L2::Inspect`
+    /// and is ungated — the same footing as `WaitForSelector`. The selector it
+    /// returns is directly usable by a later `ClickSelector`/`ReadSelectorText`
+    /// step.
+    ReadInteractiveElements,
 }
 
 /// A document load milestone (`document.readyState`), ordered
@@ -290,6 +307,7 @@ impl CollectionTask {
                         return Err(ProtocolError::InvalidTaskPayload);
                     }
                 }
+                TaskStep::ReadInteractiveElements => {}
             }
         }
         Ok(())
@@ -371,6 +389,9 @@ impl CollectionTask {
                         .map_err(|_| ProtocolError::InvalidTaskPayload)?;
                     output.extend_from_slice(&millis.to_le_bytes());
                 }
+                TaskStep::ReadInteractiveElements => {
+                    output.push(12);
+                }
             }
         }
         if output.len() > MAX_REQUEST_BYTES {
@@ -436,6 +457,7 @@ impl CollectionTask {
                     state: LoadState::from_wire(input.u8()?)?,
                     timeout: Duration::from_millis(input.u64()?),
                 },
+                12 => TaskStep::ReadInteractiveElements,
                 _ => return Err(ProtocolError::InvalidTaskPayload),
             };
             steps.push(step);
@@ -615,12 +637,72 @@ pub struct EvidenceCapture {
     pub protocol_version: u16,
 }
 
+/// One interactive element discovered by `ReadInteractiveElements`.
+///
+/// `role` is the ARIA `role` attribute when present, else the lowercase tag
+/// name; `name` is a best-effort accessible label (may be empty); `selector`
+/// is a station-authored CSS path that resolves this element for a later
+/// `ClickSelector`/`TypeSelector`/`ReadSelectorText` step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InteractiveElement {
+    role: String,
+    name: String,
+    selector: String,
+}
+
+impl InteractiveElement {
+    pub fn new(
+        role: String,
+        name: String,
+        selector: String,
+    ) -> Result<Self, ProtocolError> {
+        let element = Self {
+            role,
+            name,
+            selector,
+        };
+        element.validate()?;
+        Ok(element)
+    }
+
+    pub fn role(&self) -> &str {
+        &self.role
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn selector(&self) -> &str {
+        &self.selector
+    }
+
+    fn validate(&self) -> Result<(), ProtocolError> {
+        if self.role.is_empty()
+            || self.role.len() > MAX_ELEMENT_ROLE_BYTES
+            || self.role.contains('\0')
+            || self.role.chars().any(char::is_control)
+            || self.name.len() > MAX_ELEMENT_NAME_BYTES
+            || self.name.contains('\0')
+            || self.selector.is_empty()
+            || self.selector.len() > MAX_SELECTOR_BYTES
+            || self.selector.contains('\0')
+        {
+            return Err(ProtocolError::InvalidTaskResult);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskReply {
     Acknowledged,
     Text(String),
     ScriptJson(String),
     Capture(Box<EvidenceCapture>),
+    /// Result of a `ReadInteractiveElements` step: the page's interactive
+    /// elements as typed records (bounded to `MAX_INTERACTIVE_ELEMENTS`).
+    Elements(Vec<InteractiveElement>),
 }
 
 /// The exact runtime identity and feature support granted for a task.
@@ -769,6 +851,15 @@ impl CollectionTaskResult {
                     output.push(4);
                     encode_capture(&mut output, capture)?;
                 }
+                TaskReply::Elements(elements) => {
+                    output.push(5);
+                    output.extend_from_slice(&(elements.len() as u16).to_le_bytes());
+                    for element in elements {
+                        put_result_u16_bytes(&mut output, element.role.as_bytes())?;
+                        put_result_u16_bytes(&mut output, element.name.as_bytes())?;
+                        put_result_u16_bytes(&mut output, element.selector.as_bytes())?;
+                    }
+                }
             }
             if output.len() > MAX_TASK_RESULT_BYTES {
                 return Err(ProtocolError::ResponseTooLarge);
@@ -804,6 +895,23 @@ impl CollectionTaskResult {
                 2 => TaskReply::Text(input.utf8_u32_result()?),
                 3 => TaskReply::ScriptJson(input.utf8_u32_result()?),
                 4 => TaskReply::Capture(Box::new(decode_capture(&mut input)?)),
+                5 => {
+                    let count = usize::from(input.u16()?);
+                    if count > MAX_INTERACTIVE_ELEMENTS {
+                        return Err(ProtocolError::InvalidTaskResult);
+                    }
+                    let mut elements = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let role = input.utf8_u16_result()?;
+                        let name = input.utf8_u16_result()?;
+                        let selector = input.utf8_u16_result()?;
+                        elements.push(
+                            InteractiveElement::new(role, name, selector)
+                                .map_err(|_| ProtocolError::InvalidTaskResult)?,
+                        );
+                    }
+                    TaskReply::Elements(elements)
+                }
                 _ => return Err(ProtocolError::InvalidTaskResult),
             });
         }
@@ -831,6 +939,14 @@ impl CollectionTaskResult {
                     validate_result_text(value, MAX_SCRIPT_RESULT_BYTES)?;
                 }
                 TaskReply::Capture(capture) => validate_capture(capture)?,
+                TaskReply::Elements(elements) => {
+                    if elements.len() > MAX_INTERACTIVE_ELEMENTS {
+                        return Err(ProtocolError::InvalidTaskResult);
+                    }
+                    for element in elements {
+                        element.validate()?;
+                    }
+                }
             }
         }
         Ok(())
@@ -1350,6 +1466,67 @@ mod tests {
                 timeout: MAX_TASK_WAIT + Duration::from_millis(1),
             },
         ])
+        .is_err());
+    }
+
+    #[test]
+    fn read_interactive_elements_step_round_trips_and_is_not_interaction_or_script() {
+        let task = CollectionTask::new(vec![
+            navigate_step(),
+            TaskStep::ReadInteractiveElements,
+            TaskStep::ClickSelector {
+                selector: "#submit".to_owned(),
+            },
+        ])
+        .expect("valid task");
+
+        let encoded = task.encode_payload().expect("encode task");
+        let decoded = CollectionTask::decode_payload(&encoded).expect("decode task");
+        assert_eq!(decoded, task);
+        // Inspect-only: enumerating elements is neither interaction nor script.
+        assert!(!task.requires_script());
+    }
+
+    #[test]
+    fn elements_reply_round_trips_and_rejects_malformed() {
+        let elements = vec![
+            InteractiveElement::new(
+                "button".to_owned(),
+                "Sign in".to_owned(),
+                "#submit".to_owned(),
+            )
+            .expect("valid element"),
+            InteractiveElement::new(
+                "link".to_owned(),
+                String::new(),
+                "nav > a:nth-of-type(2)".to_owned(),
+            )
+            .expect("empty name allowed"),
+        ];
+        let result = CollectionTaskResult::new(vec![
+            TaskReply::Acknowledged,
+            TaskReply::Elements(elements),
+        ])
+        .expect("valid result");
+
+        let encoded = result.encode().expect("encode result");
+        assert_eq!(
+            CollectionTaskResult::decode(&encoded).expect("decode result"),
+            result
+        );
+
+        // An empty role and an over-length selector are both rejected.
+        assert!(InteractiveElement::new(
+            String::new(),
+            "x".to_owned(),
+            "#a".to_owned()
+        )
+        .is_err());
+        assert!(InteractiveElement::new(
+            "button".to_owned(),
+            "x".to_owned(),
+            "a".repeat(MAX_SELECTOR_BYTES + 1),
+        )
         .is_err());
     }
 

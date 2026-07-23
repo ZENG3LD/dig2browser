@@ -14,7 +14,8 @@ use dig2browser_client::{
     ArtifactMediaType, ArtifactRef, ArtifactRole, BrowserPersona, ClientConfig,
     ClientError, CollectionId, CollectionTask, ControlTransport, CrawlCursor,
     CrawlEvent, CrawlEventKind, CrawlJobId, CrawlPhase, CrawlSpec, EngineFamily, FailureClass,
-    IdentitySessionStatus, InterruptedReason, LiveCursor, LiveEventKind, LiveFilter,
+    IdentitySessionStatus, InteractiveElement, InterruptedReason, LiveCursor, LiveEventKind,
+    LiveFilter,
     LiveTarget, LoadState, MobilePersonaConfig, MonitorCursor, MonitorEvent, MonitorEventKind,
     MonitorFrame, MonitorStopReason, PersonaPreset,
     ProfileClass, ResponseStatus, RouteRef, RuntimeFeature, RuntimeKind,
@@ -252,6 +253,7 @@ ws.onmessage=(event)=>{{document.title='ws-recv';}};\
             "session-ready" => "<section data-session-ready></section>",
             "session-reauth" => "<form data-session-reauth></form>",
             "persona-probe" => "<pre id=\"persona-probe-output\"></pre>",
+            "interactive-elements" => "<button id=\"go\">Sign in</button><a href=\"/next\" id=\"next-link\">Next page</a><input id=\"q\" name=\"query\" placeholder=\"Search\">",
             _ => "",
         }
     );
@@ -1668,6 +1670,116 @@ async fn stationd_wait_for_load_state_settles_a_task_e2e() {
     assert!(status.success(), "wait-load station failed: {status}");
     let (_, stderr) = read_child_output(&mut daemon).await;
     assert!(stderr.is_empty(), "clean wait-load station wrote stderr: {stderr}");
+    remove_tree(&profiles).await;
+}
+
+// A.3 acceptance: the inspect-only ReadInteractiveElements step enumerates the
+// page's interactive elements as typed {role, name, selector} records — no
+// consumer script, no interaction/scripted gate — and the selector the engine
+// derives is directly consumable by a later inspect-only step. Runs a task that
+// navigates and enumerates, asserts the known button/link/input are present with
+// the right roles/names/#id selectors, then feeds the discovered button selector
+// back through ReadSelectorText and asserts it resolves to that element's text —
+// proving the engine-authored selector actually resolves, all over the wire and
+// fully ungated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stationd_read_interactive_elements_enumerates_and_selector_resolves_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-stationd-perceive-e2e-{unique}");
+    let profiles = e2e_temp_base().join(format!(
+        "dig2browser-stationd-perceive-e2e-{unique}"
+    ));
+    std::fs::create_dir_all(&profiles).expect("create perceive profiles root");
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+    let mut daemon = spawn_stationd(stationd, &pipe_name, &profiles);
+
+    let client = StationClient::connect(
+        ClientConfig::new(&pipe_name, Duration::from_secs(15), Duration::from_secs(90))
+            .expect("valid perceive client config"),
+    )
+    .await
+    .expect("connect perceive station client");
+
+    let url = fixture.url("/interactive-elements");
+    // A cold browser launch can occasionally fail the first navigation
+    // (surfaced as an Unavailable task), so retry a few times as a real
+    // client would.
+    let enumerate = CollectionTask::new(vec![
+        TaskStep::Navigate { url: url.clone() },
+        TaskStep::ReadInteractiveElements,
+    ])
+    .expect("valid enumerate task");
+    let mut result = None;
+    for attempt in 0..8 {
+        match client.run_task("perceive-profile", enumerate.clone()).await {
+            Ok(value) => {
+                result = Some(value);
+                break;
+            }
+            Err(ClientError::Remote {
+                status: ResponseStatus::Unavailable,
+                ..
+            }) if attempt < 7 => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            other => panic!("enumerate task failed: {other:?}"),
+        }
+    }
+    let result = result.expect("enumerate task after retries");
+    assert_eq!(result.replies().len(), 2);
+    assert_eq!(result.replies()[0], TaskReply::Acknowledged);
+    let TaskReply::Elements(elements) = &result.replies()[1] else {
+        panic!("expected Elements reply, got {:?}", result.replies()[1]);
+    };
+
+    let find = |selector: &str| -> &InteractiveElement {
+        elements
+            .iter()
+            .find(|element| element.selector() == selector)
+            .unwrap_or_else(|| panic!("no element with selector {selector} in {elements:?}"))
+    };
+    let button = find("#go");
+    assert_eq!(button.role(), "button");
+    assert_eq!(button.name(), "Sign in");
+    let link = find("#next-link");
+    assert_eq!(link.role(), "a");
+    assert_eq!(link.name(), "Next page");
+    let input = find("#q");
+    assert_eq!(input.role(), "input");
+    // Input has no text/value; the accessible name falls back to the placeholder.
+    assert_eq!(input.name(), "Search");
+
+    // The engine-derived selector must be directly usable by another inspect-only
+    // step: read the button's text through the discovered selector and confirm it
+    // matches the name the enumeration reported.
+    let discovered = button.selector().to_owned();
+    let resolve = CollectionTask::new(vec![
+        TaskStep::Navigate { url },
+        TaskStep::ReadSelectorText {
+            selector: discovered,
+        },
+    ])
+    .expect("valid resolve task");
+    let resolved = client
+        .run_task("perceive-profile", resolve)
+        .await
+        .expect("run resolve task");
+    assert_eq!(
+        resolved.replies()[1],
+        TaskReply::Text("Sign in".to_owned()),
+        "discovered selector did not resolve to the reported element"
+    );
+
+    client.shutdown().await.expect("request perceive station drain");
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("perceive station exit timeout")
+        .expect("wait for perceive station");
+    assert!(status.success(), "perceive station failed: {status}");
+    let (_, stderr) = read_child_output(&mut daemon).await;
+    assert!(stderr.is_empty(), "clean perceive station wrote stderr: {stderr}");
     remove_tree(&profiles).await;
 }
 

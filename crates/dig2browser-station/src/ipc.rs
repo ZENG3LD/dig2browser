@@ -12,10 +12,10 @@ use dig2browser::agentic::{
 use dig2browser_protocol::{
     read_worker_request, validate_pipe_suffix, write_worker_response,
     CaptureCompleteness, CollectionRequest, CollectionResponse, CollectionTask,
-    CollectionTaskResult, CrawlRequest, EvidenceCapture, FailureClass, MonitorRequest,
-    MonitorResponse, ProfileClass, RequestKind, ResolvedRuntimeRecord, ResponseStatus,
-    StationStatus, TaskCapturePolicy, TaskReply, TaskStep, WorkerRequest, WorkerResponse,
-    PROTOCOL_VERSION,
+    CollectionTaskResult, CrawlRequest, EvidenceCapture, FailureClass, InteractiveElement,
+    MonitorRequest, MonitorResponse, ProfileClass, RequestKind, ResolvedRuntimeRecord,
+    ResponseStatus, StationStatus, TaskCapturePolicy, TaskReply, TaskStep, WorkerRequest,
+    WorkerResponse, MAX_INTERACTIVE_ELEMENTS, PROTOCOL_VERSION,
 };
 use dig2browser_trace::LedgerError;
 use tokio::sync::{mpsc, watch};
@@ -1772,6 +1772,9 @@ fn to_station_task(task: &CollectionTask) -> Result<BrowserTask, crate::TaskErro
                         timeout: *timeout,
                     }
                 }
+                TaskStep::ReadInteractiveElements => {
+                    BrowserTaskStep::ReadInteractiveElements
+                }
             })
             .collect(),
     )
@@ -1805,7 +1808,9 @@ fn task_capabilities(task: &CollectionTask) -> CapabilitySet {
             TaskStep::ReadSelectorText { .. } => {
                 add(Capability::L2(L2Capability::Inspect));
             }
-            TaskStep::WaitForSelector { .. } | TaskStep::WaitForLoadState { .. } => {
+            TaskStep::WaitForSelector { .. }
+            | TaskStep::WaitForLoadState { .. }
+            | TaskStep::ReadInteractiveElements => {
                 add(Capability::L2(L2Capability::Inspect));
             }
             TaskStep::Evaluate { .. } => add(Capability::L2(L2Capability::Evaluate)),
@@ -1839,7 +1844,17 @@ fn to_protocol_result(
         let reply = match reply {
             AgentReply::Acknowledged => TaskReply::Acknowledged,
             AgentReply::Text(text) => TaskReply::Text(text),
-            AgentReply::ScriptValue(value) => TaskReply::ScriptJson(value.to_string()),
+            AgentReply::ScriptValue(value) => {
+                // `ReadInteractiveElements` runs a fixed station-authored DOM
+                // read; the root crate returns the raw JSON array (it cannot
+                // depend on `-protocol`), so the typing into `InteractiveElement`
+                // records happens here at the station boundary.
+                if matches!(step, TaskStep::ReadInteractiveElements) {
+                    TaskReply::Elements(parse_interactive_elements(&value)?)
+                } else {
+                    TaskReply::ScriptJson(value.to_string())
+                }
+            }
             AgentReply::Capture(artifact) => {
                 let TaskStep::Capture { policy } = step else {
                     return Err(dig2browser_protocol::ProtocolError::InvalidTaskResult);
@@ -1862,6 +1877,47 @@ fn to_protocol_result(
         Some(runtime) => CollectionTaskResult::new_with_runtime(replies, runtime),
         None => CollectionTaskResult::new(replies),
     }
+}
+
+/// Type the fixed enumeration script's raw JSON (`[{role, name, selector}, …]`)
+/// into bounded `InteractiveElement` records. Fail-closed: any non-array,
+/// non-object entry, missing required field, over-count, or field that fails
+/// the protocol bounds is rejected as `InvalidTaskResult`. `name` may be absent
+/// or empty (an unlabeled control); `role` and `selector` are required.
+fn parse_interactive_elements(
+    value: &serde_json::Value,
+) -> Result<Vec<InteractiveElement>, dig2browser_protocol::ProtocolError> {
+    let array = value
+        .as_array()
+        .ok_or(dig2browser_protocol::ProtocolError::InvalidTaskResult)?;
+    if array.len() > MAX_INTERACTIVE_ELEMENTS {
+        return Err(dig2browser_protocol::ProtocolError::InvalidTaskResult);
+    }
+    let mut elements = Vec::with_capacity(array.len());
+    for entry in array {
+        let object = entry
+            .as_object()
+            .ok_or(dig2browser_protocol::ProtocolError::InvalidTaskResult)?;
+        let required = |key: &str| {
+            object
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .ok_or(dig2browser_protocol::ProtocolError::InvalidTaskResult)
+        };
+        let role = required("role")?;
+        let name = object
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let selector = required("selector")?;
+        elements.push(
+            InteractiveElement::new(role, name, selector)
+                .map_err(|_| dig2browser_protocol::ProtocolError::InvalidTaskResult)?,
+        );
+    }
+    Ok(elements)
 }
 
 fn evidence_capture(

@@ -78,6 +78,16 @@ pub trait BrowserRuntime: Send + 'static {
     fn observe_document(&mut self) -> BoxFuture<'_, RuntimeResult<DocumentState>> {
         Box::pin(async { Err(RuntimeError::new(RuntimeFailureKind::Protocol)) })
     }
+
+    /// Enumerate the page's interactive elements via a fixed internal DOM read
+    /// (no consumer script), returning raw JSON `[{role, name, selector}, …]`.
+    /// Default reports the surface as unsupported; only [`RealBrowserRuntime`]
+    /// overrides it. Backs the inspect-only `ReadInteractiveElements` task step.
+    fn read_interactive_elements(
+        &mut self,
+    ) -> BoxFuture<'_, RuntimeResult<serde_json::Value>> {
+        Box::pin(async { Err(RuntimeError::new(RuntimeFailureKind::Protocol)) })
+    }
 }
 
 /// Production runtime owning exactly one browser and one page for an identity.
@@ -307,6 +317,23 @@ impl RealBrowserRuntime {
             ready_state: value["readyState"].as_str().unwrap_or_default().to_owned(),
             http_status: self.document_http_status,
         })
+    }
+
+    async fn interactive_elements(&self) -> RuntimeResult<serde_json::Value> {
+        let value = self
+            .page()?
+            .eval(INTERACTIVE_ELEMENTS_SCRIPT)
+            .await
+            .map_err(|_| RuntimeError::new(RuntimeFailureKind::Capture))?;
+        let encoded = value
+            .as_str()
+            .ok_or_else(|| RuntimeError::new(RuntimeFailureKind::Protocol))?;
+        let parsed: serde_json::Value = serde_json::from_str(encoded)
+            .map_err(|_| RuntimeError::new(RuntimeFailureKind::Protocol))?;
+        if !parsed.is_array() {
+            return Err(RuntimeError::new(RuntimeFailureKind::Protocol));
+        }
+        Ok(parsed)
     }
 
     fn clear_devtools_events(&mut self) {
@@ -568,7 +595,75 @@ impl BrowserRuntime for RealBrowserRuntime {
     fn observe_document(&mut self) -> BoxFuture<'_, RuntimeResult<DocumentState>> {
         Box::pin(async move { self.document_state().await })
     }
+
+    fn read_interactive_elements(
+        &mut self,
+    ) -> BoxFuture<'_, RuntimeResult<serde_json::Value>> {
+        Box::pin(async move { self.interactive_elements().await })
+    }
 }
+
+/// Fixed, station-authored DOM read backing `ReadInteractiveElements`. It
+/// enumerates interactive elements and, for each, derives an ARIA/tag `role`,
+/// a best-effort accessible `name`, and a stable CSS `selector` (an `#id` when
+/// uniquely resolvable, else an `nth-of-type` path anchored at the nearest
+/// uniquely-id'd ancestor). Bounded to `MAX_INTERACTIVE_ELEMENTS` (256) and
+/// returns a `JSON.stringify`'d array, mirroring `document_state`'s marshalling.
+/// This is not a consumer script — its text is compiled in, never caller-supplied.
+const INTERACTIVE_ELEMENTS_SCRIPT: &str = r#"JSON.stringify((function(){
+  var MAX=256, NAME_MAX=512;
+  function uniqueId(el){
+    if(!el.id) return null;
+    try{ if(document.querySelectorAll('#'+CSS.escape(el.id)).length===1) return '#'+CSS.escape(el.id); }catch(e){}
+    return null;
+  }
+  function cssPath(el){
+    var uid=uniqueId(el); if(uid) return uid;
+    var parts=[], node=el;
+    while(node && node.nodeType===1 && node!==document.documentElement){
+      var uidn=uniqueId(node);
+      if(uidn){ parts.unshift(uidn); break; }
+      var sel=node.tagName.toLowerCase();
+      var parent=node.parentNode;
+      if(parent && parent.children){
+        var sibs=[];
+        for(var i=0;i<parent.children.length;i++){ if(parent.children[i].tagName===node.tagName) sibs.push(parent.children[i]); }
+        if(sibs.length>1) sel+=':nth-of-type('+(sibs.indexOf(node)+1)+')';
+      }
+      parts.unshift(sel);
+      node=node.parentNode;
+    }
+    return parts.join(' > ');
+  }
+  function role(el){
+    var r=el.getAttribute&&el.getAttribute('role');
+    if(r&&r.trim()) return r.trim().toLowerCase();
+    return el.tagName.toLowerCase();
+  }
+  function name(el){
+    var a=el.getAttribute&&el.getAttribute('aria-label');
+    if(a&&a.trim()) return a.trim();
+    var t=(el.innerText||el.textContent||'').replace(/\s+/g,' ').trim();
+    if(t) return t;
+    if('value' in el && el.value) return String(el.value);
+    var ph=el.getAttribute&&el.getAttribute('placeholder'); if(ph&&ph.trim()) return ph.trim();
+    var nm=el.getAttribute&&el.getAttribute('name'); if(nm&&nm.trim()) return nm.trim();
+    var ti=el.getAttribute&&el.getAttribute('title'); if(ti&&ti.trim()) return ti.trim();
+    return '';
+  }
+  var nodes=document.querySelectorAll('a,button,input,select,textarea,[role]');
+  var seen=[], out=[];
+  for(var i=0;i<nodes.length && out.length<MAX;i++){
+    var el=nodes[i];
+    if(seen.indexOf(el)!==-1) continue;
+    seen.push(el);
+    var sel=cssPath(el);
+    if(!sel) continue;
+    var nm=name(el); if(nm.length>NAME_MAX) nm=nm.slice(0,NAME_MAX);
+    out.push({role:role(el), name:nm, selector:sel});
+  }
+  return out;
+})())"#;
 
 #[cfg(feature = "containment-test-hooks")]
 fn report_containment_start_failure(stage: &str, error: &dyn std::fmt::Display) {
