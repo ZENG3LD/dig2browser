@@ -9,6 +9,7 @@ mod identity;
 mod live;
 mod monitor;
 mod session;
+pub mod shape;
 mod task;
 mod trace;
 
@@ -2019,6 +2020,7 @@ pub enum ProtocolError {
     InvalidCrawlPayload,
     InvalidLivePayload,
     InvalidMonitorPayload,
+    InvalidShapePayload,
 }
 
 impl std::fmt::Display for ProtocolError {
@@ -2042,6 +2044,9 @@ impl std::fmt::Display for ProtocolError {
             Self::InvalidLivePayload => write!(formatter, "live event payload is invalid"),
             Self::InvalidMonitorPayload => {
                 write!(formatter, "monitor event payload is invalid")
+            }
+            Self::InvalidShapePayload => {
+                write!(formatter, "output-shaping payload is invalid")
             }
         }
     }
