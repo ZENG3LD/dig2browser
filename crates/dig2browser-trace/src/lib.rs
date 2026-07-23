@@ -352,6 +352,70 @@ impl TraceLedger {
         )?)
     }
 
+    /// Commit `bytes` into the content-addressed store WITHOUT any collection /
+    /// step / role bookkeeping. For durable data keyed by its own journal (e.g.
+    /// a monitor's captured frames) rather than the finite-task trace: the same
+    /// dedup + durable-rename + reopen-and-re-validate guarantees as
+    /// `commit_artifact`, but with no `StartedTrace`, no step index, and no
+    /// `MAX_COLLECTION_EVENTS` ceiling. Ownership and ordering are the caller's
+    /// journal's responsibility; the ledger only guarantees the bytes are stored
+    /// content-addressed and byte-exact.
+    pub fn commit_orphan_artifact(
+        &self,
+        media_type: ArtifactMediaType,
+        bytes: &[u8],
+    ) -> Result<ArtifactRef, LedgerError> {
+        if bytes.is_empty() {
+            return Err(LedgerError::InvalidTransition("empty artifacts are not valid"));
+        }
+        if bytes.len() > MAX_ARTIFACT_BYTES {
+            return Err(LedgerError::ArtifactTooLarge);
+        }
+        let digest: [u8; 32] = Sha256::digest(bytes).into();
+        let artifact = ArtifactRef::new(digest, bytes.len() as u64, media_type)?;
+        let artifact_path = self.artifact_path(&digest);
+        if artifact_path.exists() {
+            validate_artifact_file(&artifact_path, &artifact)?;
+        } else {
+            let temp_path = unique_temp_path(
+                &self.artifacts_dir(),
+                &format!(".{}", hex(&digest)),
+            )?;
+            let write_result: Result<(), LedgerError> = (|| {
+                write_new_file(&temp_path, bytes)?;
+                if artifact_path.exists() {
+                    validate_artifact_file(&artifact_path, &artifact)?;
+                    fs::remove_file(&temp_path)?;
+                } else {
+                    durable_rename(&temp_path, &artifact_path)?;
+                }
+                Ok(())
+            })();
+            if write_result.is_err() {
+                let _ = fs::remove_file(&temp_path);
+            }
+            write_result?;
+        }
+        validate_artifact_file(&artifact_path, &artifact)?;
+        Ok(artifact)
+    }
+
+    /// Read a content-addressed artifact by its reference alone (no owning
+    /// collection), re-validating length + digest on open. The companion read
+    /// for [`commit_orphan_artifact`]. Returns the full byte-exact contents;
+    /// callers keep artifacts bounded (monitor frames are small).
+    pub fn read_orphan_artifact(
+        &self,
+        reference: &ArtifactRef,
+    ) -> Result<Vec<u8>, LedgerError> {
+        let path = self.artifact_path(reference.sha256());
+        let mut file = open_validated_artifact(&path, reference)?;
+        let capacity = usize::try_from(reference.len()).unwrap_or(0);
+        let mut bytes = Vec::with_capacity(capacity);
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+
     fn append_kind(
         &self,
         collection_id: CollectionId,
@@ -917,6 +981,52 @@ mod tests {
     fn terminal() -> TerminalTrace {
         TerminalTrace::new(TerminalOutcome::Succeeded, Vec::new())
             .expect("terminal trace")
+    }
+
+    #[test]
+    fn orphan_artifact_round_trips_content_addressed_and_deduped() {
+        let root = TestRoot::new("orphan");
+        let ledger = TraceLedger::open_at(&root.0, 1).expect("ledger");
+        // Media type is irrelevant to the CAS primitive; the monitor journal
+        // that consumes this picks a frame media type when it lands.
+        let payload = b"durable monitor frame payload".to_vec();
+
+        let first = ledger
+            .commit_orphan_artifact(ArtifactMediaType::TextHtmlUtf8, &payload)
+            .expect("commit orphan artifact");
+        assert_eq!(first.len(), payload.len() as u64);
+
+        // Content-addressed: an identical payload dedups to the same reference.
+        let again = ledger
+            .commit_orphan_artifact(ArtifactMediaType::TextHtmlUtf8, &payload)
+            .expect("recommit identical orphan artifact");
+        assert_eq!(first.sha256(), again.sha256());
+
+        // Byte-exact validated read — no owning collection required.
+        let read = ledger.read_orphan_artifact(&first).expect("read orphan artifact");
+        assert_eq!(read, payload);
+
+        // Empty is rejected without any collection/step bookkeeping.
+        assert!(matches!(
+            ledger.commit_orphan_artifact(ArtifactMediaType::TextHtmlUtf8, b""),
+            Err(LedgerError::InvalidTransition(_))
+        ));
+    }
+
+    #[test]
+    fn orphan_artifact_read_rejects_a_tampered_blob() {
+        let root = TestRoot::new("orphan-tamper");
+        let ledger = TraceLedger::open_at(&root.0, 1).expect("ledger");
+        let reference = ledger
+            .commit_orphan_artifact(ArtifactMediaType::TextHtmlUtf8, b"authentic")
+            .expect("commit orphan artifact");
+        // Same length, different bytes → the reopen-and-re-hash catches it.
+        fs::write(ledger.artifact_path(reference.sha256()), b"tampered!")
+            .expect("overwrite committed blob");
+        assert!(matches!(
+            ledger.read_orphan_artifact(&reference),
+            Err(LedgerError::Corrupt(_))
+        ));
     }
 
     #[test]
