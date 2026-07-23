@@ -198,6 +198,7 @@ pub struct ServerConfig {
     allow_live_events: bool,
     allow_session_import: bool,
     allow_file_upload: bool,
+    allow_downloads: bool,
 }
 
 impl ServerConfig {
@@ -238,6 +239,7 @@ impl ServerConfig {
             allow_live_events: false,
             allow_session_import: false,
             allow_file_upload: false,
+            allow_downloads: false,
         })
     }
 
@@ -253,6 +255,15 @@ impl ServerConfig {
 
     pub fn allow_file_upload(mut self, allow: bool) -> Self {
         self.allow_file_upload = allow;
+        self
+    }
+
+    /// Allow a `WaitForDownload` task step to capture a page-triggered
+    /// download and hand its bytes back. Default-deny; independent of
+    /// `--allow-interactive-tasks` / `--allow-scripted-tasks` /
+    /// `--allow-file-upload`.
+    pub fn allow_downloads(mut self, allow: bool) -> Self {
+        self.allow_downloads = allow;
         self
     }
 
@@ -532,6 +543,7 @@ async fn run_windows_server(
                         live_events: config.allow_live_events,
                         session_import: config.allow_session_import,
                         file_upload: config.allow_file_upload,
+                        download: config.allow_downloads,
                     },
                 };
                 connections.spawn(async move {
@@ -787,6 +799,7 @@ struct TaskPermissions {
     live_events: bool,
     session_import: bool,
     file_upload: bool,
+    download: bool,
 }
 
 async fn crawl_request(
@@ -1115,6 +1128,13 @@ async fn collection_request(
                     request,
                     ResponseStatus::Invalid,
                     "file upload disabled",
+                );
+            }
+            if task.requires_download() && !permissions.download {
+                return WorkerResponse::failure(
+                    request,
+                    ResponseStatus::Invalid,
+                    "downloads disabled",
                 );
             }
             let station_task = match to_station_task(task) {
@@ -1602,6 +1622,15 @@ async fn run_task(
             started,
         );
     }
+    if task.requires_download() && !permissions.download {
+        observation.failure(FailureClass::Protocol);
+        return failure(
+            request,
+            ResponseStatus::Invalid,
+            "downloads disabled",
+            started,
+        );
+    }
     let station_task = match to_station_task(task) {
         Ok(task) => task,
         Err(_) => {
@@ -1812,6 +1841,9 @@ fn to_station_task(task: &CollectionTask) -> Result<BrowserTask, crate::TaskErro
                         path: path.clone(),
                     }
                 }
+                TaskStep::WaitForDownload { timeout } => {
+                    BrowserTaskStep::WaitForDownload { timeout: *timeout }
+                }
             })
             .collect(),
     )
@@ -1854,7 +1886,9 @@ fn task_capabilities(task: &CollectionTask) -> CapabilitySet {
                 add(Capability::L2(L2Capability::Inspect));
             }
             TaskStep::Evaluate { .. } => add(Capability::L2(L2Capability::Evaluate)),
-            TaskStep::Capture { .. } => add(Capability::L3(L3Capability::Capture)),
+            TaskStep::Capture { .. } | TaskStep::WaitForDownload { .. } => {
+                add(Capability::L3(L3Capability::Capture))
+            }
         }
     }
     CapabilitySet::new(capabilities).expect("bounded task capabilities are unique")
@@ -1907,6 +1941,13 @@ fn to_protocol_result(
                     metrics.duration_ms,
                 )))
             }
+            AgentReply::Download {
+                suggested_filename,
+                bytes,
+            } => TaskReply::Download {
+                suggested_filename,
+                bytes,
+            },
             AgentReply::Element(_) => {
                 return Err(dig2browser_protocol::ProtocolError::InvalidTaskResult)
             }

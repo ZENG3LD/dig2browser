@@ -33,6 +33,11 @@ pub const MAX_ELEMENT_ROLE_BYTES: usize = 64;
 pub const MAX_ELEMENT_NAME_BYTES: usize = 1_024;
 /// Upper bound on a local file path carried by an `UploadFile` step.
 pub const MAX_UPLOAD_PATH_BYTES: usize = 4_096;
+/// Upper bound on the raw bytes carried by a `WaitForDownload` step's
+/// `TaskReply::Download`.
+pub const MAX_DOWNLOAD_BYTES: usize = 32 * 1024 * 1024;
+/// Upper bound on a `TaskReply::Download`'s suggested filename.
+pub const MAX_DOWNLOAD_FILENAME_BYTES: usize = 1_024;
 const MAX_KEY_BYTES: usize = 64;
 const MAX_TEXT_BYTES: usize = 64 * 1024;
 const MAX_SCRIPT_BYTES: usize = 64 * 1024;
@@ -124,6 +129,17 @@ pub enum TaskStep {
     /// arbitrary local file, it sits behind its own default-deny gate
     /// (`--allow-file-upload`), independent of `--allow-interactive-tasks`.
     UploadFile { selector: String, path: String },
+    /// Block until a page-triggered download completes (CDP
+    /// `Browser.downloadWillBegin`/`Browser.downloadProgress`), or `timeout`
+    /// elapses, and return its suggested filename and raw bytes as a
+    /// `TaskReply::Download`.
+    ///
+    /// Sensitive: it hands back arbitrary page-chosen file bytes, so it sits
+    /// behind its own default-deny gate (`--allow-downloads`), independent of
+    /// `--allow-interactive-tasks` / `--allow-scripted-tasks` /
+    /// `--allow-file-upload`. `timeout` counts against the same cumulative
+    /// wait budget as `Wait`/`WaitForSelector` (`MAX_TASK_WAIT`).
+    WaitForDownload { timeout: Duration },
 }
 
 /// A document load milestone (`document.readyState`), ordered
@@ -265,6 +281,16 @@ impl CollectionTask {
             .any(|step| matches!(step, TaskStep::UploadFile { .. }))
     }
 
+    /// Whether any step captures a download (`WaitForDownload`). Gated
+    /// separately from interaction, script, and file upload by
+    /// `--allow-downloads`, because it hands back arbitrary page-chosen file
+    /// bytes.
+    pub fn requires_download(&self) -> bool {
+        self.steps
+            .iter()
+            .any(|step| matches!(step, TaskStep::WaitForDownload { .. }))
+    }
+
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.steps.is_empty() || self.steps.len() > MAX_TASK_STEPS {
             return Err(ProtocolError::InvalidTaskPayload);
@@ -350,6 +376,17 @@ impl CollectionTask {
                 TaskStep::UploadFile { selector, path } => {
                     validate_selector(selector)?;
                     validate_text(path, MAX_UPLOAD_PATH_BYTES, false)?;
+                }
+                TaskStep::WaitForDownload { timeout } => {
+                    if timeout.is_zero() {
+                        return Err(ProtocolError::InvalidTaskPayload);
+                    }
+                    total_wait = total_wait
+                        .checked_add(*timeout)
+                        .ok_or(ProtocolError::InvalidTaskPayload)?;
+                    if total_wait > MAX_TASK_WAIT {
+                        return Err(ProtocolError::InvalidTaskPayload);
+                    }
                 }
             }
         }
@@ -445,6 +482,12 @@ impl CollectionTask {
                     put_u16_bytes(&mut output, selector.as_bytes())?;
                     put_u16_bytes(&mut output, path.as_bytes())?;
                 }
+                TaskStep::WaitForDownload { timeout } => {
+                    output.push(15);
+                    let millis = u64::try_from(timeout.as_millis())
+                        .map_err(|_| ProtocolError::InvalidTaskPayload)?;
+                    output.extend_from_slice(&millis.to_le_bytes());
+                }
             }
         }
         if output.len() > MAX_REQUEST_BYTES {
@@ -518,6 +561,9 @@ impl CollectionTask {
                 14 => TaskStep::UploadFile {
                     selector: input.utf8_u16()?,
                     path: input.utf8_u16()?,
+                },
+                15 => TaskStep::WaitForDownload {
+                    timeout: Duration::from_millis(input.u64()?),
                 },
                 _ => return Err(ProtocolError::InvalidTaskPayload),
             };
@@ -764,6 +810,13 @@ pub enum TaskReply {
     /// Result of a `ReadInteractiveElements` step: the page's interactive
     /// elements as typed records (bounded to `MAX_INTERACTIVE_ELEMENTS`).
     Elements(Vec<InteractiveElement>),
+    /// Result of a `WaitForDownload` step: the captured download's suggested
+    /// filename (bounded to `MAX_DOWNLOAD_FILENAME_BYTES`) and raw bytes
+    /// (bounded to `MAX_DOWNLOAD_BYTES`).
+    Download {
+        suggested_filename: String,
+        bytes: Vec<u8>,
+    },
 }
 
 /// The exact runtime identity and feature support granted for a task.
@@ -921,6 +974,14 @@ impl CollectionTaskResult {
                         put_result_u16_bytes(&mut output, element.selector.as_bytes())?;
                     }
                 }
+                TaskReply::Download {
+                    suggested_filename,
+                    bytes,
+                } => {
+                    output.push(6);
+                    put_result_u16_bytes(&mut output, suggested_filename.as_bytes())?;
+                    put_u64_bytes(&mut output, bytes)?;
+                }
             }
             if output.len() > MAX_TASK_RESULT_BYTES {
                 return Err(ProtocolError::ResponseTooLarge);
@@ -973,6 +1034,10 @@ impl CollectionTaskResult {
                     }
                     TaskReply::Elements(elements)
                 }
+                6 => TaskReply::Download {
+                    suggested_filename: input.utf8_u16_result()?,
+                    bytes: input.bytes_u64()?.to_vec(),
+                },
                 _ => return Err(ProtocolError::InvalidTaskResult),
             });
         }
@@ -1006,6 +1071,15 @@ impl CollectionTaskResult {
                     }
                     for element in elements {
                         element.validate()?;
+                    }
+                }
+                TaskReply::Download {
+                    suggested_filename,
+                    bytes,
+                } => {
+                    validate_result_text(suggested_filename, MAX_DOWNLOAD_FILENAME_BYTES)?;
+                    if bytes.len() > MAX_DOWNLOAD_BYTES {
+                        return Err(ProtocolError::InvalidTaskResult);
                     }
                 }
             }
@@ -1647,6 +1721,75 @@ mod tests {
                 path: String::new(),
             },
         ])
+        .is_err());
+    }
+
+    #[test]
+    fn wait_for_download_round_trips_and_is_gated_separately() {
+        let task = CollectionTask::new(vec![
+            navigate_step(),
+            TaskStep::WaitForDownload {
+                timeout: Duration::from_secs(5),
+            },
+        ])
+        .expect("valid task");
+
+        let encoded = task.encode_payload().expect("encode task");
+        let decoded = CollectionTask::decode_payload(&encoded).expect("decode task");
+        assert_eq!(decoded, task);
+        // Download capture has its own gate — not folded into interaction,
+        // script, or file upload.
+        assert!(task.requires_download());
+        assert!(!task.requires_interaction());
+        assert!(!task.requires_script());
+        assert!(!task.requires_file_upload());
+
+        // A zero timeout is rejected, and the cumulative wait budget is enforced.
+        assert!(CollectionTask::new(vec![
+            navigate_step(),
+            TaskStep::WaitForDownload {
+                timeout: Duration::ZERO,
+            },
+        ])
+        .is_err());
+        assert!(CollectionTask::new(vec![
+            navigate_step(),
+            TaskStep::WaitForDownload {
+                timeout: MAX_TASK_WAIT + Duration::from_millis(1),
+            },
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn download_reply_round_trips_and_rejects_malformed() {
+        let result = CollectionTaskResult::new(vec![
+            TaskReply::Acknowledged,
+            TaskReply::Download {
+                suggested_filename: "report.pdf".to_owned(),
+                bytes: vec![1, 2, 3, 4],
+            },
+        ])
+        .expect("valid result");
+
+        let encoded = result.encode().expect("encode result");
+        assert_eq!(
+            CollectionTaskResult::decode(&encoded).expect("decode result"),
+            result
+        );
+
+        // An over-length filename is rejected.
+        assert!(CollectionTaskResult::new(vec![TaskReply::Download {
+            suggested_filename: "a".repeat(MAX_DOWNLOAD_FILENAME_BYTES + 1),
+            bytes: Vec::new(),
+        }])
+        .is_err());
+
+        // Over-cap bytes are rejected.
+        assert!(CollectionTaskResult::new(vec![TaskReply::Download {
+            suggested_filename: "x".to_owned(),
+            bytes: vec![0u8; MAX_DOWNLOAD_BYTES + 1],
+        }])
         .is_err());
     }
 

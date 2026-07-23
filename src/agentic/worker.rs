@@ -722,6 +722,13 @@ async fn handle_command(
                 .await
                 .map(|_| AgentReply::Acknowledged)
         }
+        AgentCommand::WaitForDownload { timeout } => runtime
+            .wait_for_download(timeout)
+            .await
+            .map(|(suggested_filename, bytes)| AgentReply::Download {
+                suggested_filename,
+                bytes,
+            }),
         AgentCommand::ReadElementText { element } => {
             validate_element_epoch(&element, snapshot.page_epoch)?;
             runtime

@@ -1,5 +1,6 @@
 //! Hand-written typed helpers for the CDP domains used by dig2browser.
 
+pub mod browser;
 pub mod dom;
 pub mod emulation;
 pub mod fetch;

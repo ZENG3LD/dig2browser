@@ -240,6 +240,12 @@ struct Cli {
         help = "Allow an UploadFile task step to set a file <input> from a local path (the browser reads the file; bytes never cross the pipe)"
     )]
     allow_file_upload: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Allow a WaitForDownload task step to capture a page-triggered download and return its bytes"
+    )]
+    allow_downloads: bool,
 }
 
 #[cfg(windows)]
@@ -528,7 +534,8 @@ async fn run(cli: Cli) -> Result<DaemonReport, DaemonError> {
         .allow_authenticated_crawl(cli.allow_authenticated_crawl)
         .allow_live_events(cli.allow_live_events)
         .allow_session_import(cli.allow_session_import)
-        .allow_file_upload(cli.allow_file_upload);
+        .allow_file_upload(cli.allow_file_upload)
+        .allow_downloads(cli.allow_downloads);
         if let Some(trace_root) = cli.trace_root {
             server_config = server_config.trace_root(trace_root)?;
         }

@@ -556,6 +556,8 @@ impl CdpBrowserBackend {
         // Never let a page dialog block the (already running) renderer.
         let dialog_task = spawn_dialog_auto_handler(&session);
 
+        let download = setup_download_capture(&session, target_id).await?;
+
         self.page_count.fetch_add(1, Ordering::Relaxed);
 
         Ok(CdpPageBackend::new(
@@ -565,6 +567,7 @@ impl CdpBrowserBackend {
             Arc::clone(&self.browser_closing),
             None,
             dialog_task,
+            download,
         ))
     }
 
@@ -974,6 +977,10 @@ impl CdpBrowserBackend {
         // navigation) is handled rather than stalling the task.
         let dialog_task = spawn_dialog_auto_handler(&session);
 
+        // Capture downloads from now on — before navigate, so a download
+        // triggered immediately after load is not missed.
+        let download = setup_download_capture(&session, &target_id).await?;
+
         // ── CDP-native stealth overrides ──────────────────────────────────────
         // These run at the protocol level and are more reliable than JS patching:
         // they survive property-descriptor inspection and also affect HTTP headers.
@@ -1052,6 +1059,7 @@ impl CdpBrowserBackend {
             Arc::clone(&self.browser_closing),
             self._process_tree.as_ref().map(Arc::clone),
             dialog_task,
+            download,
         ))
     }
 }
@@ -1529,6 +1537,50 @@ impl BrowserBackend for CdpBrowserBackend {
 
 // ── Page backend ───────────────────────────────────────────────────────────
 
+/// Upper bound on the bytes `wait_for_download` will read back for one
+/// captured download; a larger file on disk is reported as an error rather
+/// than loaded into memory.
+const MAX_DOWNLOAD_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Lifecycle of one download tracked by `Browser.downloadProgress`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadState {
+    InProgress,
+    Completed,
+    Canceled,
+}
+
+/// One download tracked between `Browser.downloadWillBegin` and
+/// `Browser.downloadProgress`, keyed by its `guid` in `DownloadRegistryInner::records`.
+#[derive(Debug, Clone)]
+struct DownloadRecord {
+    suggested_filename: String,
+    state: DownloadState,
+    /// Monotonic arrival order, so `wait_for_download` can prefer the
+    /// most-recently-begun completed download when more than one is tracked.
+    seq: u64,
+}
+
+#[derive(Default)]
+struct DownloadRegistryInner {
+    next_seq: u64,
+    records: HashMap<String, DownloadRecord>,
+}
+
+/// Shared, per-session download registry populated by
+/// `spawn_download_capture_handler` and polled by `wait_for_download`.
+type DownloadRegistry = Arc<Mutex<DownloadRegistryInner>>;
+
+/// Everything a `CdpPageBackend` needs to serve `wait_for_download`, bundled
+/// as one constructor argument: the shared registry the background handler
+/// keeps up to date, the per-page directory Chrome saves download bytes into
+/// (`allowAndName`, named by `guid`), and the handler task itself.
+struct DownloadCapture {
+    registry: DownloadRegistry,
+    dir: std::path::PathBuf,
+    task: JoinHandle<()>,
+}
+
 /// CDP-backed page handle.
 pub(crate) struct CdpPageBackend {
     session: CdpSession,
@@ -1543,6 +1595,9 @@ pub(crate) struct CdpPageBackend {
     /// unanswered `alert`/`confirm`/`prompt`/`beforeunload` can never block the
     /// renderer. Aborted on drop.
     dialog_task: JoinHandle<()>,
+    /// Registry + directory + handler task backing `wait_for_download`.
+    /// Handler aborted and directory removed (best-effort) on drop.
+    download: DownloadCapture,
 }
 
 impl CdpPageBackend {
@@ -1553,6 +1608,7 @@ impl CdpPageBackend {
         browser_closing: Arc<AtomicBool>,
         owned_process_tree: Option<Arc<OwnedProcessTree>>,
         dialog_task: JoinHandle<()>,
+        download: DownloadCapture,
     ) -> Self {
         Self {
             session,
@@ -1563,6 +1619,7 @@ impl CdpPageBackend {
             browser_closing,
             owned_process_tree,
             dialog_task,
+            download,
         }
     }
 }
@@ -2572,6 +2629,45 @@ impl PageBackend for CdpPageBackend {
         })
     }
 
+    // ── Downloads ────────────────────────────────────────────────────────
+
+    fn wait_for_download<'a>(
+        &'a self,
+        timeout: std::time::Duration,
+    ) -> BoxFuture<'a, Result<(String, Vec<u8>), BrowserError>> {
+        Box::pin(async move {
+            const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                let completed = {
+                    let mut registry = self.download.registry.lock().await;
+                    let guid = registry
+                        .records
+                        .iter()
+                        .filter(|(_, record)| record.state == DownloadState::Completed)
+                        .max_by_key(|(_, record)| record.seq)
+                        .map(|(guid, _)| guid.clone());
+                    guid.and_then(|guid| registry.records.remove(&guid).map(|record| (guid, record)))
+                };
+                if let Some((guid, record)) = completed {
+                    let path = self.download.dir.join(&guid);
+                    let size = tokio::fs::metadata(&path).await?.len();
+                    if size > MAX_DOWNLOAD_BYTES {
+                        return Err(BrowserError::Other(format!(
+                            "download exceeds the {MAX_DOWNLOAD_BYTES}-byte cap"
+                        )));
+                    }
+                    let bytes = tokio::fs::read(&path).await?;
+                    return Ok((record.suggested_filename, bytes));
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(BrowserError::Timeout(timeout));
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+        })
+    }
+
     // ── DevTools events ───────────────────────────────────────────────────
 
     fn subscribe_events<'a>(
@@ -2742,6 +2838,10 @@ impl Drop for CdpPageBackend {
         let _target_id = &self.target_id;
         // Stop the dialog auto-handler; its session is going away.
         self.dialog_task.abort();
+        // Stop the download-event handler and best-effort remove the
+        // per-page download directory it was writing into.
+        self.download.task.abort();
+        let _ = std::fs::remove_dir_all(&self.download.dir);
         // Could send Target.closeTarget here, but it requires an async context.
         // The browser will GC detached targets automatically.
     }
@@ -2782,6 +2882,91 @@ fn spawn_dialog_auto_handler(session: &CdpSession) -> JoinHandle<()> {
                             Some(serde_json::json!({ "accept": accept })),
                         )
                         .await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            }
+        }
+    })
+}
+
+/// Enable download capture on `session` (`Browser.setDownloadBehavior`,
+/// `allowAndName` — Chrome saves each download under a unique per-page
+/// directory, named by its GUID, so no two downloads collide on a filename)
+/// and spawn the background handler that keeps a shared registry of
+/// in-flight/completed downloads up to date. Backs
+/// `PageBackend::wait_for_download`.
+async fn setup_download_capture(
+    session: &CdpSession,
+    target_id: &str,
+) -> Result<DownloadCapture, BrowserError> {
+    let dir = std::env::temp_dir().join(format!("dig2browser-downloads-{target_id}"));
+    tokio::fs::create_dir_all(&dir).await?;
+    session
+        .set_download_behavior("allowAndName", &dir.to_string_lossy(), true)
+        .await
+        .map_err(|e| BrowserError::Connect(e.to_string()))?;
+    let registry: DownloadRegistry = Arc::new(Mutex::new(DownloadRegistryInner::default()));
+    let task = spawn_download_capture_handler(session, Arc::clone(&registry));
+    Ok(DownloadCapture { registry, dir, task })
+}
+
+/// Spawn a per-session handler that keeps `registry` in sync with this
+/// session's `Browser.downloadWillBegin` (records the download's suggested
+/// filename) and `Browser.downloadProgress` (records
+/// `inProgress`/`completed`/`canceled`) events. Scoped to this session by
+/// `session_id`, so it never tracks another page's downloads — the same
+/// scoping `spawn_dialog_auto_handler` uses.
+fn spawn_download_capture_handler(
+    session: &CdpSession,
+    registry: DownloadRegistry,
+) -> JoinHandle<()> {
+    let my_session_id = session.session_id().map(str::to_owned);
+    let mut events = session.client().subscribe();
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(event) => {
+                    if event.session_id.as_deref() != my_session_id.as_deref() {
+                        continue;
+                    }
+                    let Some(params) = &event.params else {
+                        continue;
+                    };
+                    let Some(guid) = params["guid"].as_str() else {
+                        continue;
+                    };
+                    match event.method.as_str() {
+                        "Browser.downloadWillBegin" => {
+                            let suggested_filename = params["suggestedFilename"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_owned();
+                            let mut registry = registry.lock().await;
+                            registry.next_seq += 1;
+                            let seq = registry.next_seq;
+                            registry.records.insert(
+                                guid.to_owned(),
+                                DownloadRecord {
+                                    suggested_filename,
+                                    state: DownloadState::InProgress,
+                                    seq,
+                                },
+                            );
+                        }
+                        "Browser.downloadProgress" => {
+                            let state = match params["state"].as_str() {
+                                Some("completed") => DownloadState::Completed,
+                                Some("canceled") => DownloadState::Canceled,
+                                _ => DownloadState::InProgress,
+                            };
+                            let mut registry = registry.lock().await;
+                            if let Some(record) = registry.records.get_mut(guid) {
+                                record.state = state;
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,

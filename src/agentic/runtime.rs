@@ -114,6 +114,19 @@ pub trait BrowserRuntime: Send + 'static {
         let _ = (selector, path);
         Box::pin(async { Err(RuntimeError::new(RuntimeFailureKind::Protocol)) })
     }
+
+    /// Block until a download triggered by the current page completes, or
+    /// `timeout` elapses, and return its suggested filename and raw bytes.
+    /// Default reports the surface as unsupported; only
+    /// [`RealBrowserRuntime`] overrides it. Backs the gated `WaitForDownload`
+    /// step.
+    fn wait_for_download(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> BoxFuture<'_, RuntimeResult<(String, Vec<u8>)>> {
+        let _ = timeout;
+        Box::pin(async { Err(RuntimeError::new(RuntimeFailureKind::Protocol)) })
+    }
 }
 
 /// Production runtime owning exactly one browser and one page for an identity.
@@ -685,6 +698,18 @@ impl BrowserRuntime for RealBrowserRuntime {
                 .set_input_files(selector, &paths)
                 .await
                 .map_err(|_| RuntimeError::new(RuntimeFailureKind::Interaction))
+        })
+    }
+
+    fn wait_for_download(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> BoxFuture<'_, RuntimeResult<(String, Vec<u8>)>> {
+        Box::pin(async move {
+            self.page()?
+                .wait_for_download(timeout)
+                .await
+                .map_err(|_| RuntimeError::new(RuntimeFailureKind::Capture))
         })
     }
 }

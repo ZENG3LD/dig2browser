@@ -123,6 +123,15 @@ impl StealthPage {
         self.backend.set_element_files(&element.handle, paths).await
     }
 
+    /// Block until a download triggered by this page completes, or `timeout`
+    /// elapses, and return its suggested filename and raw bytes.
+    pub async fn wait_for_download(
+        &self,
+        timeout: Duration,
+    ) -> Result<(String, Vec<u8>), BrowserError> {
+        self.backend.wait_for_download(timeout).await
+    }
+
     /// Set extra HTTP headers that will be sent with every request from this page.
     ///
     /// On the CDP backend (Chrome/Edge) this calls `Network.setExtraHTTPHeaders`.

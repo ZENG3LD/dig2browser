@@ -129,6 +129,22 @@ pub trait PageBackend: Send + Sync {
         })
     }
 
+    /// Block until a download triggered by this page completes (CDP
+    /// `Browser.downloadWillBegin`/`Browser.downloadProgress`), or `timeout`
+    /// elapses, and return its suggested filename and raw bytes. Default:
+    /// unsupported; only the CDP backend implements it.
+    fn wait_for_download<'a>(
+        &'a self,
+        timeout: std::time::Duration,
+    ) -> BoxFuture<'a, Result<(String, Vec<u8>), BrowserError>> {
+        let _ = timeout;
+        Box::pin(async {
+            Err(BrowserError::Other(
+                "download capture is not supported by this backend".to_owned(),
+            ))
+        })
+    }
+
     // ── PDF ───────────────────────────────────────────────────────────────
 
     /// Print the page as a PDF and return the raw bytes.

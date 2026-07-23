@@ -365,6 +365,7 @@ pub enum BrowserTaskStep {
     ReadInteractiveElements,
     SelectOption { selector: String, value: String },
     UploadFile { selector: String, path: String },
+    WaitForDownload { timeout: Duration },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -411,6 +412,17 @@ impl BrowserTask {
                     }
                 }
                 BrowserTaskStep::WaitForLoadState { timeout, .. } => {
+                    if timeout.is_zero() || *timeout > MAX_TASK_WAIT {
+                        return Err(TaskError::InvalidWait);
+                    }
+                    total_wait = total_wait
+                        .checked_add(*timeout)
+                        .ok_or(TaskError::InvalidWait)?;
+                    if total_wait > MAX_TASK_WAIT {
+                        return Err(TaskError::InvalidWait);
+                    }
+                }
+                BrowserTaskStep::WaitForDownload { timeout } => {
                     if timeout.is_zero() || *timeout > MAX_TASK_WAIT {
                         return Err(TaskError::InvalidWait);
                     }
@@ -569,6 +581,7 @@ fn task_runtime_requirements(
             | BrowserTaskStep::ReadInteractiveElements => {
                 add(RuntimeFeature::DomInspect)
             }
+            BrowserTaskStep::WaitForDownload { .. } => add(RuntimeFeature::CaptureState),
             BrowserTaskStep::Evaluate { .. } => add(RuntimeFeature::ScriptEvaluate),
             BrowserTaskStep::Capture { policy } => {
                 add(RuntimeFeature::CaptureState);
@@ -2359,6 +2372,12 @@ impl BrowserLease {
                     .await
                     .map_err(StationError::from)
             }
+            BrowserTaskStep::WaitForDownload { timeout } => self
+                .slot
+                .worker
+                .execute(AgentCommand::WaitForDownload { timeout: *timeout })
+                .await
+                .map_err(StationError::from),
         }
     }
 
@@ -2485,7 +2504,7 @@ impl BrowserLease {
                 BrowserTaskStep::Evaluate { .. } => {
                     &[Capability::L2(L2Capability::Evaluate)]
                 }
-                BrowserTaskStep::Capture { .. } => {
+                BrowserTaskStep::Capture { .. } | BrowserTaskStep::WaitForDownload { .. } => {
                     &[Capability::L3(L3Capability::Capture)]
                 }
             };

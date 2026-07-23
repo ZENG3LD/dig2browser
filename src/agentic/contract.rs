@@ -246,6 +246,13 @@ pub enum AgentCommand {
         element: ElementRef,
         path: String,
     },
+    /// Block until a download triggered by this page completes, or `timeout`
+    /// elapses, and return its suggested filename and raw bytes (CDP
+    /// `Browser.downloadWillBegin`/`downloadProgress`). Backs the gated
+    /// `WaitForDownload` task step.
+    WaitForDownload {
+        timeout: std::time::Duration,
+    },
     ReadElementText {
         element: ElementRef,
     },
@@ -294,7 +301,9 @@ impl AgentCommand {
             | Self::UploadFile { .. } => Capability::L2(L2Capability::Interact),
             Self::Evaluate { .. } => Capability::L2(L2Capability::Evaluate),
             Self::Navigate { .. } => Capability::L3(L3Capability::Navigate),
-            Self::Capture { .. } => Capability::L3(L3Capability::Capture),
+            Self::Capture { .. } | Self::WaitForDownload { .. } => {
+                Capability::L3(L3Capability::Capture)
+            }
             Self::SetCookies { .. } => Capability::L2(L2Capability::Interact),
             Self::Restart | Self::Shutdown => Capability::L3(L3Capability::Lifecycle),
         }
@@ -308,6 +317,12 @@ pub enum AgentReply {
     Text(String),
     ScriptValue(serde_json::Value),
     Capture(CaptureArtifact),
+    /// Result of `WaitForDownload`: the captured download's suggested
+    /// filename and raw bytes.
+    Download {
+        suggested_filename: String,
+        bytes: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
