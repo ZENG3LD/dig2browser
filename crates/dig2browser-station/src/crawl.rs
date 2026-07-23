@@ -54,6 +54,7 @@ struct CrawlManagerInner {
     jobs: StdMutex<HashMap<CrawlJobId, Arc<CrawlJob>>>,
     accepting: AtomicBool,
     execution_authorized: bool,
+    authenticated_crawl_authorized: bool,
     sequence: AtomicU64,
 }
 
@@ -72,6 +73,7 @@ struct CrawlJob {
 struct CrawlBinding {
     job_id: CrawlJobId,
     profile_id: String,
+    profile_class: ProfileClass,
     persona: BrowserPersona,
     spec: CrawlSpec,
 }
@@ -90,6 +92,7 @@ impl CrawlManager {
         crawl_root: impl Into<PathBuf>,
         trace_root: &Path,
         allow_execution: bool,
+        allow_authenticated: bool,
     ) -> Result<Self, CrawlError> {
         tokio::runtime::Handle::try_current()
             .map_err(|_| CrawlError::RuntimeUnavailable)?;
@@ -148,6 +151,7 @@ impl CrawlManager {
                 jobs: StdMutex::new(jobs),
                 accepting: AtomicBool::new(false),
                 execution_authorized: allow_execution,
+                authenticated_crawl_authorized: allow_authenticated,
                 sequence: AtomicU64::new(1),
             }),
         };
@@ -159,6 +163,11 @@ impl CrawlManager {
             return Ok(());
         }
         for job in self.jobs()? {
+            if job.binding.profile_class != ProfileClass::Public
+                && !self.inner.authenticated_crawl_authorized
+            {
+                continue;
+            }
             if lock(&job.engine)?.status().state != JobState::Running {
                 continue;
             }
@@ -176,6 +185,11 @@ impl CrawlManager {
             return Ok(());
         }
         for job in self.jobs()? {
+            if job.binding.profile_class != ProfileClass::Public
+                && !self.inner.authenticated_crawl_authorized
+            {
+                continue;
+            }
             if lock(&job.engine)?.status().state == JobState::Running {
                 self.spawn_runner(job)?;
             }
@@ -279,7 +293,9 @@ impl CrawlManager {
         if !self.inner.accepting.load(Ordering::Acquire) {
             return Err(CrawlError::AdmissionClosed);
         }
-        if profile_class != ProfileClass::Public {
+        if profile_class != ProfileClass::Public
+            && !self.inner.authenticated_crawl_authorized
+        {
             return Err(CrawlError::AuthenticatedProfileUnsupported);
         }
         validate_profile_id(profile_id)?;
@@ -317,6 +333,7 @@ impl CrawlManager {
             CrawlBinding {
                 job_id,
                 profile_id: profile_id.to_owned(),
+                profile_class,
                 persona,
                 spec,
             },
@@ -675,13 +692,23 @@ async fn execute_page(
         }
     }
     let collection_id = page_collection_id(job.id, requested_url, attempt)?;
+    // Reuse the profile's harvested session for authenticated crawls; the per-
+    // identity session_gate serializes access so there is one writer per session.
+    let identity = if job.binding.profile_class == ProfileClass::Public {
+        IdentityRequest::public_persona(
+            job.binding.profile_id.clone(),
+            job.binding.persona.clone(),
+        )
+    } else {
+        IdentityRequest::authenticated_persona(
+            job.binding.profile_id.clone(),
+            job.binding.persona.clone(),
+        )
+    };
     let collection = BeginCollection {
         collection_id,
         task_sha256,
-        identity: IdentityRequest::public_persona(
-            job.binding.profile_id.clone(),
-            job.binding.persona.clone(),
-        ),
+        identity,
         capabilities: CapabilitySet::monitoring(),
         runtime_selector: RuntimeSelector::Auto,
         runtime_requirements: None,
@@ -1119,12 +1146,10 @@ fn decode_binding(bytes: &[u8]) -> Result<CrawlBinding, CrawlError> {
     else {
         return Err(CrawlError::InvalidBinding);
     };
-    if profile_class != ProfileClass::Public {
-        return Err(CrawlError::AuthenticatedProfileUnsupported);
-    }
     Ok(CrawlBinding {
         job_id,
         profile_id,
+        profile_class,
         persona,
         spec,
     })
@@ -1379,5 +1404,36 @@ mod tests {
         assert_ne!(completed.1, exhausted.1);
         assert!(completed.1.unwrap().len() <= 1_024);
         assert!(exhausted.1.unwrap().len() <= 1_024);
+    }
+
+    fn round_trip_binding_class(class: ProfileClass) -> CrawlBinding {
+        let job = CrawlJobId::new([7; 16]).expect("job id");
+        let spec = CrawlSpec::new(
+            ["https://example.test/a", "https://example.test/b?q=1"],
+            ["https://example.test"],
+            32,
+            4,
+            2,
+        )
+        .expect("crawl spec");
+        let request =
+            CrawlRequest::begin(job, class, BrowserPersona::desktop_default(), spec)
+                .expect("begin request");
+        let encoded = encode_binding("profile-authcrawl", &request).expect("encode binding");
+        decode_binding(&encoded).expect("decode binding")
+    }
+
+    #[test]
+    fn binding_carries_profile_class_through_the_durable_format() {
+        // The persisted binding already encodes profile_class; the authenticated
+        // crawl path relies on decode carrying it (not dropping or rejecting it),
+        // so a job resumes under the right identity class after a restart.
+        let public = round_trip_binding_class(ProfileClass::Public);
+        assert_eq!(public.profile_class, ProfileClass::Public);
+        assert_eq!(public.profile_id, "profile-authcrawl");
+
+        let authenticated = round_trip_binding_class(ProfileClass::Authenticated);
+        assert_eq!(authenticated.profile_class, ProfileClass::Authenticated);
+        assert_eq!(authenticated.profile_id, "profile-authcrawl");
     }
 }

@@ -191,6 +191,7 @@ pub struct ServerConfig {
     allow_durable_write: bool,
     allow_crawl_read: bool,
     allow_crawl_write: bool,
+    allow_authenticated_crawl: bool,
     allow_live_events: bool,
 }
 
@@ -227,6 +228,7 @@ impl ServerConfig {
             allow_durable_write: false,
             allow_crawl_read: false,
             allow_crawl_write: false,
+            allow_authenticated_crawl: false,
             allow_live_events: false,
         })
     }
@@ -301,6 +303,13 @@ impl ServerConfig {
 
     pub fn allow_crawl_write(mut self, allow: bool) -> Self {
         self.allow_crawl_write = allow;
+        self
+    }
+
+    /// Allow a crawl to run under an `Authenticated` profile (session reuse).
+    /// Subordinate to the crawl/durable gates; default-deny.
+    pub fn allow_authenticated_crawl(mut self, allow: bool) -> Self {
+        self.allow_authenticated_crawl = allow;
         self
     }
 
@@ -388,6 +397,7 @@ async fn run_windows_server(
             crawl_root.clone(),
             trace_root,
             crawl_execution_authorized,
+            crawl_execution_authorized && config.allow_authenticated_crawl,
         )?),
         (Some(_), _, _) => return Err(ServerError::CrawlTraceRequired),
         (None, _, _) => None,

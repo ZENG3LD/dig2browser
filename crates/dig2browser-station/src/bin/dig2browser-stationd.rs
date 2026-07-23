@@ -214,6 +214,12 @@ struct Cli {
     #[arg(
         long,
         default_value_t = false,
+        help = "Allow a crawl to run under an Authenticated profile (reuse a harvested session); subordinate to --allow-crawl-*/--allow-durable-*"
+    )]
+    allow_authenticated_crawl: bool,
+    #[arg(
+        long,
+        default_value_t = false,
         help = "Allow the RAW (unsanitized real URLs, WS/SSE frame payloads) live DevTools event subscription"
     )]
     allow_live_events: bool,
@@ -502,6 +508,7 @@ async fn run(cli: Cli) -> Result<DaemonReport, DaemonError> {
         .allow_durable_write(cli.allow_durable_write)
         .allow_crawl_read(cli.allow_crawl_read)
         .allow_crawl_write(cli.allow_crawl_write)
+        .allow_authenticated_crawl(cli.allow_authenticated_crawl)
         .allow_live_events(cli.allow_live_events);
         if let Some(trace_root) = cli.trace_root {
             server_config = server_config.trace_root(trace_root)?;
