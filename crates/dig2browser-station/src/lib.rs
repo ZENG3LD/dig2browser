@@ -357,6 +357,7 @@ pub enum BrowserTaskStep {
     ReadSelectorText { selector: String },
     Evaluate { script: String },
     Capture { policy: CapturePolicy },
+    WaitForSelector { selector: String, timeout: Duration },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -387,6 +388,18 @@ impl BrowserTask {
                 | BrowserTaskStep::ReadSelectorText { selector }
                 | BrowserTaskStep::TypeSelector { selector, .. } => {
                     ElementRef::new(selector, 0).map_err(|_| TaskError::InvalidSelector)?;
+                }
+                BrowserTaskStep::WaitForSelector { selector, timeout } => {
+                    ElementRef::new(selector, 0).map_err(|_| TaskError::InvalidSelector)?;
+                    if timeout.is_zero() || *timeout > MAX_TASK_WAIT {
+                        return Err(TaskError::InvalidWait);
+                    }
+                    total_wait = total_wait
+                        .checked_add(*timeout)
+                        .ok_or(TaskError::InvalidWait)?;
+                    if total_wait > MAX_TASK_WAIT {
+                        return Err(TaskError::InvalidWait);
+                    }
                 }
                 _ => {}
             }
@@ -527,6 +540,9 @@ fn task_runtime_requirements(
                 add(RuntimeFeature::DomInteract);
             }
             BrowserTaskStep::ReadSelectorText { .. } => {
+                add(RuntimeFeature::DomInspect)
+            }
+            BrowserTaskStep::WaitForSelector { .. } => {
                 add(RuntimeFeature::DomInspect)
             }
             BrowserTaskStep::Evaluate { .. } => add(RuntimeFeature::ScriptEvaluate),
@@ -2123,6 +2139,9 @@ impl BrowserLease {
                 tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
             }
         }
+        if let BrowserTaskStep::WaitForSelector { selector, timeout } = step {
+            return self.wait_for_selector(selector, *timeout, cancelled).await;
+        }
         let reply = self.execute_task_step(step).await?;
         if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
             return Err(StationError::TaskCancelled);
@@ -2208,6 +2227,9 @@ impl BrowserLease {
                 .execute(AgentCommand::Capture { policy: *policy })
                 .await
                 .map_err(StationError::from),
+            BrowserTaskStep::WaitForSelector { selector, timeout } => {
+                self.wait_for_selector(selector, *timeout, None).await
+            }
         }
     }
 
@@ -2223,6 +2245,42 @@ impl BrowserLease {
             return Err(StationError::InvalidWorkerReply);
         };
         Ok(element)
+    }
+
+    /// Poll for `selector` until it resolves in the DOM or `timeout` elapses.
+    ///
+    /// Presence-only (a `ResolveElement` success), so it needs just `Inspect`
+    /// and never grants interaction or script capability. Cancellation-aware
+    /// (same 100 ms granularity as `Wait`); returns `WaitTimeout` if the
+    /// element never resolves within the budget.
+    async fn wait_for_selector(
+        &self,
+        selector: &str,
+        timeout: Duration,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<AgentReply, StationError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+                return Err(StationError::TaskCancelled);
+            }
+            if self
+                .slot
+                .worker
+                .execute(AgentCommand::ResolveElement {
+                    selector: selector.to_owned(),
+                })
+                .await
+                .is_ok()
+            {
+                return Ok(AgentReply::Acknowledged);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(StationError::WaitTimeout);
+            }
+            tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
+        }
     }
 
     fn validate_task_capabilities(&self, task: &BrowserTask) -> Result<(), StationError> {
@@ -2244,6 +2302,9 @@ impl BrowserLease {
                     Capability::L2(L2Capability::Interact),
                 ],
                 BrowserTaskStep::ReadSelectorText { .. } => {
+                    &[Capability::L2(L2Capability::Inspect)]
+                }
+                BrowserTaskStep::WaitForSelector { .. } => {
                     &[Capability::L2(L2Capability::Inspect)]
                 }
                 BrowserTaskStep::Evaluate { .. } => {
@@ -2436,6 +2497,8 @@ pub enum StationError {
     InvalidWorkerReply,
     #[error("browser task was cancelled")]
     TaskCancelled,
+    #[error("wait-for-selector timed out before the element resolved")]
+    WaitTimeout,
     #[error("browser task step {index} failed")]
     TaskStepFailed {
         index: usize,

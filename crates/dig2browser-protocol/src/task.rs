@@ -66,6 +66,13 @@ pub enum TaskStep {
     ReadSelectorText { selector: String },
     Evaluate { script: String },
     Capture { policy: TaskCapturePolicy },
+    /// Block until `selector` resolves in the DOM, or `timeout` elapses.
+    ///
+    /// Inspect-only (never interaction or script): it lets an agent wait for a
+    /// dynamic element without a blind `Wait { duration }` and without needing
+    /// the scripted-task gate. `timeout` counts against the same cumulative
+    /// wait budget as `Wait` (`MAX_TASK_WAIT`).
+    WaitForSelector { selector: String, timeout: Duration },
 }
 
 /// Opt-in runtime selection and capability requirements for a task.
@@ -224,6 +231,18 @@ impl CollectionTask {
                         return Err(ProtocolError::InvalidTaskPayload);
                     }
                 }
+                TaskStep::WaitForSelector { selector, timeout } => {
+                    validate_selector(selector)?;
+                    if timeout.is_zero() {
+                        return Err(ProtocolError::InvalidTaskPayload);
+                    }
+                    total_wait = total_wait
+                        .checked_add(*timeout)
+                        .ok_or(ProtocolError::InvalidTaskPayload)?;
+                    if total_wait > MAX_TASK_WAIT {
+                        return Err(ProtocolError::InvalidTaskPayload);
+                    }
+                }
             }
         }
         Ok(())
@@ -291,6 +310,13 @@ impl CollectionTask {
                     output.push(9);
                     output.push(*policy as u8);
                 }
+                TaskStep::WaitForSelector { selector, timeout } => {
+                    output.push(10);
+                    put_u16_bytes(&mut output, selector.as_bytes())?;
+                    let millis = u64::try_from(timeout.as_millis())
+                        .map_err(|_| ProtocolError::InvalidTaskPayload)?;
+                    output.extend_from_slice(&millis.to_le_bytes());
+                }
             }
         }
         if output.len() > MAX_REQUEST_BYTES {
@@ -347,6 +373,10 @@ impl CollectionTask {
                 },
                 9 => TaskStep::Capture {
                     policy: TaskCapturePolicy::from_wire(input.u8()?)?,
+                },
+                10 => TaskStep::WaitForSelector {
+                    selector: input.utf8_u16()?,
+                    timeout: Duration::from_millis(input.u64()?),
                 },
                 _ => return Err(ProtocolError::InvalidTaskPayload),
             };
@@ -1204,6 +1234,57 @@ mod tests {
         let decoded = CollectionTask::decode_payload(&encoded).expect("decode task");
         assert_eq!(decoded, task);
         assert_eq!(decoded.runtime_contract(), None);
+    }
+
+    #[test]
+    fn wait_for_selector_round_trips_and_is_not_interaction_or_script() {
+        let task = CollectionTask::new(vec![
+            navigate_step(),
+            TaskStep::WaitForSelector {
+                selector: "#ready".to_owned(),
+                timeout: Duration::from_secs(5),
+            },
+        ])
+        .expect("valid task");
+
+        let encoded = task.encode_payload().expect("encode task");
+        let decoded = CollectionTask::decode_payload(&encoded).expect("decode task");
+        assert_eq!(decoded, task);
+        // Inspect-only: waiting for an element is neither interaction nor script.
+        assert!(!task.requires_interaction());
+        assert!(!task.requires_script());
+    }
+
+    #[test]
+    fn wait_for_selector_rejects_zero_and_over_budget_timeout() {
+        assert!(CollectionTask::new(vec![
+            navigate_step(),
+            TaskStep::WaitForSelector {
+                selector: "#ready".to_owned(),
+                timeout: Duration::ZERO,
+            },
+        ])
+        .is_err());
+
+        assert!(CollectionTask::new(vec![
+            navigate_step(),
+            TaskStep::WaitForSelector {
+                selector: "#ready".to_owned(),
+                timeout: MAX_TASK_WAIT + Duration::from_millis(1),
+            },
+        ])
+        .is_err());
+
+        // The timeout shares the cumulative wait budget with `Wait`.
+        assert!(CollectionTask::new(vec![
+            navigate_step(),
+            TaskStep::Wait { duration: MAX_TASK_WAIT },
+            TaskStep::WaitForSelector {
+                selector: "#ready".to_owned(),
+                timeout: Duration::from_millis(1),
+            },
+        ])
+        .is_err());
     }
 
     #[test]

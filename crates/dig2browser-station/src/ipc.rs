@@ -1525,6 +1525,12 @@ fn to_station_task(task: &CollectionTask) -> Result<BrowserTask, crate::TaskErro
                 TaskStep::Capture { policy } => BrowserTaskStep::Capture {
                     policy: to_capture_policy(*policy),
                 },
+                TaskStep::WaitForSelector { selector, timeout } => {
+                    BrowserTaskStep::WaitForSelector {
+                        selector: selector.clone(),
+                        timeout: *timeout,
+                    }
+                }
             })
             .collect(),
     )
@@ -1556,6 +1562,9 @@ fn task_capabilities(task: &CollectionTask) -> CapabilitySet {
                 add(Capability::L2(L2Capability::Interact));
             }
             TaskStep::ReadSelectorText { .. } => {
+                add(Capability::L2(L2Capability::Inspect));
+            }
+            TaskStep::WaitForSelector { .. } => {
                 add(Capability::L2(L2Capability::Inspect));
             }
             TaskStep::Evaluate { .. } => add(Capability::L2(L2Capability::Evaluate)),
@@ -1868,6 +1877,7 @@ fn elapsed_ms(started: Instant) -> u64 {
 fn station_error_class(error: &StationError, fallback: FailureClass) -> FailureClass {
     match error {
         StationError::Worker(WorkerError::CommandTimeout(_)) => FailureClass::Timeout,
+        StationError::WaitTimeout => FailureClass::Timeout,
         StationError::TaskStepFailed { source, .. } => station_error_class(source, fallback),
         _ => fallback,
     }
