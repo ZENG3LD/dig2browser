@@ -710,11 +710,12 @@ impl RuntimeFactory for LightweightRuntimeFactory {
             LightweightRuntimeConfig::default(),
             navigation_policy.clone(),
         )?;
-        BrowserWorker::spawn_with_runtime_and_timeout_and_navigation_policy(
+        BrowserWorker::spawn_with_runtime_and_timeouts_and_navigation_policy(
             identity,
             capabilities,
             config.queue_capacity,
             config.command_timeout,
+            config.close_timeout.unwrap_or(config.command_timeout),
             navigation_policy,
             runtime,
         )
@@ -734,11 +735,12 @@ impl RuntimeFactory for LightweightRuntimeFactory {
             navigation_policy.clone(),
             egress_proxy,
         )?;
-        BrowserWorker::spawn_with_runtime_and_timeout_and_navigation_policy(
+        BrowserWorker::spawn_with_runtime_and_timeouts_and_navigation_policy(
             identity,
             capabilities,
             config.queue_capacity,
             config.command_timeout,
+            config.close_timeout.unwrap_or(config.command_timeout),
             navigation_policy,
             runtime,
         )

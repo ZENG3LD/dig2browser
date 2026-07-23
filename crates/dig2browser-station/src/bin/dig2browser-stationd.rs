@@ -168,6 +168,13 @@ struct Cli {
     max_connections: usize,
     #[arg(long, default_value_t = 90)]
     timeout_seconds: u64,
+    #[arg(
+        long = "close-timeout-seconds",
+        value_name = "SECONDS",
+        help = "Worker close/drain teardown budget, distinct from --timeout-seconds \
+            (task/command execution budget). Defaults to --timeout-seconds when unset."
+    )]
+    close_timeout_seconds: Option<u64>,
     #[cfg(feature = "geckodriver-test-hooks")]
     #[arg(long, hide = true)]
     test_geckodriver_startup_timeout_millis: Option<u64>,
@@ -265,6 +272,7 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => {
+            report_station_failure(&error);
             eprintln!(
                 "{{\"schema_version\":1,\"event\":\"station_exit\",\"outcome\":\"error\",\"error_class\":\"{}\"}}",
                 error.class()
@@ -274,8 +282,62 @@ async fn main() -> ExitCode {
     }
 }
 
+#[cfg(feature = "containment-test-hooks")]
+fn report_station_diagnostic(event: &str, detail: serde_json::Value) {
+    use std::io::Write as _;
+
+    let Some(path) = std::env::var_os("DIG2BROWSER_STATION_DIAGNOSTIC_LOG") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let record = serde_json::json!({
+        "schema_version": 1,
+        "at_unix_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+        "process_id": std::process::id(),
+        "event": event,
+        "detail": detail,
+    });
+    if let Ok(mut log) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        if let Ok(mut encoded) = serde_json::to_vec(&record) {
+            encoded.push(b'\n');
+            let _ = log.write_all(&encoded);
+        }
+    }
+}
+
+#[cfg(not(feature = "containment-test-hooks"))]
+fn report_station_diagnostic(_event: &str, _detail: serde_json::Value) {}
+
+fn report_station_failure(error: &DaemonError) {
+    report_station_diagnostic(
+        "station_failure",
+        serde_json::json!({
+            "error_class": error.class(),
+            "message": error.to_string(),
+            "debug": format!("{error:?}"),
+        }),
+    );
+}
+
 #[cfg(windows)]
 async fn run(cli: Cli) -> Result<DaemonReport, DaemonError> {
+    report_station_diagnostic(
+        "startup_started",
+        serde_json::json!({
+            "runtime": format!("{:?}", cli.runtime),
+            "windows_containment": format!("{:?}", cli.windows_containment),
+            "profiles_root": cli.profiles_root,
+        }),
+    );
     let geckodriver_source = select_geckodriver_source(
         cli.runtime,
         cli.geckodriver_path,
@@ -302,14 +364,20 @@ async fn run(cli: Cli) -> Result<DaemonReport, DaemonError> {
         &navigation_policy,
     )?;
     #[cfg(feature = "containment-test-hooks")]
+    let close_timeout_seconds = cli.close_timeout_seconds.unwrap_or(cli.timeout_seconds);
+    #[cfg(feature = "containment-test-hooks")]
     let test_chromium_close_delay_argument = containment_test_close_delay_argument(
         cli.test_chromium_close_delay_millis,
         cli.windows_containment,
         cli.runtime,
         &navigation_policy,
-        cli.timeout_seconds,
+        close_timeout_seconds,
     )?;
     let profiles_owner = ProfilesRootOwnership::acquire(&cli.profiles_root)?;
+    report_station_diagnostic(
+        "profiles_root_acquired",
+        serde_json::json!({ "profiles_root": profiles_owner.root() }),
+    );
     let egress_proxy = if navigation_policy.is_exact() {
         let peer_policy =
             EgressPeerPolicy::with_exact_exceptions(cli.allowed_private_peers)?;
@@ -318,6 +386,17 @@ async fn run(cli: Cli) -> Result<DaemonReport, DaemonError> {
         None
     };
     let egress_endpoint = egress_proxy.as_ref().map(EgressProxy::local_addr);
+    report_station_diagnostic(
+        "egress_ready",
+        serde_json::json!({ "endpoint": egress_endpoint.map(|value| value.to_string()) }),
+    );
+    report_station_diagnostic(
+        "containment_acquire_started",
+        serde_json::json!({
+            "required": matches!(cli.windows_containment, WindowsContainmentArg::Required),
+            "runtime": format!("{:?}", cli.runtime),
+        }),
+    );
     let windows_containment = prepare_windows_containment(
         cli.windows_containment,
         cli.runtime,
@@ -327,6 +406,10 @@ async fn run(cli: Cli) -> Result<DaemonReport, DaemonError> {
         cli.windows_wfp_broker_pipe.as_deref(),
     )
     .await?;
+    report_station_diagnostic(
+        "containment_acquire_finished",
+        serde_json::json!({ "active": windows_containment.is_some() }),
+    );
     let containment_assurance = windows_containment
         .as_ref()
         .map(WindowsWfpContainment::assurance);
@@ -342,8 +425,10 @@ async fn run(cli: Cli) -> Result<DaemonReport, DaemonError> {
             egress_endpoint,
         )?;
         let command_timeout = Duration::from_secs(cli.timeout_seconds);
+        let close_timeout = cli.close_timeout_seconds.map(Duration::from_secs);
         let mut worker = BrowserWorkerConfig {
             command_timeout,
+            close_timeout,
             ..BrowserWorkerConfig::default()
         };
         match geckodriver_source {
@@ -376,6 +461,10 @@ async fn run(cli: Cli) -> Result<DaemonReport, DaemonError> {
         #[cfg(feature = "containment-test-hooks")]
         let worker = {
             let mut worker = worker;
+            if matches!(cli.windows_containment, WindowsContainmentArg::Required) {
+                worker.launch.extra_args.push("--enable-logging=stderr".to_owned());
+                worker.launch.extra_args.push("--v=1".to_owned());
+            }
             if let Some(argument) = test_chromium_close_delay_argument {
                 worker.launch.extra_args.push(argument);
             }
@@ -414,6 +503,10 @@ async fn run(cli: Cli) -> Result<DaemonReport, DaemonError> {
             server_config = server_config.crawl_root(crawl_root)?;
         }
         let station = BrowserStation::new(station_config);
+        report_station_diagnostic(
+            "station_service_starting",
+            serde_json::json!({ "containment_active": windows_containment.is_some() }),
+        );
         let emergency_station = station.clone();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let ctrl_shutdown_tx = shutdown_tx.clone();
@@ -525,19 +618,22 @@ fn containment_test_close_delay_argument(
     containment: WindowsContainmentArg,
     runtime: RuntimeArg,
     navigation_policy: &NavigationPolicy,
-    command_timeout_seconds: u64,
+    close_timeout_seconds: u64,
 ) -> Result<Option<String>, DaemonError> {
     let Some(delay_millis) = delay_millis else {
         return Ok(None);
     };
-    let command_timeout_millis = command_timeout_seconds
+    // The injected delay must outlast the worker close/teardown budget
+    // (not the task-execution budget) so the close path actually times
+    // out and proves WFP retention until the real process tree exits.
+    let close_timeout_millis = close_timeout_seconds
         .checked_mul(1_000)
         .ok_or(DaemonError::ContainmentTestHookScope)?;
     if !matches!(containment, WindowsContainmentArg::Required)
         || !matches!(runtime, RuntimeArg::Chrome | RuntimeArg::Edge)
         || !navigation_policy.is_exact()
         || !(1..=60_000).contains(&delay_millis)
-        || delay_millis <= command_timeout_millis
+        || delay_millis <= close_timeout_millis
     {
         return Err(DaemonError::ContainmentTestHookScope);
     }

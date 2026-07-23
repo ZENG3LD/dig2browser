@@ -30,7 +30,14 @@ const EMERGENCY_ACTOR_EXIT_TIMEOUT: Duration = Duration::from_secs(13);
 #[derive(Debug, Clone)]
 pub struct BrowserWorkerConfig {
     pub queue_capacity: usize,
+    /// Bounds a single task/command execution (navigate, click, evaluate,
+    /// etc.), including the initial runtime startup.
     pub command_timeout: Duration,
+    /// Bounds the worker close/drain/teardown budget, distinct from
+    /// [`command_timeout`](Self::command_timeout). `None` falls back to
+    /// `command_timeout`, matching prior behavior when this budget is
+    /// unset.
+    pub close_timeout: Option<Duration>,
     pub launch: LaunchConfig,
     pub stealth: StealthConfig,
     pub mobile_layout: Option<MobileLayout>,
@@ -41,6 +48,7 @@ impl Default for BrowserWorkerConfig {
         Self {
             queue_capacity: 32,
             command_timeout: DEFAULT_COMMAND_TIMEOUT,
+            close_timeout: None,
             launch: LaunchConfig::default(),
             stealth: StealthConfig::default(),
             mobile_layout: None,
@@ -103,6 +111,8 @@ impl BrowserWorker {
     ) -> Result<Self, WorkerError> {
         validate_queue_capacity(config.queue_capacity)?;
         validate_command_timeout(config.command_timeout)?;
+        let close_timeout = config.close_timeout.unwrap_or(config.command_timeout);
+        validate_close_timeout(close_timeout)?;
         let runtime = RealBrowserRuntime::new_with_navigation_policy_and_process_isolation(
             identity.clone(),
             config.launch,
@@ -111,11 +121,12 @@ impl BrowserWorker {
             navigation_policy.clone(),
             process_isolation,
         )?;
-        Self::spawn_with_runtime_and_timeout_and_navigation_policy(
+        Self::spawn_with_runtime_and_timeouts_and_navigation_policy(
             identity,
             capabilities,
             config.queue_capacity,
             config.command_timeout,
+            close_timeout,
             navigation_policy,
             runtime,
         )
@@ -170,8 +181,36 @@ impl BrowserWorker {
     where
         R: BrowserRuntime,
     {
+        Self::spawn_with_runtime_and_timeouts_and_navigation_policy(
+            identity,
+            capabilities,
+            queue_capacity,
+            command_timeout,
+            command_timeout,
+            navigation_policy,
+            runtime,
+        )
+    }
+
+    /// Spawn with separately bounded task-execution and worker-close
+    /// budgets. `close_timeout` bounds the worker close/drain/teardown
+    /// path only; `command_timeout` continues to bound task/command
+    /// execution, including the initial runtime startup.
+    pub fn spawn_with_runtime_and_timeouts_and_navigation_policy<R>(
+        identity: IdentityProfile,
+        capabilities: CapabilitySet,
+        queue_capacity: usize,
+        command_timeout: Duration,
+        close_timeout: Duration,
+        navigation_policy: NavigationPolicy,
+        runtime: R,
+    ) -> Result<Self, WorkerError>
+    where
+        R: BrowserRuntime,
+    {
         validate_queue_capacity(queue_capacity)?;
         validate_command_timeout(command_timeout)?;
+        validate_close_timeout(close_timeout)?;
         let initial = BrowserSnapshot::starting(identity.id().to_owned());
         let (commands, receiver) = mpsc::channel(queue_capacity);
         let (snapshot_tx, snapshot) = watch::channel(initial.clone());
@@ -187,6 +226,7 @@ impl BrowserWorker {
                     snapshots: snapshot_tx,
                     snapshot: initial,
                     command_timeout,
+                    close_timeout,
                     stopped: stopped_tx,
                     emergency: emergency_rx,
                 },
@@ -323,6 +363,7 @@ struct ActorContext {
     snapshots: watch::Sender<BrowserSnapshot>,
     snapshot: BrowserSnapshot,
     command_timeout: Duration,
+    close_timeout: Duration,
     stopped: watch::Sender<bool>,
     emergency: watch::Receiver<bool>,
 }
@@ -337,6 +378,7 @@ async fn run_actor(
         snapshots,
         mut snapshot,
         command_timeout,
+        close_timeout,
         stopped,
         mut emergency,
     } = context;
@@ -348,7 +390,7 @@ async fn run_actor(
                 &mut *runtime,
                 &mut snapshot,
                 &snapshots,
-                command_timeout,
+                close_timeout,
             ).await;
             drop(runtime);
             stopped.send_replace(true);
@@ -390,6 +432,16 @@ async fn run_actor(
         let is_shutdown = matches!(envelope.command, AgentCommand::Shutdown);
         shutdown_attempted |= is_shutdown
             && capabilities.contains(envelope.command.required_capability());
+        // A Shutdown command's own runtime.close() runs inside
+        // handle_command below; bound it by the close/teardown budget
+        // rather than the task-execution budget so a slow close cannot
+        // silently borrow extra time from (or steal too little time from)
+        // command_timeout.
+        let envelope_timeout = if is_shutdown {
+            close_timeout
+        } else {
+            command_timeout
+        };
         let command_result = tokio::select! {
             biased;
             _ = wait_for_emergency(&mut emergency) => {
@@ -397,7 +449,7 @@ async fn run_actor(
                 break;
             }
             result = tokio::time::timeout(
-                command_timeout,
+                envelope_timeout,
                 handle_command(
                     &mut *runtime,
                     &capabilities,
@@ -413,7 +465,7 @@ async fn run_actor(
             Err(_) => {
                 mark_timeout_degraded(&mut snapshot);
                 snapshots.send_replace(snapshot.clone());
-                Err(WorkerError::CommandTimeout(command_timeout))
+                Err(WorkerError::CommandTimeout(envelope_timeout))
             }
         };
         let _ = envelope.reply.send(result);
@@ -427,14 +479,14 @@ async fn run_actor(
             &mut *runtime,
             &mut snapshot,
             &snapshots,
-            command_timeout,
+            close_timeout,
         )
         .await;
     } else if snapshot.lifecycle != WorkerLifecycle::Stopped {
         snapshot.lifecycle = WorkerLifecycle::ShuttingDown;
         snapshots.send_replace(snapshot.clone());
         if !shutdown_attempted {
-            match tokio::time::timeout(command_timeout, runtime.close()).await {
+            match tokio::time::timeout(close_timeout, runtime.close()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => snapshot.last_failure = Some(error.kind()),
                 Err(_) => snapshot.last_failure = Some(RuntimeFailureKind::Timeout),
@@ -463,11 +515,11 @@ async fn emergency_close_runtime(
     runtime: &mut dyn BrowserRuntime,
     snapshot: &mut BrowserSnapshot,
     snapshots: &watch::Sender<BrowserSnapshot>,
-    command_timeout: Duration,
+    close_timeout: Duration,
 ) {
     snapshot.lifecycle = WorkerLifecycle::ShuttingDown;
     snapshots.send_replace(snapshot.clone());
-    let timeout = command_timeout.min(EMERGENCY_CLOSE_TIMEOUT);
+    let timeout = close_timeout.min(EMERGENCY_CLOSE_TIMEOUT);
     match tokio::time::timeout(timeout, runtime.close()).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => snapshot.last_failure = Some(error.kind()),
@@ -705,6 +757,14 @@ fn validate_command_timeout(timeout: Duration) -> Result<(), WorkerError> {
     }
 }
 
+fn validate_close_timeout(timeout: Duration) -> Result<(), WorkerError> {
+    if (MIN_COMMAND_TIMEOUT..=MAX_COMMAND_TIMEOUT).contains(&timeout) {
+        Ok(())
+    } else {
+        Err(WorkerError::InvalidCloseTimeout)
+    }
+}
+
 fn validate_finite(values: &[f64]) -> Result<(), WorkerError> {
     if values.iter().all(|value| value.is_finite()) {
         Ok(())
@@ -745,6 +805,7 @@ fn sanitized_origin(state: &DocumentState) -> Option<String> {
 pub enum WorkerError {
     InvalidQueueCapacity,
     InvalidCommandTimeout,
+    InvalidCloseTimeout,
     QueueClosed,
     WorkerStopped,
     CapabilityDenied(Capability),
@@ -766,6 +827,10 @@ impl std::fmt::Display for WorkerError {
             Self::InvalidCommandTimeout => write!(
                 formatter,
                 "command timeout must be between 100 milliseconds and 15 minutes"
+            ),
+            Self::InvalidCloseTimeout => write!(
+                formatter,
+                "close timeout must be between 100 milliseconds and 15 minutes"
             ),
             Self::QueueClosed => write!(formatter, "browser worker queue is closed"),
             Self::WorkerStopped => write!(formatter, "browser worker stopped"),

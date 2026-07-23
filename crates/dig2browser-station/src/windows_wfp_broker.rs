@@ -1,52 +1,59 @@
 use std::ffi::OsString;
 use std::io;
+use std::io::Write as _;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::os::windows::ffi::OsStringExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{compiler_fence, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dig2browser::detect::{BrowserBinary, BrowserKind};
 use dig2browser::{
     WindowsBrowserRuntimeMirror, WindowsRuntimeMirrorScope,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, WriteHalf};
 use tokio::net::windows::named_pipe::{
     ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{self, Instant};
-use windows::core::{GUID, PWSTR};
+use windows::core::{GUID, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY,
-    ERROR_PIPE_NOT_CONNECTED, FILETIME, GENERIC_ALL, HANDLE, WAIT_FAILED,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_PIPE_NOT_CONNECTED, FILETIME, GENERIC_ALL, HANDLE, STILL_ACTIVE,
+    WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Security::{
     AddAccessAllowedAceEx, CreateWellKnownSid, GetLengthSid,
-    GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor,
-    IsValidSecurityDescriptor, RevertToSelf, SetSecurityDescriptorDacl,
-    SetSecurityDescriptorOwner, TokenElevation, TokenUser, ACL,
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
+    InitializeAcl, InitializeSecurityDescriptor, IsValidSecurityDescriptor,
+    RevertToSelf, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner,
+    TokenElevation, TokenIntegrityLevel, TokenUser, ACL,
     ACL_REVISION, ACCESS_ALLOWED_ACE, NO_INHERITANCE, PSECURITY_DESCRIPTOR,
     PSID, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE,
-    TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, WinLocalSystemSid,
+    TOKEN_ELEVATION, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
+    WinLocalSystemSid,
 };
+use windows::Win32::Storage::FileSystem::SECURITY_IMPERSONATION;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Pipes::{
     GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
     ImpersonateNamedPipeClient,
 };
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessId, GetProcessTimes, OpenProcess,
-    OpenProcessToken, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE,
+    GetCurrentProcess, GetExitCodeProcess, GetProcessId, GetProcessTimes,
+    OpenProcess, OpenProcessToken, TerminateProcess, WaitForSingleObject,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    PROCESS_TERMINATE,
 };
 use windows::Win32::UI::Shell::{
     FOLDERID_LocalAppData, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86,
-    KF_FLAG_DEFAULT, SHGetKnownFolderPath,
+    KF_FLAG_DEFAULT, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    SHGetKnownFolderPath, ShellExecuteExW,
 };
 
 use crate::windows_containment::{WindowsContainmentError, WindowsContainmentGuard};
@@ -56,11 +63,17 @@ const CAPABILITY_BYTES: usize = 32;
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
+const LEASE_GRANT_TIMEOUT: Duration = Duration::from_secs(180);
 const PREAUTH_FRAME_TIMEOUT: Duration = Duration::from_secs(2);
 const PREAUTH_REJECT_TIMEOUT: Duration = Duration::from_millis(250);
 const PREAUTH_RETRY_DELAY: Duration = Duration::from_millis(25);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_BOOTSTRAP_FAILURE_CLASS_BYTES: usize = 64;
+const MAX_BOOTSTRAP_FAILURE_MESSAGE_BYTES: usize = 1024;
 const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+const SECURITY_MANDATORY_MEDIUM_RID: u32 = 0x0000_2000;
+const SECURITY_MANDATORY_HIGH_RID: u32 = 0x0000_3000;
+pub const WFP_BROKER_CRASH_EXIT_CODE: u32 = 86;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -83,9 +96,10 @@ enum ClientFrame {
 /// A one-use secret shared only by the broker launcher and its intended client.
 ///
 /// Use [`Self::generate_pair`] immediately before launching the elevated broker,
-/// write the broker copy to its stdin, and move the client copy into
-/// [`acquire_windows_wfp_lease`]. The value is deliberately not `Clone` and its
-/// debug representation never contains secret bytes.
+/// pass the broker copy to [`launch_elevated_windows_wfp_broker`] for transfer
+/// over the authenticated bootstrap pipe, and move the client copy into
+/// [`acquire_windows_wfp_lease`]. The value is deliberately not `Clone` and
+/// its debug representation never contains secret bytes.
 #[derive(Serialize, Deserialize)]
 pub struct WindowsWfpBrokerCapability([u8; CAPABILITY_BYTES]);
 
@@ -245,7 +259,7 @@ pub enum WindowsWfpBrokerRejectCode {
     PolicyClose,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum WindowsWfpBrokerOutcome {
     Closed {
@@ -264,6 +278,123 @@ pub enum WindowsWfpBrokerOutcome {
         version: u16,
         message: String,
     },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum BootstrapLauncherFrame {
+    Start {
+        version: u16,
+        capability: WindowsWfpBrokerCapability,
+    },
+    Crash {
+        version: u16,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum BootstrapBrokerFrame {
+    Diagnostic {
+        version: u16,
+        record: BootstrapEventRecord,
+    },
+    CrashAcknowledged {
+        version: u16,
+    },
+    Outcome {
+        version: u16,
+        outcome: WindowsWfpBrokerOutcome,
+    },
+    Failed {
+        version: u16,
+        class: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BootstrapEventRecord {
+    schema_version: u16,
+    at_unix_ms: u64,
+    process_id: u32,
+    event: String,
+    detail: serde_json::Value,
+}
+
+struct BootstrapEventLogger {
+    log: Option<std::fs::File>,
+}
+
+struct PendingElevatedWindowsWfpBroker {
+    process: Option<OwnedHandle>,
+    process_id: u32,
+    event_logger: Option<BootstrapEventLogger>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowsProcessSecurity {
+    pub process_id: u32,
+    pub creation_filetime: u64,
+    pub elevated: bool,
+    pub integrity_rid: u32,
+}
+
+impl WindowsProcessSecurity {
+    pub fn is_medium_integrity(self) -> bool {
+        (SECURITY_MANDATORY_MEDIUM_RID..SECURITY_MANDATORY_HIGH_RID)
+            .contains(&self.integrity_rid)
+    }
+
+    pub fn is_high_integrity(self) -> bool {
+        self.integrity_rid >= SECURITY_MANDATORY_HIGH_RID
+    }
+}
+
+#[derive(Debug)]
+pub struct ElevatedWindowsWfpBrokerExit {
+    pub exit_code: u32,
+    pub outcome: Option<WindowsWfpBrokerOutcome>,
+}
+
+pub struct ElevatedWindowsWfpBroker {
+    process: OwnedHandle,
+    identity: WindowsProcessSecurity,
+    bootstrap: WriteHalf<NamedPipeServer>,
+    broker_frames: mpsc::UnboundedReceiver<
+        Result<Option<BootstrapBrokerFrame>, WindowsWfpBrokerBootstrapError>,
+    >,
+    broker_reader: JoinHandle<()>,
+    event_logger: Arc<Mutex<BootstrapEventLogger>>,
+    completed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrappedWindowsWfpBrokerExit {
+    Outcome { clean: bool },
+    LauncherDisconnected,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum WindowsWfpBrokerBootstrapError {
+    #[error("invalid WFP broker bootstrap configuration: {0}")]
+    InvalidConfiguration(String),
+    #[error("WFP broker bootstrap identity is invalid: {0}")]
+    Identity(String),
+    #[error("WFP broker elevation launch failed: {0}")]
+    Launch(String),
+    #[error("WFP broker bootstrap protocol failed: {0}")]
+    Protocol(String),
+    #[error("WFP broker bootstrap pipe {operation} failed")]
+    Pipe {
+        operation: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("timed out while {0}")]
+    Timeout(&'static str),
+    #[error("elevated WFP broker bootstrap failed ({class}): {message}")]
+    Remote { class: String, message: String },
 }
 
 impl WindowsWfpBrokerOutcome {
@@ -391,6 +522,1051 @@ impl Drop for WindowsWfpLease {
     }
 }
 
+impl ElevatedWindowsWfpBroker {
+    pub fn id(&self) -> u32 {
+        self.identity.process_id
+    }
+
+    pub fn security(&self) -> WindowsProcessSecurity {
+        self.identity
+    }
+
+    pub async fn request_crash(
+        &mut self,
+    ) -> Result<ElevatedWindowsWfpBrokerExit, WindowsWfpBrokerBootstrapError> {
+        report_shared_bootstrap_event(
+            &self.event_logger,
+            "crash_requested",
+            serde_json::json!({ "process_id": self.identity.process_id }),
+        );
+        write_bootstrap_frame(
+            &mut self.bootstrap,
+            &BootstrapLauncherFrame::Crash {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .await?;
+        let response = time::timeout(
+            CLOSE_TIMEOUT,
+            self.read_broker_frame(),
+        )
+        .await
+        .map_err(|_| WindowsWfpBrokerBootstrapError::Timeout(
+            "waiting for broker crash acknowledgement",
+        ))??
+        .ok_or_else(|| WindowsWfpBrokerBootstrapError::Protocol(
+            "broker disconnected before acknowledging crash control".to_owned(),
+        ))?;
+        if !matches!(
+            response,
+            BootstrapBrokerFrame::CrashAcknowledged {
+                version: PROTOCOL_VERSION
+            }
+        ) {
+            return Err(WindowsWfpBrokerBootstrapError::Protocol(
+                "broker returned an unexpected crash-control response".to_owned(),
+            ));
+        }
+        let exit_code = wait_for_process_exit(&self.process).await?;
+        self.completed = true;
+        self.broker_reader.abort();
+        report_shared_bootstrap_event(
+            &self.event_logger,
+            "crash_exit_observed",
+            serde_json::json!({
+                "process_id": self.identity.process_id,
+                "exit_code": exit_code,
+            }),
+        );
+        Ok(ElevatedWindowsWfpBrokerExit {
+            exit_code,
+            outcome: None,
+        })
+    }
+
+    pub async fn wait(
+        &mut self,
+    ) -> Result<ElevatedWindowsWfpBrokerExit, WindowsWfpBrokerBootstrapError> {
+        let response = time::timeout(
+            ACQUIRE_TIMEOUT,
+            self.read_broker_frame(),
+        )
+        .await
+        .map_err(|_| WindowsWfpBrokerBootstrapError::Timeout(
+            "waiting for broker outcome",
+        ))??;
+        let outcome = match response {
+            Some(BootstrapBrokerFrame::Outcome {
+                version: PROTOCOL_VERSION,
+                outcome,
+            }) => Some(outcome),
+            None => None,
+            Some(_) => {
+                return Err(WindowsWfpBrokerBootstrapError::Protocol(
+                    "broker returned an unexpected bootstrap response".to_owned(),
+                ));
+            }
+        };
+        let exit_code = wait_for_process_exit(&self.process).await?;
+        self.completed = true;
+        self.broker_reader.abort();
+        report_shared_bootstrap_event(
+            &self.event_logger,
+            "outcome_exit_observed",
+            serde_json::json!({
+                "process_id": self.identity.process_id,
+                "exit_code": exit_code,
+                "outcome": format!("{outcome:?}"),
+            }),
+        );
+        Ok(ElevatedWindowsWfpBrokerExit { exit_code, outcome })
+    }
+
+    async fn read_broker_frame(
+        &mut self,
+    ) -> Result<Option<BootstrapBrokerFrame>, WindowsWfpBrokerBootstrapError> {
+        self.broker_frames.recv().await.unwrap_or_else(|| {
+            Err(WindowsWfpBrokerBootstrapError::Protocol(
+                "bootstrap broker reader stopped before delivering a terminal frame"
+                    .to_owned(),
+            ))
+        })
+    }
+}
+
+impl Drop for ElevatedWindowsWfpBroker {
+    fn drop(&mut self) {
+        self.broker_reader.abort();
+        if self.completed {
+            return;
+        }
+
+        match unsafe { WaitForSingleObject(self.process.0, 0) } {
+            WAIT_OBJECT_0 => return,
+            WAIT_TIMEOUT => {}
+            WAIT_FAILED => {
+                report_shared_bootstrap_event(
+                    &self.event_logger,
+                    "orphan_state_check_failed",
+                    serde_json::json!({
+                        "process_id": self.identity.process_id,
+                        "error": windows::core::Error::from_win32().to_string(),
+                    }),
+                );
+            }
+            result => {
+                report_shared_bootstrap_event(
+                    &self.event_logger,
+                    "orphan_state_check_failed",
+                    serde_json::json!({
+                        "process_id": self.identity.process_id,
+                        "unexpected_wait_result": result.0,
+                    }),
+                );
+            }
+        }
+
+        report_shared_bootstrap_event(
+            &self.event_logger,
+            "orphan_termination_requested",
+            serde_json::json!({
+                "process_id": self.identity.process_id,
+                "exit_code": WFP_BROKER_CRASH_EXIT_CODE,
+            }),
+        );
+        if let Err(error) = unsafe {
+            TerminateProcess(self.process.0, WFP_BROKER_CRASH_EXIT_CODE)
+        } {
+            report_shared_bootstrap_event(
+                &self.event_logger,
+                "orphan_termination_failed",
+                serde_json::json!({
+                    "process_id": self.identity.process_id,
+                    "error": error.to_string(),
+                }),
+            );
+            return;
+        }
+
+        let wait_result = unsafe {
+            WaitForSingleObject(self.process.0, CLOSE_TIMEOUT.as_millis() as u32)
+        };
+        report_shared_bootstrap_event(
+            &self.event_logger,
+            "orphan_termination_observed",
+            serde_json::json!({
+                "process_id": self.identity.process_id,
+                "wait_result": wait_result.0,
+                "terminated": wait_result == WAIT_OBJECT_0,
+            }),
+        );
+    }
+}
+
+impl PendingElevatedWindowsWfpBroker {
+    fn new(process: OwnedHandle, event_logger: BootstrapEventLogger) -> Self {
+        let process_id = unsafe { GetProcessId(process.0) };
+        Self {
+            process: Some(process),
+            process_id,
+            event_logger: Some(event_logger),
+        }
+    }
+
+    fn process(&self) -> &OwnedHandle {
+        self.process
+            .as_ref()
+            .expect("pending elevated broker owns its process handle")
+    }
+
+    fn event_logger_mut(&mut self) -> &mut BootstrapEventLogger {
+        self.event_logger
+            .as_mut()
+            .expect("pending elevated broker owns its event logger")
+    }
+
+    fn set_process_id(&mut self, process_id: u32) {
+        self.process_id = process_id;
+    }
+
+    fn complete(
+        mut self,
+        identity: WindowsProcessSecurity,
+        bootstrap: NamedPipeServer,
+    ) -> ElevatedWindowsWfpBroker {
+        let process = self
+            .process
+            .take()
+            .expect("pending elevated broker owns its process handle");
+        let event_logger = self
+            .event_logger
+            .take()
+            .expect("pending elevated broker owns its event logger");
+        let event_logger = Arc::new(Mutex::new(event_logger));
+        let (bootstrap_reader, bootstrap) = tokio::io::split(bootstrap);
+        let (broker_frame_tx, broker_frames) = mpsc::unbounded_channel();
+        let broker_reader = tokio::spawn(read_live_bootstrap_broker_frame(
+            bootstrap_reader,
+            Arc::clone(&event_logger),
+            broker_frame_tx,
+        ));
+        ElevatedWindowsWfpBroker {
+            process,
+            identity,
+            bootstrap,
+            broker_frames,
+            broker_reader,
+            event_logger,
+            completed: false,
+        }
+    }
+}
+
+impl Drop for PendingElevatedWindowsWfpBroker {
+    fn drop(&mut self) {
+        let process_id = self.process_id;
+        let (Some(process), Some(event_logger)) =
+            (self.process.as_ref(), self.event_logger.as_mut())
+        else {
+            return;
+        };
+
+        match unsafe { WaitForSingleObject(process.0, 0) } {
+            WAIT_OBJECT_0 => {
+                let mut exit_code = STILL_ACTIVE.0 as u32;
+                let exit_code = unsafe { GetExitCodeProcess(process.0, &mut exit_code) }
+                    .ok()
+                    .map(|()| exit_code);
+                event_logger.report(
+                    "pending_launch_exit_observed",
+                    serde_json::json!({
+                        "process_id": process_id,
+                        "exit_code": exit_code,
+                    }),
+                );
+                return;
+            }
+            WAIT_TIMEOUT => {}
+            WAIT_FAILED => {
+                event_logger.report(
+                    "pending_launch_state_check_failed",
+                    serde_json::json!({
+                        "process_id": process_id,
+                        "error": windows::core::Error::from_win32().to_string(),
+                    }),
+                );
+            }
+            result => {
+                event_logger.report(
+                    "pending_launch_state_check_failed",
+                    serde_json::json!({
+                        "process_id": process_id,
+                        "unexpected_wait_result": result.0,
+                    }),
+                );
+            }
+        }
+
+        event_logger.report(
+            "pending_launch_termination_requested",
+            serde_json::json!({
+                "process_id": process_id,
+                "exit_code": WFP_BROKER_CRASH_EXIT_CODE,
+            }),
+        );
+        if let Err(error) = unsafe {
+            TerminateProcess(process.0, WFP_BROKER_CRASH_EXIT_CODE)
+        } {
+            event_logger.report(
+                "pending_launch_termination_failed",
+                serde_json::json!({
+                    "process_id": process_id,
+                    "error": error.to_string(),
+                }),
+            );
+            return;
+        }
+
+        let wait_result = unsafe {
+            WaitForSingleObject(process.0, CLOSE_TIMEOUT.as_millis() as u32)
+        };
+        let mut exit_code = STILL_ACTIVE.0 as u32;
+        let exit_code = if wait_result == WAIT_OBJECT_0 {
+            unsafe { GetExitCodeProcess(process.0, &mut exit_code) }
+                .ok()
+                .map(|()| exit_code)
+        } else {
+            None
+        };
+        event_logger.report(
+            "pending_launch_termination_observed",
+            serde_json::json!({
+                "process_id": process_id,
+                "wait_result": wait_result.0,
+                "terminated": wait_result == WAIT_OBJECT_0,
+                "exit_code": exit_code,
+            }),
+        );
+    }
+}
+
+async fn recover_handleless_elevated_broker(
+    bootstrap: &mut NamedPipeServer,
+    event_logger: &mut BootstrapEventLogger,
+) -> String {
+    match time::timeout(PREAUTH_FRAME_TIMEOUT, bootstrap.connect()).await {
+        Err(_) => {
+            event_logger.report(
+                "handleless_recovery_no_client",
+                serde_json::json!({ "outcome": "timeout" }),
+            );
+            return "handleless recovery observed no bootstrap client before timeout"
+                .to_owned();
+        }
+        Ok(Err(error)) => {
+            let message = bounded_sanitized_bootstrap_text(
+                &error.to_string(),
+                MAX_BOOTSTRAP_FAILURE_MESSAGE_BYTES,
+            );
+            event_logger.report(
+                "handleless_recovery_no_client",
+                serde_json::json!({
+                    "outcome": "connect_failed",
+                    "error": &message,
+                }),
+            );
+            return format!(
+                "handleless recovery bootstrap connection failed: {message}"
+            );
+        }
+        Ok(Ok(())) => {}
+    }
+
+    let peer = match PeerProcess::from_pipe(bootstrap) {
+        Ok(peer) => peer,
+        Err(error) => {
+            let message = bounded_sanitized_bootstrap_text(
+                &error,
+                MAX_BOOTSTRAP_FAILURE_MESSAGE_BYTES,
+            );
+            event_logger.report(
+                "handleless_recovery_peer_rejected",
+                serde_json::json!({ "error": &message }),
+            );
+            return format!(
+                "handleless recovery rejected the bootstrap peer: {message}"
+            );
+        }
+    };
+    let security = match inspect_process_security_handle(peer.handle.0) {
+        Ok(security) => security,
+        Err(error) => {
+            let message = bounded_sanitized_bootstrap_text(
+                &error,
+                MAX_BOOTSTRAP_FAILURE_MESSAGE_BYTES,
+            );
+            event_logger.report(
+                "handleless_recovery_peer_rejected",
+                serde_json::json!({
+                    "process_id": peer.pid,
+                    "error": &message,
+                }),
+            );
+            return format!(
+                "handleless recovery could not inspect bootstrap peer {}: {message}",
+                peer.pid
+            );
+        }
+    };
+    if security.process_id != peer.pid
+        || security.creation_filetime != peer.creation_filetime
+        || !security.elevated
+        || !security.is_high_integrity()
+    {
+        event_logger.report(
+            "handleless_recovery_peer_rejected",
+            serde_json::json!({
+                "process_id": peer.pid,
+                "creation_filetime": peer.creation_filetime,
+                "observed_security": {
+                    "process_id": security.process_id,
+                    "creation_filetime": security.creation_filetime,
+                    "elevated": security.elevated,
+                    "integrity_rid": security.integrity_rid,
+                },
+            }),
+        );
+        return format!(
+            "handleless recovery rejected bootstrap peer {} because it was not the same elevated high-integrity process incarnation",
+            peer.pid
+        );
+    }
+
+    if let Err(error) = await_handleless_broker_authentication(
+        bootstrap,
+        event_logger,
+        peer.pid,
+    )
+    .await
+    {
+        let message = bounded_sanitized_bootstrap_text(
+            &error,
+            MAX_BOOTSTRAP_FAILURE_MESSAGE_BYTES,
+        );
+        event_logger.report(
+            "handleless_recovery_peer_rejected",
+            serde_json::json!({
+                "process_id": peer.pid,
+                "error": &message,
+            }),
+        );
+        return format!(
+            "handleless recovery rejected unauthenticated bootstrap peer {}: {message}",
+            peer.pid
+        );
+    }
+    event_logger.report(
+        "handleless_recovery_peer_authenticated",
+        serde_json::json!({
+            "process_id": peer.pid,
+            "creation_filetime": peer.creation_filetime,
+            "integrity_rid": security.integrity_rid,
+        }),
+    );
+
+    let process = match unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION
+                | PROCESS_SYNCHRONIZE
+                | PROCESS_TERMINATE,
+            false,
+            peer.pid,
+        )
+    }
+    .map(OwnedHandle)
+    {
+        Ok(process) => process,
+        Err(error) => {
+            let message = bounded_sanitized_bootstrap_text(
+                &error.to_string(),
+                MAX_BOOTSTRAP_FAILURE_MESSAGE_BYTES,
+            );
+            event_logger.report(
+                "handleless_recovery_termination_failed",
+                serde_json::json!({
+                    "process_id": peer.pid,
+                    "operation": "open_terminate_handle",
+                    "error": &message,
+                }),
+            );
+            return format!(
+                "handleless recovery could not open broker {} for termination: {message}",
+                peer.pid
+            );
+        }
+    };
+    let opened_security = match inspect_process_security_handle(process.0) {
+        Ok(security) => security,
+        Err(error) => {
+            let message = bounded_sanitized_bootstrap_text(
+                &error,
+                MAX_BOOTSTRAP_FAILURE_MESSAGE_BYTES,
+            );
+            event_logger.report(
+                "handleless_recovery_peer_rejected",
+                serde_json::json!({
+                    "process_id": peer.pid,
+                    "operation": "revalidate_terminate_handle",
+                    "error": &message,
+                }),
+            );
+            return format!(
+                "handleless recovery could not revalidate broker {}: {message}",
+                peer.pid
+            );
+        }
+    };
+    let same_user = process_user_sid(process.0)
+        .and_then(|peer_sid| {
+            process_user_sid(unsafe { GetCurrentProcess() })
+                .map(|launcher_sid| peer_sid == launcher_sid)
+        });
+    let same_user_valid = matches!(&same_user, Ok(true));
+    if opened_security.process_id != peer.pid
+        || opened_security.creation_filetime != peer.creation_filetime
+        || !opened_security.elevated
+        || !opened_security.is_high_integrity()
+        || !same_user_valid
+    {
+        let same_user_error = same_user.as_ref().err().map(|error| {
+            bounded_sanitized_bootstrap_text(
+                error,
+                MAX_BOOTSTRAP_FAILURE_MESSAGE_BYTES,
+            )
+        });
+        event_logger.report(
+            "handleless_recovery_peer_rejected",
+            serde_json::json!({
+                "process_id": peer.pid,
+                "operation": "revalidate_terminate_handle",
+                "same_user": same_user_valid,
+                "same_user_error": same_user_error,
+                "observed_security": {
+                    "process_id": opened_security.process_id,
+                    "creation_filetime": opened_security.creation_filetime,
+                    "elevated": opened_security.elevated,
+                    "integrity_rid": opened_security.integrity_rid,
+                },
+            }),
+        );
+        return format!(
+            "handleless recovery refused to terminate broker {} after identity revalidation failed",
+            peer.pid
+        );
+    }
+    match unsafe { WaitForSingleObject(process.0, 0) } {
+        WAIT_OBJECT_0 => {
+            let mut exit_code = STILL_ACTIVE.0 as u32;
+            let exit_code = unsafe { GetExitCodeProcess(process.0, &mut exit_code) }
+                .ok()
+                .map(|()| exit_code);
+            event_logger.report(
+                "handleless_recovery_exit_observed",
+                serde_json::json!({
+                    "process_id": peer.pid,
+                    "exit_code": exit_code,
+                }),
+            );
+            return format!(
+                "handleless recovery found broker {} already exited with code {exit_code:?}",
+                peer.pid
+            );
+        }
+        WAIT_TIMEOUT => {}
+        WAIT_FAILED => {
+            let message = windows::core::Error::from_win32().to_string();
+            event_logger.report(
+                "handleless_recovery_state_check_failed",
+                serde_json::json!({
+                    "process_id": peer.pid,
+                    "error": &message,
+                }),
+            );
+        }
+        result => {
+            event_logger.report(
+                "handleless_recovery_state_check_failed",
+                serde_json::json!({
+                    "process_id": peer.pid,
+                    "unexpected_wait_result": result.0,
+                }),
+            );
+        }
+    }
+
+    event_logger.report(
+        "handleless_recovery_termination_requested",
+        serde_json::json!({
+            "process_id": peer.pid,
+            "exit_code": WFP_BROKER_CRASH_EXIT_CODE,
+        }),
+    );
+    if let Err(error) = unsafe {
+        TerminateProcess(process.0, WFP_BROKER_CRASH_EXIT_CODE)
+    } {
+        let message = bounded_sanitized_bootstrap_text(
+            &error.to_string(),
+            MAX_BOOTSTRAP_FAILURE_MESSAGE_BYTES,
+        );
+        event_logger.report(
+            "handleless_recovery_termination_failed",
+            serde_json::json!({
+                "process_id": peer.pid,
+                "operation": "terminate",
+                "error": &message,
+            }),
+        );
+        return format!(
+            "handleless recovery could not terminate broker {}: {message}",
+            peer.pid
+        );
+    }
+
+    let wait_result = unsafe {
+        WaitForSingleObject(process.0, CLOSE_TIMEOUT.as_millis() as u32)
+    };
+    let mut exit_code = STILL_ACTIVE.0 as u32;
+    let exit_code = if wait_result == WAIT_OBJECT_0 {
+        unsafe { GetExitCodeProcess(process.0, &mut exit_code) }
+            .ok()
+            .map(|()| exit_code)
+    } else {
+        None
+    };
+    event_logger.report(
+        "handleless_recovery_termination_observed",
+        serde_json::json!({
+            "process_id": peer.pid,
+            "wait_result": wait_result.0,
+            "terminated": wait_result == WAIT_OBJECT_0,
+            "exit_code": exit_code,
+        }),
+    );
+    format!(
+        "handleless recovery termination for broker {} completed with wait result {} and exit code {exit_code:?}",
+        peer.pid,
+        wait_result.0
+    )
+}
+
+async fn await_handleless_broker_authentication(
+    bootstrap: &mut NamedPipeServer,
+    event_logger: &mut BootstrapEventLogger,
+    peer_pid: u32,
+) -> Result<(), String> {
+    time::timeout(PREAUTH_FRAME_TIMEOUT, async {
+        loop {
+            let frame = read_bootstrap_frame::<_, BootstrapBrokerFrame>(bootstrap)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    "bootstrap peer disconnected before authenticating its launcher"
+                        .to_owned()
+                })?;
+            match frame {
+                BootstrapBrokerFrame::Diagnostic {
+                    version: PROTOCOL_VERSION,
+                    record,
+                } => {
+                    if record.process_id != peer_pid {
+                        return Err(
+                            "bootstrap diagnostic process ID did not match the connected peer"
+                                .to_owned(),
+                        );
+                    }
+                    let launcher_authenticated =
+                        record.event == "launcher_authenticated";
+                    let expected_parent = record
+                        .detail
+                        .get("parent_process_id")
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(std::process::id() as u64);
+                    event_logger.append(&record);
+                    if launcher_authenticated {
+                        if expected_parent {
+                            return Ok(());
+                        }
+                        return Err(
+                            "bootstrap peer authenticated a different launcher process"
+                                .to_owned(),
+                        );
+                    }
+                }
+                BootstrapBrokerFrame::Failed {
+                    version: PROTOCOL_VERSION,
+                    class,
+                    message,
+                } => {
+                    let class = bounded_sanitized_bootstrap_text(
+                        &class,
+                        MAX_BOOTSTRAP_FAILURE_CLASS_BYTES,
+                    );
+                    let message = bounded_sanitized_bootstrap_text(
+                        &message,
+                        MAX_BOOTSTRAP_FAILURE_MESSAGE_BYTES,
+                    );
+                    return Err(format!(
+                        "bootstrap peer failed before launcher authentication ({class}): {message}"
+                    ));
+                }
+                BootstrapBrokerFrame::Diagnostic { .. }
+                | BootstrapBrokerFrame::Failed { .. } => {
+                    return Err(
+                        "bootstrap peer used an unsupported pre-authentication frame version"
+                            .to_owned(),
+                    );
+                }
+                BootstrapBrokerFrame::CrashAcknowledged { .. }
+                | BootstrapBrokerFrame::Outcome { .. } => {
+                    return Err(
+                        "bootstrap peer sent a terminal frame before launcher authentication"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        "timed out waiting for bootstrap peer launcher authentication".to_owned()
+    })?
+}
+
+/// Starts only the WFP broker elevated. The caller, station, and browser stay
+/// at medium integrity. The one-use capability is transferred only after the
+/// exact `runas` process has authenticated on an owner-restricted pipe.
+pub async fn launch_elevated_windows_wfp_broker(
+    executable: &Path,
+    pipe_name: &str,
+    allowed_runtime_root: &Path,
+    capability: WindowsWfpBrokerCapability,
+) -> Result<ElevatedWindowsWfpBroker, WindowsWfpBrokerBootstrapError> {
+    let launcher = inspect_process_security_handle(unsafe { GetCurrentProcess() })
+        .map_err(WindowsWfpBrokerBootstrapError::Identity)?;
+    if launcher.elevated || !launcher.is_medium_integrity() {
+        return Err(WindowsWfpBrokerBootstrapError::Identity(
+            "WFP broker launcher must be a non-elevated medium-integrity process"
+                .to_owned(),
+        ));
+    }
+    let mut event_logger = BootstrapEventLogger::from_medium_launcher_environment();
+    event_logger.report(
+        "launch_requested",
+        serde_json::json!({ "executable": executable }),
+    );
+    if !executable.is_file() {
+        return Err(WindowsWfpBrokerBootstrapError::InvalidConfiguration(
+            format!("broker executable does not exist: {}", executable.display()),
+        ));
+    }
+    local_pipe_name(pipe_name)
+        .map_err(|error| WindowsWfpBrokerBootstrapError::InvalidConfiguration(
+            error.to_string(),
+        ))?;
+
+    let bootstrap_name = format!(
+        "dig2browser-wfp-bootstrap-{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    let full_bootstrap_name = local_pipe_name(&bootstrap_name)
+        .map_err(|error| WindowsWfpBrokerBootstrapError::InvalidConfiguration(
+            error.to_string(),
+        ))?;
+    let mut bootstrap = create_owner_restricted_pipe(&full_bootstrap_name)
+        .map_err(bootstrap_from_broker_error)?;
+
+    let arguments = vec![
+        "--bootstrap-pipe".to_owned(),
+        bootstrap_name,
+        "--bootstrap-parent-pid".to_owned(),
+        launcher.process_id.to_string(),
+        "--bootstrap-parent-creation-filetime".to_owned(),
+        launcher.creation_filetime.to_string(),
+        "--pipe-name".to_owned(),
+        pipe_name.to_owned(),
+        "--allowed-runtime-root".to_owned(),
+        allowed_runtime_root.as_os_str().to_string_lossy().into_owned(),
+    ];
+    let parameters = arguments
+        .into_iter()
+        .map(|argument| quote_windows_argument(&argument))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let verb = wide_null("runas")?;
+    let file = wide_null_os(executable.as_os_str())?;
+    let parameters = wide_null(&parameters)?;
+    let mut execute = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        lpVerb: PCWSTR(verb.as_ptr()),
+        lpFile: PCWSTR(file.as_ptr()),
+        lpParameters: PCWSTR(parameters.as_ptr()),
+        nShow: 0,
+        ..Default::default()
+    };
+    unsafe { ShellExecuteExW(&mut execute) }
+        .map_err(|error| WindowsWfpBrokerBootstrapError::Launch(error.to_string()))?;
+    if execute.hProcess.is_invalid() {
+        event_logger.report(
+            "handleless_recovery_started",
+            serde_json::json!({ "bootstrap_pipe": full_bootstrap_name }),
+        );
+        let recovery = recover_handleless_elevated_broker(
+            &mut bootstrap,
+            &mut event_logger,
+        )
+        .await;
+        return Err(WindowsWfpBrokerBootstrapError::Launch(
+            format!(
+                "ShellExecuteExW did not return a broker process handle; {recovery}"
+            ),
+        ));
+    }
+    let mut pending = PendingElevatedWindowsWfpBroker::new(
+        OwnedHandle(execute.hProcess),
+        event_logger,
+    );
+    let identity = inspect_process_security_handle(pending.process().0)
+        .map_err(WindowsWfpBrokerBootstrapError::Identity)?;
+    pending.set_process_id(identity.process_id);
+    if !identity.elevated || !identity.is_high_integrity() {
+        return Err(WindowsWfpBrokerBootstrapError::Identity(
+            "runas broker is not elevated at high integrity".to_owned(),
+        ));
+    }
+    pending.event_logger_mut().report(
+        "elevated_process_started",
+        serde_json::json!({
+            "process_id": identity.process_id,
+            "creation_filetime": identity.creation_filetime,
+            "integrity_rid": identity.integrity_rid,
+            "elevated": identity.elevated,
+        }),
+    );
+
+    tokio::select! {
+        biased;
+        connect = time::timeout(ACQUIRE_TIMEOUT, bootstrap.connect()) => {
+            connect
+                .map_err(|_| WindowsWfpBrokerBootstrapError::Timeout(
+                    "waiting for elevated broker bootstrap",
+                ))?
+                .map_err(|source| WindowsWfpBrokerBootstrapError::Pipe {
+                    operation: "connect",
+                    source,
+                })?;
+        }
+        exit = wait_for_process_exit(pending.process()) => {
+            let exit_code = exit?;
+            return Err(WindowsWfpBrokerBootstrapError::Launch(format!(
+                "elevated broker exited before bootstrap connection with code {exit_code}"
+            )));
+        }
+    }
+    let peer = PeerProcess::from_pipe(&bootstrap)
+        .map_err(WindowsWfpBrokerBootstrapError::Identity)?;
+    if peer.pid != identity.process_id
+        || peer.creation_filetime != identity.creation_filetime
+    {
+        return Err(WindowsWfpBrokerBootstrapError::Identity(
+            "bootstrap client is not the exact process returned by ShellExecuteExW"
+                .to_owned(),
+        ));
+    }
+    let peer_security = inspect_process_security_handle(peer.handle.0)
+        .map_err(WindowsWfpBrokerBootstrapError::Identity)?;
+    if !peer_security.elevated || !peer_security.is_high_integrity() {
+        return Err(WindowsWfpBrokerBootstrapError::Identity(
+            "bootstrap client is not an elevated high-integrity broker".to_owned(),
+        ));
+    }
+    pending.event_logger_mut().report(
+        "elevated_peer_authenticated",
+        serde_json::json!({ "process_id": peer_security.process_id }),
+    );
+
+    let start_write = write_bootstrap_frame(
+        &mut bootstrap,
+        &BootstrapLauncherFrame::Start {
+            version: PROTOCOL_VERSION,
+            capability,
+        },
+    )
+    .await;
+    if let Err(write_error) = start_write {
+        if let Ok(Err(remote_error @ WindowsWfpBrokerBootstrapError::Remote { .. })) =
+            time::timeout(
+                PREAUTH_REJECT_TIMEOUT,
+                read_bootstrap_broker_frame(
+                    &mut bootstrap,
+                    pending.event_logger_mut(),
+                ),
+            )
+            .await
+        {
+            return Err(remote_error);
+        }
+        return Err(write_error);
+    }
+    pending.event_logger_mut().report(
+        "capability_transferred",
+        serde_json::json!({ "process_id": identity.process_id }),
+    );
+    Ok(pending.complete(identity, bootstrap))
+}
+
+pub async fn run_bootstrapped_windows_wfp_broker(
+    bootstrap_pipe_name: &str,
+    expected_parent_pid: u32,
+    expected_parent_creation_filetime: u64,
+    pipe_name: &str,
+    allowed_runtime_root: &Path,
+) -> Result<BootstrappedWindowsWfpBrokerExit, WindowsWfpBrokerBootstrapError> {
+    let full_bootstrap_name = local_pipe_name(bootstrap_pipe_name)
+        .map_err(|error| WindowsWfpBrokerBootstrapError::InvalidConfiguration(
+            error.to_string(),
+        ))?;
+    let mut bootstrap = connect_client(&full_bootstrap_name)
+        .await
+        .map_err(bootstrap_from_broker_error)?;
+    report_elevated_bootstrap_event(
+        &mut bootstrap,
+        "broker_connected_to_launcher",
+        serde_json::json!({ "process_id": std::process::id() }),
+    ).await;
+    if let Err(message) = verify_bootstrap_launcher(
+        &bootstrap,
+        expected_parent_pid,
+        expected_parent_creation_filetime,
+    ) {
+        let error = WindowsWfpBrokerBootstrapError::Identity(message);
+        report_elevated_bootstrap_failure(&mut bootstrap, &error).await;
+        return Err(error);
+    }
+    report_elevated_bootstrap_event(
+        &mut bootstrap,
+        "launcher_authenticated",
+        serde_json::json!({ "parent_process_id": expected_parent_pid }),
+    ).await;
+    let result = run_authenticated_windows_wfp_broker(
+        &mut bootstrap,
+        pipe_name,
+        allowed_runtime_root,
+    )
+    .await;
+    if let Err(error) = &result {
+        report_elevated_bootstrap_failure(&mut bootstrap, error).await;
+    }
+    result
+}
+
+async fn run_authenticated_windows_wfp_broker(
+    bootstrap: &mut NamedPipeClient,
+    pipe_name: &str,
+    allowed_runtime_root: &Path,
+) -> Result<BootstrappedWindowsWfpBrokerExit, WindowsWfpBrokerBootstrapError> {
+    let start = time::timeout(
+        PREAUTH_FRAME_TIMEOUT,
+        read_bootstrap_frame::<_, BootstrapLauncherFrame>(bootstrap),
+    )
+    .await
+    .map_err(|_| WindowsWfpBrokerBootstrapError::Timeout(
+        "waiting for bootstrap capability",
+    ))??
+    .ok_or_else(|| WindowsWfpBrokerBootstrapError::Protocol(
+        "launcher disconnected before sending bootstrap capability".to_owned(),
+    ))?;
+    let capability = match start {
+        BootstrapLauncherFrame::Start {
+            version: PROTOCOL_VERSION,
+            capability,
+        } => capability,
+        _ => {
+            return Err(WindowsWfpBrokerBootstrapError::Protocol(
+                "first bootstrap frame must be a version 3 start request".to_owned(),
+            ));
+        }
+    };
+    report_elevated_bootstrap_event(
+        bootstrap,
+        "capability_received",
+        serde_json::json!({ "process_id": std::process::id() }),
+    ).await;
+
+    let broker = run_windows_wfp_broker(pipe_name, allowed_runtime_root, capability);
+    tokio::pin!(broker);
+    tokio::select! {
+        outcome = &mut broker => {
+            let clean = outcome.is_clean_close();
+            report_elevated_bootstrap_event(
+                bootstrap,
+                "broker_outcome",
+                serde_json::json!({
+                    "clean": clean,
+                    "outcome": format!("{outcome:?}"),
+                }),
+            ).await;
+            write_bootstrap_frame(
+                bootstrap,
+                &BootstrapBrokerFrame::Outcome {
+                    version: PROTOCOL_VERSION,
+                    outcome,
+                },
+            ).await?;
+            Ok(BootstrappedWindowsWfpBrokerExit::Outcome { clean })
+        }
+        control = read_bootstrap_frame::<_, BootstrapLauncherFrame>(bootstrap) => {
+            match control? {
+                Some(BootstrapLauncherFrame::Crash {
+                    version: PROTOCOL_VERSION,
+                }) => {
+                    write_bootstrap_frame(
+                        bootstrap,
+                        &BootstrapBrokerFrame::CrashAcknowledged {
+                            version: PROTOCOL_VERSION,
+                        },
+                    ).await?;
+                    unsafe {
+                        TerminateProcess(
+                            GetCurrentProcess(),
+                            WFP_BROKER_CRASH_EXIT_CODE,
+                        )
+                    }
+                    .map_err(|error| WindowsWfpBrokerBootstrapError::Launch(
+                        format!("cannot terminate WFP broker for crash proof: {error}"),
+                    ))?;
+                    loop {
+                        std::thread::park();
+                    }
+                }
+                None => Ok(
+                    {
+                        report_elevated_bootstrap_event(
+                            bootstrap,
+                            "launcher_disconnected",
+                            serde_json::json!({ "process_id": std::process::id() }),
+                        ).await;
+                        BootstrappedWindowsWfpBrokerExit::LauncherDisconnected
+                    },
+                ),
+                Some(_) => Err(WindowsWfpBrokerBootstrapError::Protocol(
+                    "unexpected bootstrap control frame".to_owned(),
+                )),
+            }
+        }
+    }
+}
+
 /// Acquires a single WFP lease from an already-started elevated broker.
 pub async fn acquire_windows_wfp_lease(
     pipe_name: &str,
@@ -404,7 +1580,7 @@ pub async fn acquire_windows_wfp_lease(
     let client_creation_filetime = process_creation_filetime(unsafe { GetCurrentProcess() })
         .map_err(WindowsWfpBrokerError::BrokerIdentity)?;
     let requested_scope = mirror_scope.as_hex();
-    let mut pipe = connect_client(&pipe_name).await?;
+    let mut pipe = connect_impersonable_client(&pipe_name).await?;
     verify_elevated_broker_server(&pipe)
         .map_err(WindowsWfpBrokerError::BrokerIdentity)?;
     write_frame(
@@ -421,7 +1597,7 @@ pub async fn acquire_windows_wfp_lease(
     )
     .await?;
 
-    let response = time::timeout(ACQUIRE_TIMEOUT, read_frame::<_, BrokerFrame>(&mut pipe))
+    let response = time::timeout(LEASE_GRANT_TIMEOUT, read_frame::<_, BrokerFrame>(&mut pipe))
         .await
         .map_err(|_| WindowsWfpBrokerError::Timeout("waiting for lease grant"))??
         .ok_or_else(|| WindowsWfpBrokerError::LeaseLost(
@@ -1047,9 +2223,26 @@ fn pipe_security_error(
 }
 
 async fn connect_client(pipe_name: &str) -> Result<NamedPipeClient, WindowsWfpBrokerError> {
+    connect_client_with_security_qos(pipe_name, None).await
+}
+
+async fn connect_impersonable_client(
+    pipe_name: &str,
+) -> Result<NamedPipeClient, WindowsWfpBrokerError> {
+    connect_client_with_security_qos(pipe_name, Some(SECURITY_IMPERSONATION.0)).await
+}
+
+async fn connect_client_with_security_qos(
+    pipe_name: &str,
+    security_qos_flags: Option<u32>,
+) -> Result<NamedPipeClient, WindowsWfpBrokerError> {
     let deadline = Instant::now() + CONNECT_TIMEOUT;
     loop {
-        match ClientOptions::new().open(pipe_name) {
+        let mut options = ClientOptions::new();
+        if let Some(flags) = security_qos_flags {
+            options.security_qos_flags(flags);
+        }
+        match options.open(pipe_name) {
             Ok(pipe) => return Ok(pipe),
             Err(source) if retryable_connect_error(&source) && Instant::now() < deadline => {
                 time::sleep(Duration::from_millis(25)).await;
@@ -1227,6 +2420,174 @@ where
         .map_err(|error| WindowsWfpBrokerError::Protocol(format!("invalid JSON frame: {error}")));
     zeroize_bytes(&mut payload);
     decoded
+}
+
+async fn write_bootstrap_frame<W, T>(
+    writer: &mut W,
+    value: &T,
+) -> Result<(), WindowsWfpBrokerBootstrapError>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    write_frame(writer, value)
+        .await
+        .map_err(bootstrap_from_broker_error)
+}
+
+async fn read_bootstrap_frame<R, T>(
+    reader: &mut R,
+) -> Result<Option<T>, WindowsWfpBrokerBootstrapError>
+where
+    R: AsyncRead + Unpin,
+    T: DeserializeOwned,
+{
+    read_frame(reader)
+        .await
+        .map_err(bootstrap_from_broker_error)
+}
+
+async fn read_bootstrap_broker_frame<R>(
+    reader: &mut R,
+    event_logger: &mut BootstrapEventLogger,
+) -> Result<Option<BootstrapBrokerFrame>, WindowsWfpBrokerBootstrapError>
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        match read_bootstrap_frame::<_, BootstrapBrokerFrame>(reader).await? {
+            Some(BootstrapBrokerFrame::Diagnostic {
+                version: PROTOCOL_VERSION,
+                record,
+            }) => event_logger.append(&record),
+            Some(BootstrapBrokerFrame::Diagnostic { .. }) => {
+                return Err(WindowsWfpBrokerBootstrapError::Protocol(
+                    "broker returned an unsupported diagnostic frame version"
+                        .to_owned(),
+                ));
+            }
+            Some(BootstrapBrokerFrame::Failed {
+                version: PROTOCOL_VERSION,
+                class,
+                message,
+            }) => {
+                let class = bounded_sanitized_bootstrap_text(
+                    &class,
+                    MAX_BOOTSTRAP_FAILURE_CLASS_BYTES,
+                );
+                let message = bounded_sanitized_bootstrap_text(
+                    &message,
+                    MAX_BOOTSTRAP_FAILURE_MESSAGE_BYTES,
+                );
+                event_logger.report(
+                    "broker_bootstrap_failed",
+                    serde_json::json!({
+                        "class": &class,
+                        "message": &message,
+                    }),
+                );
+                return Err(WindowsWfpBrokerBootstrapError::Remote {
+                    class,
+                    message,
+                });
+            }
+            Some(BootstrapBrokerFrame::Failed { .. }) => {
+                return Err(WindowsWfpBrokerBootstrapError::Protocol(
+                    "broker returned an unsupported failure frame version"
+                        .to_owned(),
+                ));
+            }
+            frame => return Ok(frame),
+        }
+    }
+}
+
+async fn read_live_bootstrap_broker_frame<R>(
+    mut reader: R,
+    event_logger: Arc<Mutex<BootstrapEventLogger>>,
+    broker_frame_tx: mpsc::UnboundedSender<
+        Result<Option<BootstrapBrokerFrame>, WindowsWfpBrokerBootstrapError>,
+    >,
+) where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        let frame = match read_bootstrap_frame::<_, BootstrapBrokerFrame>(&mut reader).await {
+            Ok(frame) => frame,
+            Err(error) => {
+                let _ = broker_frame_tx.send(Err(error));
+                return;
+            }
+        };
+        match frame {
+            Some(BootstrapBrokerFrame::Diagnostic {
+                version: PROTOCOL_VERSION,
+                record,
+            }) => append_shared_bootstrap_record(&event_logger, &record),
+            Some(BootstrapBrokerFrame::Diagnostic { .. }) => {
+                let _ = broker_frame_tx.send(Err(
+                    WindowsWfpBrokerBootstrapError::Protocol(
+                        "broker returned an unsupported diagnostic frame version"
+                            .to_owned(),
+                    ),
+                ));
+                return;
+            }
+            Some(BootstrapBrokerFrame::Failed {
+                version: PROTOCOL_VERSION,
+                class,
+                message,
+            }) => {
+                let class = bounded_sanitized_bootstrap_text(
+                    &class,
+                    MAX_BOOTSTRAP_FAILURE_CLASS_BYTES,
+                );
+                let message = bounded_sanitized_bootstrap_text(
+                    &message,
+                    MAX_BOOTSTRAP_FAILURE_MESSAGE_BYTES,
+                );
+                report_shared_bootstrap_event(
+                    &event_logger,
+                    "broker_bootstrap_failed",
+                    serde_json::json!({
+                        "class": &class,
+                        "message": &message,
+                    }),
+                );
+                let _ = broker_frame_tx.send(Err(
+                    WindowsWfpBrokerBootstrapError::Remote { class, message },
+                ));
+                return;
+            }
+            Some(BootstrapBrokerFrame::Failed { .. }) => {
+                let _ = broker_frame_tx.send(Err(
+                    WindowsWfpBrokerBootstrapError::Protocol(
+                        "broker returned an unsupported failure frame version"
+                            .to_owned(),
+                    ),
+                ));
+                return;
+            }
+            frame => {
+                let _ = broker_frame_tx.send(Ok(frame));
+                return;
+            }
+        }
+    }
+}
+
+fn bootstrap_from_broker_error(
+    error: WindowsWfpBrokerError,
+) -> WindowsWfpBrokerBootstrapError {
+    match error {
+        WindowsWfpBrokerError::Pipe { operation, source } => {
+            WindowsWfpBrokerBootstrapError::Pipe { operation, source }
+        }
+        WindowsWfpBrokerError::Timeout(operation) => {
+            WindowsWfpBrokerBootstrapError::Timeout(operation)
+        }
+        other => WindowsWfpBrokerBootstrapError::Protocol(other.to_string()),
+    }
 }
 
 fn local_pipe_name(pipe_name: &str) -> Result<String, WindowsWfpBrokerError> {
@@ -1696,6 +3057,360 @@ fn process_creation_filetime(process: HANDLE) -> Result<u64, String> {
         return Err("Windows returned an invalid process creation time".to_owned());
     }
     Ok(creation_filetime)
+}
+
+pub fn inspect_windows_process_security(
+    process_id: u32,
+) -> Result<WindowsProcessSecurity, String> {
+    if process_id == 0 {
+        return Err("cannot inspect process ID zero".to_owned());
+    }
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            process_id,
+        )
+    }
+    .map(OwnedHandle)
+    .map_err(|error| format!("cannot open process {process_id}: {error}"))?;
+    inspect_process_security_handle(process.0)
+}
+
+fn inspect_process_security_handle(
+    process: HANDLE,
+) -> Result<WindowsProcessSecurity, String> {
+    let process_id = unsafe { GetProcessId(process) };
+    if process_id == 0 {
+        return Err("Windows returned an invalid process ID".to_owned());
+    }
+    Ok(WindowsProcessSecurity {
+        process_id,
+        creation_filetime: process_creation_filetime(process)?,
+        elevated: process_token_is_elevated(process)?,
+        integrity_rid: process_integrity_rid(process)?,
+    })
+}
+
+fn process_integrity_rid(process: HANDLE) -> Result<u32, String> {
+    let mut token = HANDLE::default();
+    unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }
+        .map_err(|error| format!("cannot open process token: {error}"))?;
+    let token = OwnedHandle(token);
+    let mut required = 0_u32;
+    let _ = unsafe {
+        GetTokenInformation(token.0, TokenIntegrityLevel, None, 0, &mut required)
+    };
+    if required < std::mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32 {
+        return Err("Windows returned an invalid token-integrity size".to_owned());
+    }
+    let words = (required as usize)
+        .saturating_add(std::mem::size_of::<usize>() - 1)
+        / std::mem::size_of::<usize>();
+    let mut buffer = vec![0_usize; words];
+    unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenIntegrityLevel,
+            Some(buffer.as_mut_ptr().cast()),
+            required,
+            &mut required,
+        )
+    }
+    .map_err(|error| format!("cannot read process-token integrity: {error}"))?;
+    let label = unsafe { &*(buffer.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()) };
+    let sid = label.Label.Sid;
+    if sid.0.is_null() {
+        return Err("Windows returned a null token-integrity SID".to_owned());
+    }
+    let subauthority_count = unsafe { *GetSidSubAuthorityCount(sid) } as u32;
+    if subauthority_count == 0 {
+        return Err("Windows returned an invalid token-integrity SID".to_owned());
+    }
+    let rid = unsafe { GetSidSubAuthority(sid, subauthority_count - 1) };
+    if rid.is_null() {
+        return Err("Windows returned a null token-integrity RID".to_owned());
+    }
+    Ok(unsafe { *rid })
+}
+
+fn verify_bootstrap_launcher(
+    pipe: &NamedPipeClient,
+    expected_pid: u32,
+    expected_creation_filetime: u64,
+) -> Result<(), String> {
+    if expected_pid == 0 || expected_creation_filetime == 0 {
+        return Err("bootstrap launcher identity is incomplete".to_owned());
+    }
+    let pipe_handle = HANDLE(pipe.as_raw_handle());
+    let mut pid = 0_u32;
+    unsafe { GetNamedPipeServerProcessId(pipe_handle, &mut pid) }
+        .map_err(|error| format!("cannot identify bootstrap launcher: {error}"))?;
+    if pid != expected_pid {
+        return Err("bootstrap server process ID does not match the launcher".to_owned());
+    }
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            pid,
+        )
+    }
+    .map(OwnedHandle)
+    .map_err(|error| format!("cannot open bootstrap launcher process: {error}"))?;
+    if process_creation_filetime(handle.0)? != expected_creation_filetime {
+        return Err("bootstrap server process incarnation does not match the launcher"
+            .to_owned());
+    }
+    if unsafe { WaitForSingleObject(handle.0, 0) } != WAIT_TIMEOUT {
+        return Err("bootstrap launcher is not live".to_owned());
+    }
+    if process_user_sid(handle.0)?
+        != process_user_sid(unsafe { GetCurrentProcess() })?
+    {
+        return Err("bootstrap launcher belongs to a different Windows user".to_owned());
+    }
+    let security = inspect_process_security_handle(handle.0)?;
+    if security.elevated || !security.is_medium_integrity() {
+        return Err("bootstrap launcher is not non-elevated medium integrity".to_owned());
+    }
+    Ok(())
+}
+
+async fn wait_for_process_exit(
+    process: &OwnedHandle,
+) -> Result<u32, WindowsWfpBrokerBootstrapError> {
+    let deadline = Instant::now() + ACQUIRE_TIMEOUT;
+    loop {
+        match unsafe { WaitForSingleObject(process.0, 0) } {
+            WAIT_OBJECT_0 => break,
+            WAIT_TIMEOUT if Instant::now() < deadline => {
+                time::sleep(PREAUTH_RETRY_DELAY).await;
+            }
+            WAIT_TIMEOUT => {
+                return Err(WindowsWfpBrokerBootstrapError::Timeout(
+                    "waiting for elevated broker process exit",
+                ));
+            }
+            WAIT_FAILED => {
+                return Err(WindowsWfpBrokerBootstrapError::Launch(format!(
+                    "cannot wait for elevated broker: {}",
+                    windows::core::Error::from_win32()
+                )));
+            }
+            result => {
+                return Err(WindowsWfpBrokerBootstrapError::Launch(format!(
+                    "unexpected elevated broker wait result: {}",
+                    result.0
+                )));
+            }
+        }
+    }
+    let mut exit_code = STILL_ACTIVE.0 as u32;
+    unsafe { GetExitCodeProcess(process.0, &mut exit_code) }
+        .map_err(|error| WindowsWfpBrokerBootstrapError::Launch(format!(
+            "cannot read elevated broker exit code: {error}"
+        )))?;
+    if exit_code == STILL_ACTIVE.0 as u32 {
+        return Err(WindowsWfpBrokerBootstrapError::Launch(
+            "elevated broker remained active after its process handle was signaled"
+                .to_owned(),
+        ));
+    }
+    Ok(exit_code)
+}
+
+fn quote_windows_argument(argument: &str) -> String {
+    if !argument.is_empty()
+        && !argument.chars().any(|character| {
+            character.is_whitespace() || character == '"'
+        })
+    {
+        return argument.to_owned();
+    }
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0_usize;
+    for character in argument.chars() {
+        if character == '\\' {
+            backslashes += 1;
+        } else if character == '"' {
+            quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+            quoted.push('"');
+            backslashes = 0;
+        } else {
+            quoted.extend(std::iter::repeat_n('\\', backslashes));
+            backslashes = 0;
+            quoted.push(character);
+        }
+    }
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+    quoted.push('"');
+    quoted
+}
+
+fn wide_null(value: &str) -> Result<Vec<u16>, WindowsWfpBrokerBootstrapError> {
+    wide_null_os(std::ffi::OsStr::new(value))
+}
+
+fn wide_null_os(
+    value: &std::ffi::OsStr,
+) -> Result<Vec<u16>, WindowsWfpBrokerBootstrapError> {
+    let mut wide = value.encode_wide().collect::<Vec<_>>();
+    if wide.contains(&0) {
+        return Err(WindowsWfpBrokerBootstrapError::InvalidConfiguration(
+            "broker launch argument contains NUL".to_owned(),
+        ));
+    }
+    wide.push(0);
+    Ok(wide)
+}
+
+impl BootstrapEventRecord {
+    fn new(event: &str, detail: serde_json::Value) -> Self {
+        let at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or_default();
+        Self {
+            schema_version: 1,
+            at_unix_ms,
+            process_id: std::process::id(),
+            event: event.to_owned(),
+            detail,
+        }
+    }
+}
+
+impl BootstrapEventLogger {
+    fn from_medium_launcher_environment() -> Self {
+        let log = std::env::var_os("DIG2BROWSER_WFP_BROKER_LOG")
+            .filter(|path| !path.is_empty())
+            .and_then(|path| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .ok()
+            });
+        Self { log }
+    }
+
+    fn report(&mut self, event: &str, detail: serde_json::Value) {
+        self.append(&BootstrapEventRecord::new(event, detail));
+    }
+
+    fn append(&mut self, record: &BootstrapEventRecord) {
+        let Some(log) = self.log.as_mut() else {
+            return;
+        };
+        if let Ok(mut encoded) = serde_json::to_vec(record) {
+            encoded.push(b'\n');
+            let _ = log.write_all(&encoded);
+        }
+    }
+}
+
+fn report_shared_bootstrap_event(
+    event_logger: &Arc<Mutex<BootstrapEventLogger>>,
+    event: &str,
+    detail: serde_json::Value,
+) {
+    if let Ok(mut event_logger) = event_logger.lock() {
+        event_logger.report(event, detail);
+    }
+}
+
+fn append_shared_bootstrap_record(
+    event_logger: &Arc<Mutex<BootstrapEventLogger>>,
+    record: &BootstrapEventRecord,
+) {
+    if let Ok(mut event_logger) = event_logger.lock() {
+        event_logger.append(record);
+    }
+}
+
+async fn report_elevated_bootstrap_event(
+    bootstrap: &mut NamedPipeClient,
+    event: &str,
+    detail: serde_json::Value,
+) {
+    let _ = write_bootstrap_frame(
+        bootstrap,
+        &BootstrapBrokerFrame::Diagnostic {
+            version: PROTOCOL_VERSION,
+            record: BootstrapEventRecord::new(event, detail),
+        },
+    )
+    .await;
+}
+
+async fn report_elevated_bootstrap_failure(
+    bootstrap: &mut NamedPipeClient,
+    error: &WindowsWfpBrokerBootstrapError,
+) {
+    let class = match error {
+        WindowsWfpBrokerBootstrapError::InvalidConfiguration(_) => {
+            "invalid_configuration"
+        }
+        WindowsWfpBrokerBootstrapError::Identity(_) => "identity",
+        WindowsWfpBrokerBootstrapError::Launch(_) => "launch",
+        WindowsWfpBrokerBootstrapError::Protocol(_) => "protocol",
+        WindowsWfpBrokerBootstrapError::Pipe { .. } => "pipe",
+        WindowsWfpBrokerBootstrapError::Timeout(_) => "timeout",
+        WindowsWfpBrokerBootstrapError::Remote { .. } => "remote",
+    };
+    let rendered = match error {
+        WindowsWfpBrokerBootstrapError::Pipe {
+            operation,
+            source,
+        } => format!(
+            "WFP broker bootstrap pipe {operation} failed: {source}"
+        ),
+        _ => error.to_string(),
+    };
+    let message = bounded_sanitized_bootstrap_text(
+        &rendered,
+        MAX_BOOTSTRAP_FAILURE_MESSAGE_BYTES,
+    );
+    let frame = BootstrapBrokerFrame::Failed {
+        version: PROTOCOL_VERSION,
+        class: class.to_owned(),
+        message,
+    };
+    let _ = time::timeout(
+        PREAUTH_REJECT_TIMEOUT,
+        write_bootstrap_frame(bootstrap, &frame),
+    )
+    .await;
+}
+
+fn bounded_sanitized_bootstrap_text(value: &str, max_bytes: usize) -> String {
+    let mut sanitized = String::with_capacity(value.len().min(max_bytes));
+    let mut truncated = false;
+    for character in value.chars() {
+        let character = if character.is_control() {
+            ' '
+        } else {
+            character
+        };
+        if sanitized.len() + character.len_utf8() > max_bytes {
+            truncated = true;
+            break;
+        }
+        sanitized.push(character);
+    }
+    if truncated {
+        const SUFFIX: &str = " [truncated]";
+        while sanitized.len() + SUFFIX.len() > max_bytes {
+            if sanitized.pop().is_none() {
+                break;
+            }
+        }
+        if SUFFIX.len() <= max_bytes {
+            sanitized.push_str(SUFFIX);
+        }
+    }
+    sanitized
 }
 
 fn zeroize_bytes(bytes: &mut [u8]) {

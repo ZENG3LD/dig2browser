@@ -1,40 +1,50 @@
 #![cfg(windows)]
 
 use std::collections::HashSet;
+use std::ffi::OsString;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::mem::size_of;
 use std::net::{
     IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener,
     TcpStream, UdpSocket,
 };
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 #[cfg(feature = "tls-test-hooks")]
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, Once};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
-#[cfg(feature = "tls-test-hooks")]
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dig2browser::detect::{
     BrowserBinary, BrowserKind, BrowserPreference, LaunchConfig,
 };
 use dig2browser::identity::ProfileOwnershipGuard;
 use dig2browser::stealth::StealthConfig;
-use dig2browser::{BrowserProcessIsolation, StealthBrowser};
+use dig2browser::{
+    BrowserProcessIsolation, StealthBrowser, WindowsBrowserRuntimeMirror,
+};
 use dig2browser_client::{
     BrowserPersona, ClientConfig, ClientError, CollectionTask, ResponseStatus,
     RuntimeFeature, RuntimeKind, RuntimeRequirements, RuntimeSelector, StationClient,
     TaskCapturePolicy, TaskReply, TaskRuntimeContract, TaskStep,
 };
-use dig2browser_station::windows_wfp_broker::WindowsWfpBrokerCapability;
+use dig2browser_station::windows_wfp_broker::{
+    inspect_windows_process_security, launch_elevated_windows_wfp_broker,
+    ElevatedWindowsWfpBroker, WindowsWfpBrokerCapability,
+    WindowsWfpBrokerOutcome, WFP_BROKER_CRASH_EXIT_CODE,
+};
 use dig2browser_station::ProfilesRootOwnership;
 use tokio::io::AsyncReadExt;
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{
     CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE,
+};
+use windows::Win32::Storage::FileSystem::{
+    GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
 };
 use windows::Win32::System::Threading::{
     GetExitCodeProcess, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
@@ -89,6 +99,327 @@ impl Drop for ReadOnlyHandle {
             let _ = CloseHandle(self.0);
         }
     }
+}
+
+static WFP_E2E_RUN_SERIALIZATION: Mutex<()> = Mutex::new(());
+static WFP_E2E_PANIC_HOOK: Once = Once::new();
+static WFP_E2E_PANIC_TARGET: Mutex<Option<PanicLogTarget>> = Mutex::new(None);
+
+#[derive(Clone)]
+struct PanicLogTarget {
+    path: PathBuf,
+    root: PathBuf,
+}
+
+enum PanicLogRestore {
+    Inactive,
+    Active(Option<PanicLogTarget>),
+}
+
+struct WfpE2eRun {
+    root: PathBuf,
+    panic_log_restore: Mutex<PanicLogRestore>,
+    run_dir_environment: Option<ScopedEnvironmentVariable>,
+    broker_log_environment: Option<ScopedEnvironmentVariable>,
+    serialization_guard: Option<MutexGuard<'static, ()>>,
+}
+
+struct ScopedEnvironmentVariable {
+    name: &'static str,
+    previous: Option<OsString>,
+}
+
+impl ScopedEnvironmentVariable {
+    fn set(name: &'static str, value: &Path) -> Self {
+        let previous = std::env::var_os(name);
+        std::env::set_var(name, value);
+        Self { name, previous }
+    }
+}
+
+impl Drop for ScopedEnvironmentVariable {
+    fn drop(&mut self) {
+        if let Some(previous) = &self.previous {
+            std::env::set_var(self.name, previous);
+        } else {
+            std::env::remove_var(self.name);
+        }
+    }
+}
+
+fn lock_wfp_e2e_run_serialization() -> MutexGuard<'static, ()> {
+    WFP_E2E_RUN_SERIALIZATION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_wfp_e2e_panic_target() -> MutexGuard<'static, Option<PanicLogTarget>> {
+    WFP_E2E_PANIC_TARGET
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn install_wfp_e2e_panic_hook() {
+    WFP_E2E_PANIC_HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic| {
+            let target = lock_wfp_e2e_panic_target().clone();
+            if let Some(target) = target {
+                if let Ok(mut log) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&target.path)
+                {
+                    let _ = writeln!(log, "{panic}");
+                }
+                append_e2e_event(
+                    &target.root,
+                    "test",
+                    "panic",
+                    serde_json::json!({ "message": panic.to_string() }),
+                );
+            }
+            previous(panic);
+        }));
+    });
+}
+
+impl WfpE2eRun {
+    fn start(scenario: &str) -> Self {
+        let serialization_guard = lock_wfp_e2e_run_serialization();
+        let started_at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after Unix epoch")
+            .as_millis() as u64;
+        let root = std::env::var_os("DIG2BROWSER_E2E_RUN_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                e2e_temp_base().join("dig2browser-wfp-e2e-runs")
+            })
+            .join(format!(
+                "{started_at_unix_ms}-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+        std::fs::create_dir_all(&root).expect("create WFP E2E run directory");
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "scenario": scenario,
+            "started_at_unix_ms": started_at_unix_ms,
+            "test_process_id": std::process::id(),
+            "run_directory": root,
+        });
+        std::fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).expect("serialize WFP E2E manifest"),
+        )
+        .expect("write WFP E2E manifest");
+        File::create(root.join("panic.log")).expect("create WFP E2E panic log");
+        let broker_log_path = root.join("broker-bootstrap.jsonl");
+        File::create(&broker_log_path).expect("create WFP broker bootstrap log");
+        let run_dir_environment = ScopedEnvironmentVariable::set(
+            "DIG2BROWSER_E2E_RUN_DIR",
+            &root,
+        );
+        let broker_log_environment = ScopedEnvironmentVariable::set(
+            "DIG2BROWSER_WFP_BROKER_LOG",
+            &broker_log_path,
+        );
+        eprintln!("DIG2BROWSER_E2E_RUN_DIR={}", root.display());
+        let run = Self {
+            root,
+            panic_log_restore: Mutex::new(PanicLogRestore::Inactive),
+            run_dir_environment: Some(run_dir_environment),
+            broker_log_environment: Some(broker_log_environment),
+            serialization_guard: Some(serialization_guard),
+        };
+        run.event("test", "run_started", serde_json::json!({}));
+        run
+    }
+
+    fn event(&self, component: &str, event: &str, detail: serde_json::Value) {
+        append_e2e_event(&self.root, component, event, detail);
+    }
+
+    fn install_panic_log(&self) {
+        install_wfp_e2e_panic_hook();
+        let mut restore = self
+            .panic_log_restore
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(*restore, PanicLogRestore::Active(_)) {
+            return;
+        }
+        let target = PanicLogTarget {
+            path: self.root.join("panic.log"),
+            root: self.root.clone(),
+        };
+        let previous = lock_wfp_e2e_panic_target().replace(target);
+        *restore = PanicLogRestore::Active(previous);
+    }
+}
+
+impl Drop for WfpE2eRun {
+    fn drop(&mut self) {
+        let restore = self
+            .panic_log_restore
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let PanicLogRestore::Active(previous) =
+            std::mem::replace(restore, PanicLogRestore::Inactive)
+        {
+            *lock_wfp_e2e_panic_target() = previous;
+        }
+        drop(self.broker_log_environment.take());
+        drop(self.run_dir_environment.take());
+        drop(self.serialization_guard.take());
+    }
+}
+
+struct LoggedStation {
+    child: tokio::process::Child,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    diagnostic_path: PathBuf,
+}
+
+impl LoggedStation {
+    fn id(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.wait().await
+    }
+
+    fn output(&self) -> (String, String) {
+        let stdout = std::fs::read_to_string(&self.stdout_path)
+            .unwrap_or_else(|error| format!("<cannot read station stdout: {error}>"));
+        let stderr = std::fs::read_to_string(&self.stderr_path)
+            .unwrap_or_else(|error| format!("<cannot read station stderr: {error}>"));
+        (stdout, stderr)
+    }
+
+    fn diagnostic_tail(&self) -> String {
+        const MAX_BYTES: usize = 16 * 1024;
+
+        let bytes = match std::fs::read(&self.diagnostic_path) {
+            Ok(bytes) => bytes,
+            Err(error) => return format!("<cannot read station diagnostic log: {error}>"),
+        };
+        let start = bytes.len().saturating_sub(MAX_BYTES);
+        String::from_utf8_lossy(&bytes[start..]).into_owned()
+    }
+}
+
+fn current_e2e_run_root() -> PathBuf {
+    std::env::var_os("DIG2BROWSER_E2E_RUN_DIR")
+        .map(PathBuf::from)
+        .expect("WFP E2E run directory is initialized")
+}
+
+fn e2e_component_path(component: &str, suffix: &str) -> PathBuf {
+    current_e2e_run_root().join(format!(
+        "{}.{}.log",
+        safe_e2e_component_name(component),
+        suffix
+    ))
+}
+
+fn e2e_component_artifact_path(component: &str, suffix: &str) -> PathBuf {
+    current_e2e_run_root().join(format!(
+        "{}.{}",
+        safe_e2e_component_name(component),
+        suffix
+    ))
+}
+
+fn safe_e2e_component_name(component: &str) -> String {
+    component
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn record_e2e_event(component: &str, event: &str, detail: serde_json::Value) {
+    append_e2e_event(&current_e2e_run_root(), component, event, detail);
+}
+
+fn append_e2e_event(
+    root: &Path,
+    component: &str,
+    event: &str,
+    detail: serde_json::Value,
+) {
+    let at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default();
+    let record = serde_json::json!({
+        "schema_version": 1,
+        "at_unix_ms": at_unix_ms,
+        "component": component,
+        "event": event,
+        "detail": detail,
+    });
+    if let Ok(mut log) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(root.join("events.jsonl"))
+    {
+        if let Ok(mut encoded) = serde_json::to_vec(&record) {
+            encoded.push(b'\n');
+            let _ = log.write_all(&encoded);
+        }
+    }
+}
+
+fn assert_medium_process(process_id: u32, label: &str) {
+    let security = inspect_windows_process_security(process_id)
+        .unwrap_or_else(|error| panic!("inspect {label} security: {error}"));
+    record_e2e_event(
+        "test",
+        "process_security_observed",
+        serde_json::json!({
+            "label": label,
+            "process_id": security.process_id,
+            "elevated": security.elevated,
+            "integrity_rid": security.integrity_rid,
+        }),
+    );
+    assert!(
+        !security.elevated && security.is_medium_integrity(),
+        "{label} must remain non-elevated medium integrity: {security:?}"
+    );
+}
+
+fn assert_non_elevated_process_at_or_below_medium(process_id: u32, label: &str) {
+    let security = inspect_windows_process_security(process_id)
+        .unwrap_or_else(|error| panic!("inspect {label} security: {error}"));
+    record_e2e_event(
+        "test",
+        "process_security_observed",
+        serde_json::json!({
+            "label": label,
+            "process_id": security.process_id,
+            "elevated": security.elevated,
+            "integrity_rid": security.integrity_rid,
+        }),
+    );
+    assert!(
+        !security.elevated && !security.is_high_integrity(),
+        "{label} must remain non-elevated at or below medium integrity: {security:?}"
+    );
 }
 
 #[link(name = "kernel32")]
@@ -222,10 +553,92 @@ fn process_image_path(process_id: u32) -> Result<String, String> {
     Ok(String::from_utf16_lossy(&path))
 }
 
+fn live_processes_with_images_under(root: &Path) -> Vec<serde_json::Value> {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let root = normalized_windows_path(root.to_string_lossy())
+        .trim_end_matches('\\')
+        .to_owned();
+    let prefix = format!("{root}\\");
+    let Ok(entries) = process_snapshot() else {
+        return Vec::new();
+    };
+    entries
+        .into_iter()
+        .filter_map(|entry| {
+            let image_path = process_image_path(entry.process_id).ok()?;
+            let normalized = normalized_windows_path(&image_path);
+            (normalized == root || normalized.starts_with(&prefix)).then(|| {
+                serde_json::json!({
+                    "process_id": entry.process_id,
+                    "parent_process_id": entry.parent_process_id,
+                    "executable": entry.executable,
+                    "image_path": image_path,
+                })
+            })
+        })
+        .collect()
+}
+
+async fn remove_runtime_mirror_with_evidence(
+    mirror: WindowsBrowserRuntimeMirror,
+    context: &str,
+) -> Result<(), String> {
+    const MAX_WAIT: Duration = Duration::from_secs(15);
+
+    let root = mirror.root().to_path_buf();
+    let started = Instant::now();
+    record_e2e_event(
+        "runtime-mirror",
+        "removal_started",
+        serde_json::json!({
+            "context": context,
+            "root": root,
+            "max_wait_ms": MAX_WAIT.as_millis() as u64,
+        }),
+    );
+    match mirror.remove_with_retry(MAX_WAIT).await {
+        Ok(report) => {
+            record_e2e_event(
+                "runtime-mirror",
+                "removal_finished",
+                serde_json::json!({
+                    "context": context,
+                    "root": root,
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                    "attempts": report.attempts,
+                    "retry_wait_ms": report.waited.as_millis() as u64,
+                }),
+            );
+            Ok(())
+        }
+        Err(error) => {
+            record_e2e_event(
+                "runtime-mirror",
+                "removal_failed",
+                serde_json::json!({
+                    "context": context,
+                    "root": root,
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                    "error": error.to_string(),
+                    "live_runtime_processes": live_processes_with_images_under(&root),
+                }),
+            );
+            Err(error.to_string())
+        }
+    }
+}
+
 fn chromium_root_process_image_path(
     station_process_id: u32,
     runtime_name: &str,
 ) -> PathBuf {
+    chromium_root_process(station_process_id, runtime_name).1
+}
+
+fn chromium_root_process(
+    station_process_id: u32,
+    runtime_name: &str,
+) -> (u32, PathBuf) {
     let browser_executable = match runtime_name {
         "chrome" => "chrome.exe",
         "edge" => "msedge.exe",
@@ -260,10 +673,11 @@ fn chromium_root_process_image_path(
         1,
         "station must have one exact {browser_executable} root"
     );
-    PathBuf::from(
-        process_image_path(roots[0].process_id)
-            .expect("read station browser root image path"),
-    )
+    let process_id = roots[0].process_id;
+    let image_path = PathBuf::from(
+        process_image_path(process_id).expect("read station browser root image path"),
+    );
+    (process_id, image_path)
 }
 
 fn current_process_identity(process_id: u32) -> Option<ProcessIdentity> {
@@ -1434,16 +1848,202 @@ async fn stationd_chrome_spki_certificate_exception_reaches_https_through_owned_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires an elevated test process, installed Chrome, and --features containment-test-hooks; proves IPv4/IPv6 STUN UDP and direct HTTP TCP"]
+#[ignore = "requires a medium-integrity test process, UAC for the WFP broker, installed Chrome, and --features containment-test-hooks"]
 async fn stationd_chrome_wfp_app_id_allows_only_exact_proxy_and_blocks_direct_egress_e2e() {
     let _serial = e2e_serial_guard().await;
+    let run = WfpE2eRun::start(
+        "stationd_chrome_wfp_app_id_allows_only_exact_proxy_and_blocks_direct_egress_e2e",
+    );
+    run.install_panic_log();
     run_wfp_app_id_containment_e2e("chrome", RuntimeKind::Chrome).await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires installed Chrome; proves the real runtime tree can be mirrored and removed without UAC or browser launch"]
+async fn chrome_runtime_mirror_materializes_and_removes_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let run = WfpE2eRun::start(
+        "chrome_runtime_mirror_materializes_and_removes_e2e",
+    );
+    run.install_panic_log();
+    let unique = uuid::Uuid::new_v4();
+    let profiles = e2e_temp_base().join(format!(
+        "dig2browser-runtime-mirror-chrome-{unique}"
+    ));
+    std::fs::create_dir_all(&profiles).expect("create runtime-mirror E2E profiles root");
+    let prepared = prepare_webrtc_runtime("chrome", RuntimeKind::Chrome);
+    let source = BrowserBinary {
+        path: prepared.original_browser_path.clone(),
+        kind: BrowserKind::Chrome,
+    };
+    run.event(
+        "test",
+        "runtime_mirror_materialization_started",
+        serde_json::json!({
+            "source": source.path,
+            "catalog": prepared.mirror_catalog,
+            "catalog_entries_before": prepared.mirror_entries_before.len(),
+        }),
+    );
+    let mirror = WindowsBrowserRuntimeMirror::materialize(&source, &profiles)
+        .unwrap_or_else(|error| {
+            run.event(
+                "test",
+                "runtime_mirror_materialization_failed",
+                serde_json::json!({ "error": error.to_string() }),
+            );
+            panic!("materialize real Chrome runtime mirror: {error}");
+        });
+    let mirror_root = mirror.root().to_path_buf();
+    let source_identity = file_identity_and_size(&source.path);
+    let mirror_identity = file_identity_and_size(&mirror.browser_binary().path);
+    run.event(
+        "test",
+        "runtime_mirror_materialized",
+        serde_json::json!({
+            "mirror_root": mirror_root,
+            "source_file_id": source_identity.1,
+            "mirror_file_id": mirror_identity.1,
+            "source_bytes": source_identity.2,
+            "mirror_bytes": mirror_identity.2,
+            "mode": if source_identity.0 == mirror_identity.0
+                && source_identity.1 == mirror_identity.1
+            {
+                "hard_link"
+            } else {
+                "copy"
+            },
+        }),
+    );
+    mirror
+        .remove()
+        .expect("remove real Chrome runtime mirror");
+    assert!(!mirror_root.exists(), "removed runtime mirror still exists");
+    // The catalog is the shared, station-owned `%LOCALAPPDATA%` directory
+    // (`runtime_mirror_catalog()` cannot be relocated to an isolated per-run
+    // temp dir; see `ensure_mirror_base`/`existing_mirror_base` in
+    // `dig2browser/src/windows_runtime_mirror.rs`), so it may already carry
+    // foreign entries left by other runs. Assert only that this test did not
+    // leave a new entry behind, ignoring whatever pre-existed the baseline.
+    let mirror_entries_after = directory_entry_names(&prepared.mirror_catalog);
+    assert!(
+        mirror_entries_after.is_subset(&prepared.mirror_entries_before),
+        "runtime-mirror E2E left a newly-created runtime mirror or staging directory behind: before={:?}, after={mirror_entries_after:?}",
+        prepared.mirror_entries_before,
+    );
+    remove_tree(&profiles).await;
+    run.event(
+        "test",
+        "runtime_mirror_removed",
+        serde_json::json!({ "mirror_root": mirror_root }),
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires installed Edge; proves the copied real runtime can reach a controlled direct TCP fixture without WFP or UAC"]
+async fn edge_runtime_mirror_reaches_direct_tcp_fixture_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let run = WfpE2eRun::start(
+        "edge_runtime_mirror_reaches_direct_tcp_fixture_e2e",
+    );
+    run.install_panic_log();
+    let unique = uuid::Uuid::new_v4();
+    let profiles = e2e_temp_base().join(format!(
+        "dig2browser-runtime-mirror-edge-{unique}"
+    ));
+    std::fs::create_dir_all(&profiles).expect("create Edge runtime-mirror E2E profiles root");
+    let prepared = prepare_webrtc_runtime("edge", RuntimeKind::Edge);
+    let source = BrowserBinary {
+        path: prepared.original_browser_path.clone(),
+        kind: BrowserKind::Edge,
+    };
+    let materialization_started = Instant::now();
+    run.event(
+        "test",
+        "runtime_mirror_materialization_started",
+        serde_json::json!({
+            "source": source.path,
+            "catalog": prepared.mirror_catalog,
+            "catalog_entries_before": prepared.mirror_entries_before.len(),
+        }),
+    );
+    let mirror = WindowsBrowserRuntimeMirror::materialize(&source, &profiles)
+        .unwrap_or_else(|error| {
+            run.event(
+                "test",
+                "runtime_mirror_materialization_failed",
+                serde_json::json!({
+                    "elapsed_ms": materialization_started.elapsed().as_millis() as u64,
+                    "error": error.to_string(),
+                }),
+            );
+            panic!("materialize real Edge runtime mirror: {error}");
+        });
+    let mirror_root = mirror.root().to_path_buf();
+    let source_identity = file_identity_and_size(&source.path);
+    let mirror_identity = file_identity_and_size(&mirror.browser_binary().path);
+    run.event(
+        "test",
+        "runtime_mirror_materialized",
+        serde_json::json!({
+            "elapsed_ms": materialization_started.elapsed().as_millis() as u64,
+            "mirror_root": mirror_root,
+            "source_file_id": source_identity.1,
+            "mirror_file_id": mirror_identity.1,
+            "source_bytes": source_identity.2,
+            "mirror_bytes": mirror_identity.2,
+            "mode": if source_identity.0 == mirror_identity.0
+                && source_identity.1 == mirror_identity.1
+            {
+                "hard_link"
+            } else {
+                "copy"
+            },
+        }),
+    );
+    let origin = ControlledOrigin::direct_tcp_probe();
+    let context = "uncontained runtime-mirror edge";
+    let observation = run_owned_browser_direct_tcp_probe(
+        RuntimeKind::Edge,
+        mirror.browser_binary().path.clone(),
+        &origin,
+        context,
+    )
+    .await;
+    drop(origin);
+    remove_runtime_mirror_with_evidence(
+        mirror,
+        "remove real Edge runtime mirror after direct TCP probe",
+    )
+    .await
+    .unwrap_or_else(|error| panic!("remove real Edge runtime mirror: {error}"));
+    assert!(!mirror_root.exists(), "removed Edge runtime mirror still exists");
+    // Same shared-catalog caveat as the Chrome runtime-mirror E2E above:
+    // assert no new entry survives this test, ignoring foreign pre-existing
+    // entries in the shared `%LOCALAPPDATA%` catalog.
+    let mirror_entries_after = directory_entry_names(&prepared.mirror_catalog);
+    assert!(
+        mirror_entries_after.is_subset(&prepared.mirror_entries_before),
+        "Edge runtime-mirror E2E left a newly-created runtime mirror or staging directory behind: before={:?}, after={mirror_entries_after:?}",
+        prepared.mirror_entries_before,
+    );
+    remove_tree(&profiles).await;
+    run.event(
+        "test",
+        "runtime_mirror_removed",
+        serde_json::json!({ "mirror_root": mirror_root }),
+    );
+    assert_direct_tcp_probe_observation(observation, true, context);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires an elevated test process, installed Edge, and --features containment-test-hooks; proves IPv4/IPv6 STUN UDP and direct HTTP TCP"]
+#[ignore = "requires a medium-integrity test process, UAC for the WFP broker, installed Edge, and --features containment-test-hooks"]
 async fn stationd_edge_wfp_app_id_allows_only_exact_proxy_and_blocks_direct_egress_e2e() {
     let _serial = e2e_serial_guard().await;
+    let run = WfpE2eRun::start(
+        "stationd_edge_wfp_app_id_allows_only_exact_proxy_and_blocks_direct_egress_e2e",
+    );
+    run.install_panic_log();
     run_wfp_app_id_containment_e2e("edge", RuntimeKind::Edge).await;
 }
 
@@ -1451,6 +2051,10 @@ async fn stationd_edge_wfp_app_id_allows_only_exact_proxy_and_blocks_direct_egre
 #[ignore = "requires installed Chrome and --features containment-test-hooks; proves IPv4/IPv6 STUN UDP and direct HTTP TCP positive controls"]
 async fn stationd_chrome_direct_egress_positive_control_e2e() {
     let _serial = e2e_serial_guard().await;
+    let run = WfpE2eRun::start(
+        "stationd_chrome_direct_egress_positive_control_e2e",
+    );
+    run.install_panic_log();
     run_direct_stun_positive_control_only_e2e("chrome", RuntimeKind::Chrome).await;
 }
 
@@ -1458,13 +2062,21 @@ async fn stationd_chrome_direct_egress_positive_control_e2e() {
 #[ignore = "requires installed Edge and --features containment-test-hooks; proves IPv4/IPv6 STUN UDP and direct HTTP TCP positive controls"]
 async fn stationd_edge_direct_egress_positive_control_e2e() {
     let _serial = e2e_serial_guard().await;
+    let run = WfpE2eRun::start(
+        "stationd_edge_direct_egress_positive_control_e2e",
+    );
+    run.install_panic_log();
     run_direct_stun_positive_control_only_e2e("edge", RuntimeKind::Edge).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires an elevated test process, installed Chrome, and --features containment-test-hooks; kills a test-owned WFP broker"]
+#[ignore = "requires a medium-integrity test process, UAC for the WFP broker, installed Chrome, and --features containment-test-hooks"]
 async fn stationd_chrome_wfp_broker_crash_is_fail_closed_and_reconciles_e2e() {
     let _serial = e2e_serial_guard().await;
+    let run = WfpE2eRun::start(
+        "stationd_chrome_wfp_broker_crash_is_fail_closed_and_reconciles_e2e",
+    );
+    run.install_panic_log();
     assert_containment_test_hooks_enabled();
     let runtime_name = "chrome";
     let runtime_kind = RuntimeKind::Chrome;
@@ -1507,7 +2119,12 @@ async fn stationd_chrome_wfp_broker_crash_is_fail_closed_and_reconciles_e2e() {
         first_broker_capability,
     )
     .await;
-    let first_broker_pid = first_broker.id().expect("first WFP broker remains live");
+    let first_broker_pid = first_broker.id();
+    assert!(
+        first_broker.security().elevated
+            && first_broker.security().is_high_integrity(),
+        "WFP broker must be the only elevated high-integrity process"
+    );
     let mut first_daemon = spawn_webrtc_stationd(
         &first_station_pipe,
         &profiles,
@@ -1518,6 +2135,7 @@ async fn stationd_chrome_wfp_broker_crash_is_fail_closed_and_reconciles_e2e() {
             broker_pipe_name: Some(&first_broker_pipe),
             broker_capability: Some(first_station_capability),
             command_timeout_seconds: 60,
+            close_timeout_seconds: None,
             test_close_delay_millis: None,
         },
     )
@@ -1559,14 +2177,15 @@ async fn stationd_chrome_wfp_broker_crash_is_fail_closed_and_reconciles_e2e() {
         first_station_pid,
         runtime_name,
     );
-    assert_owned_browser_direct_tcp_probe(
+    let direct_probe_context = format!("WFP-contained {runtime_name}");
+    let direct_probe = run_owned_browser_direct_tcp_probe(
         runtime_kind,
         mirror_browser_path,
         &direct_tcp,
-        false,
-        &format!("WFP-contained {runtime_name}"),
+        &direct_probe_context,
     )
     .await;
+    assert_direct_tcp_probe_observation(direct_probe, false, &direct_probe_context);
     let first_browser_processes =
         chromium_browser_descendant_process_identities(first_station_pid, runtime_name).await;
     assert_eq!(
@@ -1585,15 +2204,19 @@ async fn stationd_chrome_wfp_broker_crash_is_fail_closed_and_reconciles_e2e() {
         "first contained browser emitted TURN/TCP before broker crash"
     );
 
-    first_broker
-        .kill()
+    let first_broker_exit = first_broker
+        .request_crash()
         .await
-        .expect("kill test-owned first WFP broker");
-    let first_broker_status = first_broker
-        .wait()
-        .await
-        .expect("wait for killed first WFP broker");
-    assert!(!first_broker_status.success(), "killed broker exited successfully");
+        .expect("request test-owned broker self-termination");
+    assert_eq!(
+        first_broker_exit.exit_code,
+        WFP_BROKER_CRASH_EXIT_CODE,
+        "crash-controlled broker exited with an unexpected code"
+    );
+    assert!(
+        first_broker_exit.outcome.is_none(),
+        "crash-controlled broker emitted a clean outcome"
+    );
     assert_containment_lost_exit(&mut first_daemon).await;
     drop(first_client);
     assert_processes_exit(
@@ -1639,7 +2262,7 @@ async fn stationd_chrome_wfp_broker_crash_is_fail_closed_and_reconciles_e2e() {
     )
     .await;
     assert_ne!(
-        successor_broker.id().expect("successor WFP broker remains live"),
+        successor_broker.id(),
         first_broker_pid,
         "successor broker unexpectedly reused the killed broker PID"
     );
@@ -1653,6 +2276,7 @@ async fn stationd_chrome_wfp_broker_crash_is_fail_closed_and_reconciles_e2e() {
             broker_pipe_name: Some(&successor_broker_pipe),
             broker_capability: Some(successor_station_capability),
             command_timeout_seconds: 60,
+            close_timeout_seconds: None,
             test_close_delay_millis: None,
         },
     )
@@ -1708,10 +2332,23 @@ async fn stationd_chrome_wfp_broker_crash_is_fail_closed_and_reconciles_e2e() {
     drop(successor_client);
     assert_webrtc_clean_exit(&mut successor_daemon, true).await;
     assert_wfp_broker_clean_exit(&mut successor_broker).await;
-    assert_eq!(
-        directory_entry_names(&prepared.mirror_catalog),
-        prepared.mirror_entries_before,
-        "clean successor close did not remove the reconciled runtime mirror"
+    // The catalog is the shared, station-owned `%LOCALAPPDATA%` directory
+    // (see `runtime_mirror_catalog()` / `ensure_mirror_base` — it cannot be
+    // relocated to an isolated per-run temp dir), so a full baseline-equality
+    // assert is fragile against unrelated concurrent or historical entries.
+    // Assert by name instead: both of this test's own mirrors (the crashed
+    // first station's and the reconciled successor's) must be gone, ignoring
+    // any foreign entries already in, or added to, the shared catalog.
+    let successor_cleanup_entries = directory_entry_names(&prepared.mirror_catalog);
+    assert!(
+        !successor_cleanup_entries.contains(&created_mirrors[0]),
+        "clean successor close left the crashed first station's runtime mirror behind: {}",
+        created_mirrors[0]
+    );
+    assert!(
+        !successor_cleanup_entries.contains(&successor_created_mirrors[0]),
+        "clean successor close did not remove the reconciled runtime mirror: {}",
+        successor_created_mirrors[0]
     );
     let released_profiles = ProfilesRootOwnership::acquire(&successor_profiles)
         .expect("clean successor releases profiles-root ownership");
@@ -1728,9 +2365,13 @@ async fn stationd_chrome_wfp_broker_crash_is_fail_closed_and_reconciles_e2e() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires an elevated test process, installed Chrome, and --features containment-test-hooks; forces a contained worker close timeout"]
+#[ignore = "requires a medium-integrity test process, UAC for the WFP broker, installed Chrome, and --features containment-test-hooks"]
 async fn stationd_chrome_worker_close_timeout_retains_wfp_until_process_tree_exit_e2e() {
     let _serial = e2e_serial_guard().await;
+    let run = WfpE2eRun::start(
+        "stationd_chrome_worker_close_timeout_retains_wfp_until_process_tree_exit_e2e",
+    );
+    run.install_panic_log();
     assert_containment_test_hooks_enabled();
     let unique = uuid::Uuid::new_v4();
     let profiles = e2e_temp_base().join(format!(
@@ -1780,7 +2421,13 @@ async fn stationd_chrome_worker_close_timeout_retains_wfp_until_process_tree_exi
         WebRtcStationOptions {
             broker_pipe_name: Some(&broker_pipe),
             broker_capability: Some(station_capability),
-            command_timeout_seconds: 1,
+            // Step-0 setup (assert_webrtc_probe_completes: navigate + ICE +
+            // capture) needs more than 1s, so command_timeout must cover
+            // it; the worker close/teardown budget is bounded separately
+            // (well under the injected 30s close delay) so this test still
+            // proves WFP retention on a slow close.
+            command_timeout_seconds: 60,
+            close_timeout_seconds: Some(1),
             test_close_delay_millis: Some(30_000),
         },
     )
@@ -1869,6 +2516,7 @@ async fn stationd_chrome_worker_close_timeout_retains_wfp_until_process_tree_exi
             broker_pipe_name: Some(&successor_broker_pipe),
             broker_capability: Some(successor_station_capability),
             command_timeout_seconds: 60,
+            close_timeout_seconds: None,
             test_close_delay_millis: None,
         },
     )
@@ -1882,6 +2530,22 @@ async fn stationd_chrome_worker_close_timeout_retains_wfp_until_process_tree_exi
         "chrome",
     )
     .await;
+    // Capture the successor's own new mirror by name (diffed against the
+    // catalog snapshot taken right after the primary daemon's probe) before
+    // its reconciliation and later cleanup can remove it, so the final
+    // assert below can check for it by name rather than by full-catalog
+    // equality.
+    let successor_active_entries = directory_entry_names(&prepared.mirror_catalog);
+    let successor_active_mirrors = successor_active_entries
+        .difference(&active_entries)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        successor_active_mirrors.len(),
+        1,
+        "unexpected successor active mirrors: {successor_active_mirrors:?}"
+    );
+    let successor_mirror_name = successor_active_mirrors[0].clone();
     assert!(
         !old_mirror_root.exists(),
         "successor reconciliation retained the dead unreferenced mirror"
@@ -1893,10 +2557,26 @@ async fn stationd_chrome_worker_close_timeout_retains_wfp_until_process_tree_exi
     drop(successor_client);
     assert_webrtc_clean_exit(&mut successor_daemon, true).await;
     assert_wfp_broker_clean_exit(&mut successor_broker).await;
-    assert_eq!(
-        directory_entry_names(&prepared.mirror_catalog),
-        prepared.mirror_entries_before,
-        "successor cleanup did not restore the mirror catalog baseline"
+    // The catalog is the shared, station-owned `%LOCALAPPDATA%` directory
+    // (`runtime_mirror_catalog()` cannot be relocated to an isolated per-run
+    // temp dir; see `ensure_mirror_base`/`existing_mirror_base` in
+    // `dig2browser/src/windows_runtime_mirror.rs`), so other runs' entries
+    // (including hours-old orphaned `.staging-*` dirs, or mirrors from
+    // completely unrelated concurrent station activity) can already be
+    // present in, or appear in, the baseline. A full-catalog equality assert
+    // against that shared baseline is therefore fragile. Instead assert by
+    // name that both of this test's own daemon mirrors (the retained primary
+    // mirror and the successor's reconciled mirror) are gone, ignoring any
+    // foreign entries.
+    let successor_cleanup_entries = directory_entry_names(&prepared.mirror_catalog);
+    assert!(
+        !successor_cleanup_entries.contains(&active_mirrors[0]),
+        "successor cleanup left the primary station's retained runtime mirror behind: {}",
+        active_mirrors[0]
+    );
+    assert!(
+        !successor_cleanup_entries.contains(&successor_mirror_name),
+        "successor cleanup did not remove its own runtime mirror: {successor_mirror_name}"
     );
 
     drop(origin);
@@ -1965,6 +2645,23 @@ fn browser_binary_kind(runtime_kind: RuntimeKind) -> BrowserKind {
     }
 }
 
+fn file_identity_and_size(path: &Path) -> (u32, u64, u64) {
+    let file = File::open(path)
+        .unwrap_or_else(|error| panic!("open '{}' for file identity: {error}", path.display()));
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe {
+        GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut information)
+            .unwrap_or_else(|error| {
+                panic!("read '{}' file identity: {error}", path.display())
+            });
+    }
+    let file_index = ((information.nFileIndexHigh as u64) << 32)
+        | information.nFileIndexLow as u64;
+    let file_size = ((information.nFileSizeHigh as u64) << 32)
+        | information.nFileSizeLow as u64;
+    (information.dwVolumeSerialNumber, file_index, file_size)
+}
+
 fn browser_preference(runtime_kind: RuntimeKind) -> BrowserPreference {
     match runtime_kind {
         RuntimeKind::Chrome => BrowserPreference::ChromeOnly,
@@ -1973,52 +2670,193 @@ fn browser_preference(runtime_kind: RuntimeKind) -> BrowserPreference {
     }
 }
 
-async fn assert_owned_browser_direct_tcp_probe(
-    runtime_kind: RuntimeKind,
-    binary_path: PathBuf,
-    origin: &ControlledOrigin,
+struct DirectTcpProbeObservation {
+    navigation_succeeded: bool,
+    reached: bool,
+    navigation_detail: String,
+}
+
+fn assert_direct_tcp_probe_observation(
+    observation: Result<DirectTcpProbeObservation, String>,
     expected_reachable: bool,
     context: &str,
 ) {
+    let observation = observation.unwrap_or_else(|error| panic!("{context}: {error}"));
+    if expected_reachable {
+        assert!(
+            observation.navigation_succeeded && observation.reached,
+            "{context}: exact browser binary did not reach the direct TCP fixture: {}",
+            observation.navigation_detail
+        );
+    } else {
+        assert!(
+            !observation.reached,
+            "{context}: contained exact browser binary reached the direct TCP fixture: {}",
+            observation.navigation_detail
+        );
+    }
+}
+
+async fn run_owned_browser_direct_tcp_probe(
+    runtime_kind: RuntimeKind,
+    binary_path: PathBuf,
+    origin: &ControlledOrigin,
+    context: &str,
+) -> Result<DirectTcpProbeObservation, String> {
+    let runtime_root = binary_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .to_path_buf();
+    let component = format!(
+        "direct-tcp-probe-{:?}-{}",
+        runtime_kind,
+        uuid::Uuid::new_v4().simple()
+    );
+    let browser_stderr_log = e2e_component_path(&component, "browser-stderr");
+    let browser_lifecycle_log = e2e_component_artifact_path(&component, "lifecycle.jsonl");
+    let browser_net_log = matches!(
+        std::env::var("DIG2BROWSER_E2E_NETLOG"),
+        Ok(value) if value == "1"
+    )
+    .then(|| e2e_component_artifact_path(&component, "netlog.json"));
+    let requested_url = origin.url("/direct-tcp-probe");
+    File::create(&browser_stderr_log)
+        .expect("create direct TCP probe browser stderr log");
+    File::create(&browser_lifecycle_log)
+        .expect("create direct TCP probe browser lifecycle log");
+    let _browser_stderr = ScopedEnvironmentVariable::set(
+        "DIG2BROWSER_BROWSER_STDERR_LOG",
+        &browser_stderr_log,
+    );
+    let _browser_lifecycle = ScopedEnvironmentVariable::set(
+        "DIG2BROWSER_BROWSER_LIFECYCLE_LOG",
+        &browser_lifecycle_log,
+    );
+    record_e2e_event(
+        &component,
+        "browser_probe_started",
+        serde_json::json!({
+            "binary_path": binary_path,
+            "browser_stderr_log": browser_stderr_log,
+            "browser_lifecycle_log": browser_lifecycle_log,
+            "browser_net_log": browser_net_log.as_ref(),
+            "context": context,
+            "requested_url": requested_url,
+        }),
+    );
+    let mut extra_args = vec![
+        "--enable-logging=stderr".to_owned(),
+        "--v=1".to_owned(),
+    ];
+    if let Some(browser_net_log) = browser_net_log.as_ref() {
+        extra_args.push(format!("--log-net-log={}", browser_net_log.display()));
+        extra_args.push("--net-log-capture-mode=Everything".to_owned());
+    }
     let launch = LaunchConfig {
         browser_pref: browser_preference(runtime_kind),
         browser_proxy: Some(dig2browser::BrowserProxy::Direct),
+        extra_args,
         ..LaunchConfig::default()
     };
     let isolation = BrowserProcessIsolation::WindowsRuntimeMirror(BrowserBinary {
         path: binary_path,
         kind: browser_binary_kind(runtime_kind),
     });
-    let browser = StealthBrowser::launch_with_process_isolation(
+    let launch_started = Instant::now();
+    let browser = match StealthBrowser::launch_with_process_isolation(
         launch,
         StealthConfig::default(),
         isolation,
     )
-    .await
-    .unwrap_or_else(|error| panic!("{context}: launch direct TCP probe browser: {error}"));
+    .await {
+        Ok(browser) => browser,
+        Err(error) => {
+            record_e2e_event(
+                &component,
+                "browser_probe_launch_failed",
+                serde_json::json!({
+                    "elapsed_ms": launch_started.elapsed().as_millis() as u64,
+                    "error": error.to_string(),
+                }),
+            );
+            return Err(format!("launch direct TCP probe browser: {error}"));
+        }
+    };
+    record_e2e_event(
+        &component,
+        "browser_probe_launched",
+        serde_json::json!({
+            "elapsed_ms": launch_started.elapsed().as_millis() as u64,
+        }),
+    );
     let baseline = origin.path_count("/direct-tcp-probe");
+    let navigation_started = Instant::now();
+    record_e2e_event(
+        &component,
+        "browser_probe_navigation_started",
+        serde_json::json!({
+            "baseline_requests": baseline,
+            "requested_url": requested_url,
+        }),
+    );
     let navigation = tokio::time::timeout(
         Duration::from_secs(10),
-        browser.new_page(&origin.url("/direct-tcp-probe")),
+        browser.new_page(&requested_url),
     )
     .await;
     let reached = origin.path_count("/direct-tcp-probe") > baseline;
-    if expected_reachable {
-        assert!(
-            matches!(navigation, Ok(Ok(_))) && reached,
-            "{context}: exact browser binary did not reach the direct TCP fixture"
-        );
-    } else {
-        assert!(
-            !reached,
-            "{context}: contained exact browser binary reached the direct TCP fixture"
-        );
-    }
+    let (navigation_succeeded, navigation_detail) = match &navigation {
+        Ok(Ok(_)) => (true, "completed".to_owned()),
+        Ok(Err(error)) => (false, format!("failed: {error}")),
+        Err(error) => (false, format!("timed out: {error}")),
+    };
+    record_e2e_event(
+        &component,
+        "browser_probe_navigation_finished",
+        serde_json::json!({
+            "baseline_requests": baseline,
+            "final_requests": origin.path_count("/direct-tcp-probe"),
+            "elapsed_ms": navigation_started.elapsed().as_millis() as u64,
+            "navigation": navigation_detail,
+            "reached": reached,
+        }),
+    );
     drop(navigation);
-    browser
-        .close()
-        .await
-        .unwrap_or_else(|error| panic!("{context}: close direct TCP probe browser: {error}"));
+    let close_started = Instant::now();
+    record_e2e_event(
+        &component,
+        "browser_probe_close_started",
+        serde_json::json!({}),
+    );
+    if let Err(error) = browser.close().await {
+        let live_runtime_processes = live_processes_with_images_under(&runtime_root);
+        record_e2e_event(
+            &component,
+            "browser_probe_close_failed",
+            serde_json::json!({
+                "elapsed_ms": close_started.elapsed().as_millis() as u64,
+                "error": error.to_string(),
+                "runtime_root": runtime_root,
+                "live_runtime_processes": live_runtime_processes,
+            }),
+        );
+        return Err(format!("close direct TCP probe browser: {error}"));
+    }
+    let live_runtime_processes = live_processes_with_images_under(&runtime_root);
+    record_e2e_event(
+        &component,
+        "browser_probe_closed",
+        serde_json::json!({
+            "elapsed_ms": close_started.elapsed().as_millis() as u64,
+            "runtime_root": runtime_root,
+            "live_runtime_processes": live_runtime_processes,
+        }),
+    );
+    Ok(DirectTcpProbeObservation {
+        navigation_succeeded,
+        reached,
+        navigation_detail,
+    })
 }
 
 async fn run_direct_stun_positive_control_only_e2e(
@@ -2047,10 +2885,14 @@ async fn run_direct_stun_positive_control_only_e2e(
     )
     .await;
 
-    assert_eq!(
-        directory_entry_names(&prepared.mirror_catalog),
+    // Same shared-catalog caveat as the runtime-mirror E2Es above: the
+    // catalog is a station-owned `%LOCALAPPDATA%` directory shared across
+    // runs, so only assert this run did not add a new entry.
+    let mirror_entries_after = directory_entry_names(&prepared.mirror_catalog);
+    assert!(
+        mirror_entries_after.is_subset(&prepared.mirror_entries_before),
+        "positive control unexpectedly created a runtime mirror: before={:?}, after={mirror_entries_after:?}",
         prepared.mirror_entries_before,
-        "positive control unexpectedly created a runtime mirror"
     );
     remove_tree(&profiles).await;
     remove_tree(&traces).await;
@@ -2061,6 +2903,11 @@ async fn run_wfp_app_id_containment_e2e(
     runtime_kind: RuntimeKind,
 ) {
     assert_containment_test_hooks_enabled();
+    record_e2e_event(
+        "test",
+        "runtime_preparation_started",
+        serde_json::json!({ "runtime": runtime_name }),
+    );
     let unique = uuid::Uuid::new_v4();
     let broker_pipe_name = format!("dig2browser-wfp-e2e-{runtime_name}-{unique}");
     let profiles = e2e_temp_base().join(format!(
@@ -2072,7 +2919,21 @@ async fn run_wfp_app_id_containment_e2e(
     std::fs::create_dir_all(&profiles).expect("create WebRTC profiles root");
     std::fs::create_dir_all(&traces).expect("create WebRTC trace root");
     let prepared = prepare_webrtc_runtime(runtime_name, runtime_kind);
+    record_e2e_event(
+        "test",
+        "runtime_prepared",
+        serde_json::json!({
+            "runtime": runtime_name,
+            "browser_path": prepared.original_browser_path,
+            "mirror_catalog": prepared.mirror_catalog,
+        }),
+    );
 
+    record_e2e_event(
+        "test",
+        "direct_positive_control_started",
+        serde_json::json!({ "runtime": runtime_name }),
+    );
     run_direct_egress_positive_control(
         runtime_name,
         runtime_kind,
@@ -2082,15 +2943,83 @@ async fn run_wfp_app_id_containment_e2e(
         &prepared,
     )
     .await;
+    record_e2e_event(
+        "test",
+        "direct_positive_control_passed",
+        serde_json::json!({ "runtime": runtime_name }),
+    );
+
+    let source = BrowserBinary {
+        path: prepared.original_browser_path.clone(),
+        kind: browser_binary_kind(runtime_kind),
+    };
+    let mirror = WindowsBrowserRuntimeMirror::materialize(&source, &profiles)
+        .expect("materialize runtime-mirror positive control");
+    let mirror_root = mirror.root().to_path_buf();
+    let source_identity = file_identity_and_size(&source.path);
+    let mirror_identity = file_identity_and_size(&mirror.browser_binary().path);
+    let same_file_identity = source_identity.0 == mirror_identity.0
+        && source_identity.1 == mirror_identity.1;
+    record_e2e_event(
+        "test",
+        "runtime_mirror_materialized",
+        serde_json::json!({
+            "runtime": runtime_name,
+            "mode": if same_file_identity { "hard_link" } else { "copy" },
+            "source_bytes": source_identity.2,
+            "mirror_bytes": mirror_identity.2,
+        }),
+    );
+    let mirror_probe = ControlledOrigin::direct_tcp_probe();
+    let mirror_probe_context = format!("uncontained runtime-mirror {runtime_name}");
+    let mirror_probe_observation = run_owned_browser_direct_tcp_probe(
+        runtime_kind,
+        mirror.browser_binary().path.clone(),
+        &mirror_probe,
+        &mirror_probe_context,
+    )
+    .await;
+    drop(mirror_probe);
+    remove_runtime_mirror_with_evidence(mirror, "remove runtime-mirror positive control")
+        .await
+        .unwrap_or_else(|error| panic!("remove runtime-mirror positive control: {error}"));
+    assert!(
+        !mirror_root.exists(),
+        "runtime-mirror positive control survived explicit removal"
+    );
+    assert_direct_tcp_probe_observation(
+        mirror_probe_observation,
+        true,
+        &mirror_probe_context,
+    );
+    record_e2e_event(
+        "test",
+        "runtime_mirror_positive_control_passed",
+        serde_json::json!({ "runtime": runtime_name }),
+    );
 
     let (broker_capability, station_capability) =
         WindowsWfpBrokerCapability::generate_pair();
+    record_e2e_event(
+        "test",
+        "broker_launch_started",
+        serde_json::json!({ "runtime": runtime_name }),
+    );
     let mut broker = spawn_wfp_broker(
         &broker_pipe_name,
         &prepared.mirror_catalog,
         broker_capability,
     )
     .await;
+    record_e2e_event(
+        "test",
+        "broker_launch_passed",
+        serde_json::json!({
+            "process_id": broker.id(),
+            "integrity_rid": broker.security().integrity_rid,
+            "elevated": broker.security().elevated,
+        }),
+    );
 
     let udp_ipv4 = ControlledUdpReceiver::start_ipv4();
     let udp_ipv6 = ControlledUdpReceiver::start_ipv6();
@@ -2116,12 +3045,32 @@ async fn run_wfp_app_id_containment_e2e(
             broker_pipe_name: Some(&broker_pipe_name),
             broker_capability: Some(station_capability),
             command_timeout_seconds: 60,
+            close_timeout_seconds: None,
             test_close_delay_millis: None,
         },
     )
     .await;
-    let client = connect(&pipe_name).await;
+    let containment_startup_timeout = Duration::from_secs(180);
+    record_e2e_event(
+        "test",
+        "contained_station_connect_started",
+        serde_json::json!({
+            "runtime": runtime_name,
+            "startup_timeout_ms": containment_startup_timeout.as_millis() as u64,
+        }),
+    );
+    let client = connect_with_daemon_timeout(
+        &pipe_name,
+        &mut daemon,
+        containment_startup_timeout,
+    )
+    .await;
     let profile_id = format!("webrtc-wfp-app-id-{runtime_name}");
+    record_e2e_event(
+        "test",
+        "contained_browser_task_started",
+        serde_json::json!({ "runtime": runtime_name, "profile_id": profile_id }),
+    );
     assert_webrtc_probe_completes(
         &client,
         &profile_id,
@@ -2130,6 +3079,11 @@ async fn run_wfp_app_id_containment_e2e(
         runtime_name,
     )
     .await;
+    record_e2e_event(
+        "test",
+        "contained_browser_task_passed",
+        serde_json::json!({ "runtime": runtime_name, "profile_id": profile_id }),
+    );
 
     let mirror_entries = directory_entry_names(&prepared.mirror_catalog);
     let created_mirrors = mirror_entries
@@ -2142,26 +3096,40 @@ async fn run_wfp_app_id_containment_e2e(
         "elevated broker did not create exactly one scoped runtime mirror: {created_mirrors:?}"
     );
     let mirror_root = prepared.mirror_catalog.join(&created_mirrors[0]);
+    let station_pid = daemon
+        .id()
+        .expect("containment station process remains live");
+    assert_medium_process(station_pid, "containment station");
     assert_chromium_descendants_use_station_mirror(
-        daemon.id().expect("containment station process remains live"),
+        station_pid,
         &prepared.original_browser_path,
         &prepared.mirror_catalog,
         &mirror_root,
         runtime_name,
     )
     .await;
-    let mirror_browser_path = chromium_root_process_image_path(
-        daemon.id().expect("containment station process remains live"),
+    let (browser_root_pid, mirror_browser_path) = chromium_root_process(
+        station_pid,
         runtime_name,
     );
-    assert_owned_browser_direct_tcp_probe(
+    assert_medium_process(browser_root_pid, "contained browser root");
+    for browser in
+        chromium_browser_descendant_process_identities(station_pid, runtime_name).await
+    {
+        assert_non_elevated_process_at_or_below_medium(
+            browser.process_id,
+            "contained browser process",
+        );
+    }
+    let direct_probe_context = format!("WFP-contained {runtime_name}");
+    let direct_probe = run_owned_browser_direct_tcp_probe(
         runtime_kind,
         mirror_browser_path,
         &direct_tcp,
-        false,
-        &format!("WFP-contained {runtime_name}"),
+        &direct_probe_context,
     )
     .await;
+    assert_direct_tcp_probe_observation(direct_probe, false, &direct_probe_context);
 
     let stun_ipv4_datagrams = udp_ipv4.wait_for_stun(Duration::from_secs(5)).await;
     assert_eq!(
@@ -2178,10 +3146,19 @@ async fn run_wfp_app_id_containment_e2e(
     client.shutdown().await.expect("request clean WebRTC station shutdown");
     drop(client);
     assert_webrtc_clean_exit(&mut daemon, true).await;
-    assert_eq!(
-        directory_entry_names(&prepared.mirror_catalog),
+    let mirror_entries_after = directory_entry_names(&prepared.mirror_catalog);
+    assert!(
+        mirror_entries_after.is_subset(&prepared.mirror_entries_before),
+        "clean station shutdown left a newly-created runtime mirror or staging directory behind: before={:?}, after={mirror_entries_after:?}",
         prepared.mirror_entries_before,
-        "clean station shutdown left a runtime mirror or staging directory behind"
+    );
+    record_e2e_event(
+        "test",
+        "runtime_mirror_cleanup_passed",
+        serde_json::json!({
+            "entries_before": prepared.mirror_entries_before,
+            "entries_after": mirror_entries_after,
+        }),
     );
     let released_profiles = ProfilesRootOwnership::acquire(&profiles)
         .expect("clean WebRTC station shutdown releases profiles-root ownership");
@@ -2195,6 +3172,11 @@ async fn run_wfp_app_id_containment_e2e(
     drop(turn_tcp);
     drop(direct_tcp);
     assert_wfp_broker_clean_exit(&mut broker).await;
+    record_e2e_event(
+        "test",
+        "run_passed",
+        serde_json::json!({ "runtime": runtime_name }),
+    );
 
     remove_tree(&profiles).await;
     remove_tree(&traces).await;
@@ -2232,11 +3214,12 @@ async fn run_direct_egress_positive_control(
             broker_pipe_name: None,
             broker_capability: None,
             command_timeout_seconds: 60,
+            close_timeout_seconds: None,
             test_close_delay_millis: None,
         },
     )
     .await;
-    let client = connect(&pipe_name).await;
+    let client = connect_with_daemon(&pipe_name, &mut daemon).await;
     let profile_id = format!("webrtc-stun-positive-{runtime_name}");
     assert_webrtc_probe_completes(
         &client,
@@ -2254,14 +3237,15 @@ async fn run_direct_egress_positive_control(
         runtime_name,
     )
     .await;
-    assert_owned_browser_direct_tcp_probe(
+    let direct_probe_context = format!("uncontained {runtime_name}");
+    let direct_probe = run_owned_browser_direct_tcp_probe(
         runtime_kind,
         prepared.original_browser_path.clone(),
         &direct_tcp,
-        true,
-        &format!("uncontained {runtime_name}"),
+        &direct_probe_context,
     )
     .await;
+    assert_direct_tcp_probe_observation(direct_probe, true, &direct_probe_context);
 
     let stun_ipv4_datagrams = udp_ipv4.wait_for_stun(Duration::from_secs(5)).await;
     assert!(
@@ -2754,6 +3738,10 @@ struct WebRtcStationOptions<'a> {
     broker_pipe_name: Option<&'a str>,
     broker_capability: Option<WindowsWfpBrokerCapability>,
     command_timeout_seconds: u64,
+    /// Worker close/drain teardown budget, distinct from
+    /// `command_timeout_seconds`. `None` leaves `--close-timeout-seconds`
+    /// unset, which falls back to `command_timeout_seconds` in the daemon.
+    close_timeout_seconds: Option<u64>,
     test_close_delay_millis: Option<u64>,
 }
 
@@ -2764,11 +3752,12 @@ async fn spawn_webrtc_stationd(
     runtime: &str,
     allowed_origins: &[&str],
     options: WebRtcStationOptions<'_>,
-) -> tokio::process::Child {
+) -> LoggedStation {
     let WebRtcStationOptions {
         broker_pipe_name,
         broker_capability,
         command_timeout_seconds,
+        close_timeout_seconds,
         test_close_delay_millis,
     } = options;
     assert_eq!(
@@ -2805,6 +3794,11 @@ async fn spawn_webrtc_stationd(
     command
         .arg("--timeout-seconds")
         .arg(command_timeout_seconds.to_string());
+    if let Some(close_timeout_seconds) = close_timeout_seconds {
+        command
+            .arg("--close-timeout-seconds")
+            .arg(close_timeout_seconds.to_string());
+    }
     if let Some(delay_millis) = test_close_delay_millis {
         command
             .arg("--test-chromium-close-delay-millis")
@@ -2822,10 +3816,37 @@ async fn spawn_webrtc_stationd(
         command.args(["--allow-origin", origin]);
     }
     command.args(["--allow-private-peer", "127.0.0.1"]);
+    let component = format!("station-{pipe_name}");
+    let stdout_path = e2e_component_path(&component, "stdout");
+    let stderr_path = e2e_component_path(&component, "stderr");
+    let runtime_log = e2e_component_path(&component, "runtime");
+    let browser_stderr_log = e2e_component_path(&component, "browser-stderr");
+    let station_diagnostic_log = e2e_component_path(&component, "diagnostic");
+    let stdout = File::create(&stdout_path).expect("create station stdout log");
+    let stderr = File::create(&stderr_path).expect("create station stderr log");
+    File::create(&runtime_log).expect("create station runtime log");
+    File::create(&browser_stderr_log).expect("create browser stderr log");
+    File::create(&station_diagnostic_log).expect("create station diagnostic log");
+    record_e2e_event(
+        &component,
+        "spawn_requested",
+        serde_json::json!({
+            "runtime": runtime,
+            "containment_required": broker_pipe_name.is_some(),
+            "stdout": stdout_path,
+            "stderr": stderr_path,
+            "runtime_log": runtime_log,
+            "browser_stderr_log": browser_stderr_log,
+            "station_diagnostic_log": station_diagnostic_log,
+        }),
+    );
     let mut child = command
         .env_remove("CHROME_PATH")
         .env_remove("EDGE_PATH")
         .env("DIG2BROWSER_TEST_ALLOW_DIRECT_WEBRTC_UDP", "1")
+        .env("DIG2BROWSER_RUNTIME_DIAGNOSTIC_LOG", &runtime_log)
+        .env("DIG2BROWSER_BROWSER_STDERR_LOG", &browser_stderr_log)
+        .env("DIG2BROWSER_STATION_DIAGNOSTIC_LOG", &station_diagnostic_log)
         .env("HTTP_PROXY", "http://127.0.0.1:1")
         .env("HTTPS_PROXY", "http://127.0.0.1:1")
         .env("ALL_PROXY", "http://127.0.0.1:1")
@@ -2835,11 +3856,16 @@ async fn spawn_webrtc_stationd(
         } else {
             Stdio::null()
         })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
         .kill_on_drop(true)
         .spawn()
         .expect("spawn WebRTC proof station");
+    record_e2e_event(
+        &component,
+        "spawned",
+        serde_json::json!({ "process_id": child.id() }),
+    );
     if let Some(capability) = broker_capability {
         let mut stdin = child
             .stdin
@@ -2850,38 +3876,54 @@ async fn spawn_webrtc_stationd(
             .await
             .expect("write station WFP capability");
     }
-    child
+    LoggedStation {
+        child,
+        stdout_path,
+        stderr_path,
+        diagnostic_path: station_diagnostic_log,
+    }
 }
 
 async fn spawn_wfp_broker(
     pipe_name: &str,
     allowed_runtime_root: &Path,
     capability: WindowsWfpBrokerCapability,
-) -> tokio::process::Child {
-    let mut command = tokio::process::Command::new(
-        env!("CARGO_BIN_EXE_dig2browser-wfp-broker"),
+) -> ElevatedWindowsWfpBroker {
+    let parent = inspect_windows_process_security(std::process::id())
+        .expect("inspect WFP E2E parent security");
+    assert!(
+        !parent.elevated && parent.is_medium_integrity(),
+        "WFP E2E parent must remain non-elevated medium integrity: {parent:?}"
     );
-    command.args([
-        "--pipe-name",
+    let result = launch_elevated_windows_wfp_broker(
+        Path::new(env!("CARGO_BIN_EXE_dig2browser-wfp-broker")),
         pipe_name,
-        "--allowed-runtime-root",
-        allowed_runtime_root
-            .to_str()
-            .expect("runtime-mirror catalog path is UTF-8"),
-    ]);
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("spawn test-owned elevated WFP broker");
-    let mut stdin = child.stdin.take().expect("WFP broker stdin is piped");
-    capability
-        .write_to_async(&mut stdin)
-        .await
-        .expect("write broker WFP capability");
-    child
+        allowed_runtime_root,
+        capability,
+    )
+    .await;
+    match result {
+        Ok(broker) => {
+            record_e2e_event(
+                "wfp-broker",
+                "bootstrap_authenticated",
+                serde_json::json!({
+                    "process_id": broker.id(),
+                    "integrity_rid": broker.security().integrity_rid,
+                    "elevated": broker.security().elevated,
+                }),
+            );
+            broker
+        }
+        Err(error) => {
+            record_e2e_event(
+                "wfp-broker",
+                "launch_failed",
+                serde_json::json!({ "error": error.to_string() }),
+            );
+            panic!("launch broker-only elevated WFP process: {error}");
+        }
+    }
 }
 
 fn spawn_capacity_shutdown_stationd(
@@ -2985,6 +4027,118 @@ async fn connect(pipe_name: &str) -> StationClient {
     .expect("connect navigation-policy station")
 }
 
+async fn connect_with_daemon(
+    pipe_name: &str,
+    daemon: &mut LoggedStation,
+) -> StationClient {
+    connect_with_daemon_timeout(
+        pipe_name,
+        daemon,
+        Duration::from_secs(15),
+    )
+    .await
+}
+
+async fn connect_with_daemon_timeout(
+    pipe_name: &str,
+    daemon: &mut LoggedStation,
+    startup_timeout: Duration,
+) -> StationClient {
+    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let started = Instant::now();
+    record_e2e_event(
+        "test",
+        "station_connect_requested",
+        serde_json::json!({
+            "pipe_name": pipe_name,
+            "process_id": daemon.id(),
+            "startup_timeout_ms": startup_timeout.as_millis() as u64,
+        }),
+    );
+    loop {
+        let remaining = startup_timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            let (stdout, stderr) = daemon.output();
+            let diagnostic = daemon.diagnostic_tail();
+            record_e2e_event(
+                "test",
+                "station_connect_timed_out_live",
+                serde_json::json!({
+                    "pipe_name": pipe_name,
+                    "process_id": daemon.id(),
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                    "diagnostic": diagnostic,
+                }),
+            );
+            panic!(
+                "connect navigation-policy station timed out after {startup_timeout:?}; daemon pid={:?} remained live; diagnostic={diagnostic:?}; stdout={stdout:?}; stderr={stderr:?}",
+                daemon.id()
+            );
+        }
+        let config = ClientConfig::new(
+            pipe_name,
+            ATTEMPT_TIMEOUT.min(remaining),
+            Duration::from_secs(60),
+        )
+        .expect("valid policy client config");
+        match StationClient::connect(config).await {
+            Ok(client) => {
+                record_e2e_event(
+                    "test",
+                    "station_connected",
+                    serde_json::json!({
+                        "pipe_name": pipe_name,
+                        "process_id": daemon.id(),
+                        "elapsed_ms": started.elapsed().as_millis() as u64,
+                    }),
+                );
+                return client;
+            }
+            Err(error) => match daemon.try_wait() {
+                Ok(Some(status)) => {
+                    let (stdout, stderr) = daemon.output();
+                    let diagnostic = daemon.diagnostic_tail();
+                    record_e2e_event(
+                        "test",
+                        "station_connect_failed",
+                        serde_json::json!({
+                            "pipe_name": pipe_name,
+                            "status": status.to_string(),
+                            "error": error.to_string(),
+                            "diagnostic": diagnostic,
+                        }),
+                    );
+                    panic!(
+                        "connect navigation-policy station: {error}; daemon={status}; diagnostic={diagnostic:?}; stdout={stdout:?}; stderr={stderr:?}"
+                    );
+                }
+                Ok(None) => {
+                    let diagnostic = daemon.diagnostic_tail();
+                    record_e2e_event(
+                        "test",
+                        "station_connect_waiting",
+                        serde_json::json!({
+                            "pipe_name": pipe_name,
+                            "process_id": daemon.id(),
+                            "elapsed_ms": started.elapsed().as_millis() as u64,
+                            "remaining_ms": startup_timeout
+                                .saturating_sub(started.elapsed())
+                                .as_millis() as u64,
+                            "last_error": error.to_string(),
+                            "diagnostic": diagnostic,
+                        }),
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(wait_error) => panic!(
+                    "connect navigation-policy station: {error}; daemon status failed: {wait_error}"
+                ),
+            },
+        }
+    }
+}
+
 async fn assert_clean_exit(daemon: &mut tokio::process::Child) {
     let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
         .await
@@ -3011,15 +4165,24 @@ async fn assert_clean_exit(daemon: &mut tokio::process::Child) {
 }
 
 async fn assert_webrtc_clean_exit(
-    daemon: &mut tokio::process::Child,
+    daemon: &mut LoggedStation,
     expected_containment: bool,
 ) {
     let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
         .await
         .expect("WebRTC policy station exit timeout")
         .expect("wait for WebRTC policy station");
+    record_e2e_event(
+        "station",
+        "exited",
+        serde_json::json!({
+            "process_id": daemon.id(),
+            "status": status.to_string(),
+            "expected_containment": expected_containment,
+        }),
+    );
     assert!(status.success(), "WebRTC policy station failed: {status}");
-    let (stdout, stderr) = read_child_output(daemon).await;
+    let (stdout, stderr) = daemon.output();
     assert!(stderr.is_empty(), "WebRTC policy station wrote stderr: {stderr}");
     let report: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("parse WebRTC station exit report");
@@ -3077,13 +4240,13 @@ async fn assert_webrtc_clean_exit(
     }
 }
 
-async fn assert_containment_lost_exit(daemon: &mut tokio::process::Child) {
+async fn assert_containment_lost_exit(daemon: &mut LoggedStation) {
     let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
         .await
         .expect("containment-lost station exit timeout")
         .expect("wait for containment-lost station");
     assert!(!status.success(), "containment-lost station exited successfully");
-    let (stdout, stderr) = read_child_output(daemon).await;
+    let (stdout, stderr) = daemon.output();
     assert!(
         stdout.is_empty(),
         "containment-lost station unexpectedly wrote a clean report: {stdout}"
@@ -3096,41 +4259,58 @@ async fn assert_containment_lost_exit(daemon: &mut tokio::process::Child) {
     assert_eq!(report["error_class"], "containment_lost");
 }
 
-async fn assert_wfp_broker_clean_exit(broker: &mut tokio::process::Child) {
-    let status = tokio::time::timeout(Duration::from_secs(30), broker.wait())
+async fn assert_wfp_broker_clean_exit(broker: &mut ElevatedWindowsWfpBroker) {
+    let exit = tokio::time::timeout(Duration::from_secs(30), broker.wait())
         .await
         .expect("WFP broker exit timeout")
         .expect("wait for WFP broker");
-    assert!(status.success(), "WFP broker failed: {status}");
-    let (stdout, stderr) = read_child_output(broker).await;
-    assert!(stderr.is_empty(), "WFP broker wrote stderr: {stderr}");
-    let report: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("parse WFP broker exit report");
-    assert_eq!(report["outcome"], "closed", "unclean WFP broker report: {stdout}");
-    assert_eq!(report["version"], 3);
+    record_e2e_event(
+        "wfp-broker",
+        "exited",
+        serde_json::json!({
+            "process_id": broker.id(),
+            "exit_code": exit.exit_code,
+            "outcome": format!("{:?}", exit.outcome),
+        }),
+    );
+    assert_eq!(exit.exit_code, 0, "WFP broker failed: {exit:?}");
+    assert!(
+        matches!(exit.outcome, Some(WindowsWfpBrokerOutcome::Closed { version: 3 })),
+        "unclean WFP broker outcome: {exit:?}"
+    );
 }
 
-async fn assert_wfp_broker_client_disconnected(broker: &mut tokio::process::Child) {
-    let status = tokio::time::timeout(Duration::from_secs(30), broker.wait())
+async fn assert_wfp_broker_client_disconnected(broker: &mut ElevatedWindowsWfpBroker) {
+    let exit = tokio::time::timeout(Duration::from_secs(30), broker.wait())
         .await
         .expect("disconnected WFP broker exit timeout")
         .expect("wait for disconnected WFP broker");
-    assert!(!status.success(), "disconnected WFP broker exited successfully");
-    let (stdout, stderr) = read_child_output(broker).await;
-    assert!(stderr.is_empty(), "disconnected WFP broker wrote stderr: {stderr}");
-    let report: serde_json::Value = serde_json::from_str(stdout.trim())
-        .expect("parse disconnected WFP broker report");
-    assert_eq!(report["outcome"], "client_disconnected", "{stdout}");
-    assert_eq!(report["version"], 3);
+    record_e2e_event(
+        "wfp-broker",
+        "client_disconnected_exit",
+        serde_json::json!({
+            "process_id": broker.id(),
+            "exit_code": exit.exit_code,
+            "outcome": format!("{:?}", exit.outcome),
+        }),
+    );
+    assert_ne!(exit.exit_code, 0, "disconnected WFP broker exited successfully");
+    assert!(
+        matches!(
+            exit.outcome,
+            Some(WindowsWfpBrokerOutcome::ClientDisconnected { version: 3, .. })
+        ),
+        "unexpected disconnected WFP broker outcome: {exit:?}"
+    );
 }
 
-async fn assert_station_shutdown_failure(daemon: &mut tokio::process::Child) {
+async fn assert_station_shutdown_failure(daemon: &mut LoggedStation) {
     let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
         .await
         .expect("shutdown-failure station exit timeout")
         .expect("wait for shutdown-failure station");
     assert!(!status.success(), "shutdown-failure station exited successfully");
-    let (stdout, stderr) = read_child_output(daemon).await;
+    let (stdout, stderr) = daemon.output();
     assert!(stdout.is_empty(), "shutdown-failure station wrote clean report: {stdout}");
     let report: serde_json::Value = serde_json::from_str(stderr.trim())
         .expect("parse shutdown-failure station report");

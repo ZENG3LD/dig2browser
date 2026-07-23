@@ -159,12 +159,14 @@ impl RealBrowserRuntime {
         .await
         .map_err(|error| {
             tracing::debug!(%error, "browser runtime launch failed");
+            report_containment_start_failure("launch", &error);
             RuntimeError::new(RuntimeFailureKind::Launch)
         })?;
         let page = match browser.new_blank_page().await {
             Ok(page) => page,
             Err(error) => {
                 tracing::debug!(%error, "browser runtime blank page failed");
+                report_containment_start_failure("blank_page", &error);
                 let _ = browser.close().await;
                 return Err(RuntimeError::new(RuntimeFailureKind::Launch));
             }
@@ -173,6 +175,7 @@ impl RealBrowserRuntime {
             Ok(devtools) => devtools,
             Err(error) => {
                 tracing::debug!(%error, "browser runtime devtools setup failed");
+                report_containment_start_failure("devtools", &error);
                 let _ = browser.close().await;
                 return Err(RuntimeError::new(RuntimeFailureKind::Protocol));
             }
@@ -500,6 +503,28 @@ impl BrowserRuntime for RealBrowserRuntime {
         })
     }
 }
+
+#[cfg(feature = "containment-test-hooks")]
+fn report_containment_start_failure(stage: &str, error: &dyn std::fmt::Display) {
+    use std::io::Write as _;
+
+    let Some(path) = std::env::var_os("DIG2BROWSER_RUNTIME_DIAGNOSTIC_LOG") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    if let Ok(mut log) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(log, "stage={stage} error={error}");
+    }
+}
+
+#[cfg(not(feature = "containment-test-hooks"))]
+fn report_containment_start_failure(_stage: &str, _error: &dyn std::fmt::Display) {}
 
 #[cfg(feature = "runtime-test-hooks")]
 fn report_test_capture_failure(stage: &str, error: &dyn std::fmt::Display) {

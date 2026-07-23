@@ -6,6 +6,7 @@
 
 use std::net::{SocketAddr, SocketAddrV4};
 use std::path::Path;
+use std::time::Duration;
 
 use dig2browser::{
     BrowserProcessIsolation, WindowsBrowserRuntimeMirror, WindowsRuntimeMirrorError,
@@ -73,6 +74,8 @@ pub(super) struct WindowsWfpContainment {
 }
 
 impl WindowsWfpContainment {
+    const MIRROR_REMOVAL_MAX_WAIT: Duration = Duration::from_secs(15);
+
     pub(super) fn process_isolation(&self) -> BrowserProcessIsolation {
         BrowserProcessIsolation::WindowsRuntimeMirror(
             self.mirror.browser_binary().clone(),
@@ -93,8 +96,13 @@ impl WindowsWfpContainment {
             mirror,
             assurance: _,
         } = self;
+        // Keep WFP active until no process can still hold the exact AppID
+        // runtime tree. Dropping a lease does not authorize policy removal, so
+        // any mirror cleanup failure remains fail-closed for reconciliation.
+        mirror
+            .remove_with_retry(Self::MIRROR_REMOVAL_MAX_WAIT)
+            .await?;
         lease.close().await?;
-        mirror.remove()?;
         Ok(())
     }
 }

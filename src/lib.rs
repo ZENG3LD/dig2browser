@@ -23,6 +23,6 @@ pub use detect::args::BrowserProxy;
 pub use process_isolation::BrowserProcessIsolation;
 #[cfg(windows)]
 pub use windows_runtime_mirror::{
-    WindowsBrowserRuntimeMirror, WindowsRuntimeMirrorError, WindowsRuntimeMirrorScope,
-    WindowsRuntimeMirrorScopeParseError,
+    WindowsBrowserRuntimeMirror, WindowsRuntimeMirrorError, WindowsRuntimeMirrorRemovalReport,
+    WindowsRuntimeMirrorScope, WindowsRuntimeMirrorScopeParseError,
 };

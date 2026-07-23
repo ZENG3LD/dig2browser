@@ -23,7 +23,8 @@ use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
     FWPM_CONDITION_IP_REMOTE_ADDRESS, FWPM_CONDITION_IP_REMOTE_PORT,
     FWPM_DISPLAY_DATA0, FWPM_FILTER0, FWPM_FILTER_CONDITION0,
     FWPM_FILTER_ENUM_TEMPLATE0, FWPM_FILTER_FLAGS,
-    FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT, FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+    FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT, FWPM_FILTER_FLAG_INDEXED,
+    FWPM_LAYER_ALE_AUTH_CONNECT_V4,
     FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_LAYER_ALE_RESOURCE_ASSIGNMENT_V4,
     FWPM_LAYER_ALE_RESOURCE_ASSIGNMENT_V6, FWPM_PROVIDER0, FWPM_SESSION0,
     FWPM_SUBLAYER0, FWP_ACTION_BLOCK, FWP_ACTION_PERMIT,
@@ -208,7 +209,7 @@ pub enum WindowsContainmentError {
     #[error("runtime mirror process inventory cannot be verified; mirror was retained")]
     UnverifiableMirrorProcesses,
     #[error("existing dig2browser WFP lease store is malformed: {reason}")]
-    MalformedLeaseStore { reason: &'static str },
+    MalformedLeaseStore { reason: String },
     #[error("Windows denied access while performing {operation}")]
     AccessDenied { operation: &'static str },
     #[error("Windows operation {operation} failed with code 0x{code:08x}")]
@@ -807,8 +808,10 @@ fn is_win32_error(error: &windows::core::Error, code: u32) -> bool {
     error.code().0 as u32 == (0x80070000u32 | code)
 }
 
-fn malformed(reason: &'static str) -> WindowsContainmentError {
-    WindowsContainmentError::MalformedLeaseStore { reason }
+fn malformed(reason: impl Into<String>) -> WindowsContainmentError {
+    WindowsContainmentError::MalformedLeaseStore {
+        reason: reason.into(),
+    }
 }
 
 struct WfpEngine {
@@ -1081,11 +1084,14 @@ fn validate_existing_provider(engine: HANDLE) -> Result<(), WindowsContainmentEr
     }
     let provider = unsafe { &*raw };
     let data = unsafe { copy_blob(&provider.providerData, PRODUCT_OBJECT_DATA.len()) }?;
-    if provider.providerKey != PRODUCT_PROVIDER_KEY
-        || provider.flags != 0
-        || data.as_slice() != PRODUCT_OBJECT_DATA
-    {
-        return Err(malformed("stable product provider identity is invalid"));
+    if provider.providerKey != PRODUCT_PROVIDER_KEY {
+        return Err(malformed("stable product provider key is invalid"));
+    }
+    if provider.flags != 0 {
+        return Err(malformed("stable product provider flags are invalid"));
+    }
+    if data.as_slice() != PRODUCT_OBJECT_DATA {
+        return Err(malformed("stable product provider data is invalid"));
     }
     drop(allocation);
     Ok(())
@@ -1103,14 +1109,23 @@ fn validate_existing_sublayer(engine: HANDLE) -> Result<(), WindowsContainmentEr
     }
     let sublayer = unsafe { &*raw };
     let data = unsafe { copy_blob(&sublayer.providerData, PRODUCT_OBJECT_DATA.len()) }?;
-    if sublayer.subLayerKey != PRODUCT_SUBLAYER_KEY
-        || sublayer.providerKey.is_null()
-        || unsafe { *sublayer.providerKey } != PRODUCT_PROVIDER_KEY
-        || sublayer.flags != 0
-        || sublayer.weight != SUBLAYER_WEIGHT
-        || data.as_slice() != PRODUCT_OBJECT_DATA
-    {
-        return Err(malformed("stable product sublayer identity is invalid"));
+    if sublayer.subLayerKey != PRODUCT_SUBLAYER_KEY {
+        return Err(malformed("stable product sublayer key is invalid"));
+    }
+    if sublayer.providerKey.is_null() {
+        return Err(malformed("stable product sublayer provider is missing"));
+    }
+    if unsafe { *sublayer.providerKey } != PRODUCT_PROVIDER_KEY {
+        return Err(malformed("stable product sublayer provider is invalid"));
+    }
+    if sublayer.flags != 0 {
+        return Err(malformed("stable product sublayer flags are invalid"));
+    }
+    // BFE may assign the closest available sublayer weight instead of retaining
+    // the requested value. The stable key, provider, flags, and provider data
+    // identify this product object; the assigned arbitration weight does not.
+    if data.as_slice() != PRODUCT_OBJECT_DATA {
+        return Err(malformed("stable product sublayer data is invalid"));
     }
     drop(allocation);
     Ok(())
@@ -1237,9 +1252,27 @@ impl Drop for FilterEnumHandle {
 fn enumerate_product_filters(
     engine: HANDLE,
 ) -> Result<Vec<StoredFilter>, WindowsContainmentError> {
+    let mut filters = Vec::new();
+    for layer_key in [
+        FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+        FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+        FWPM_LAYER_ALE_RESOURCE_ASSIGNMENT_V4,
+        FWPM_LAYER_ALE_RESOURCE_ASSIGNMENT_V6,
+    ] {
+        filters.extend(enumerate_product_filters_at_layer(engine, layer_key)?);
+    }
+    Ok(filters)
+}
+
+fn enumerate_product_filters_at_layer(
+    engine: HANDLE,
+    layer_key: GUID,
+) -> Result<Vec<StoredFilter>, WindowsContainmentError> {
     let mut provider_key = PRODUCT_PROVIDER_KEY;
     let template = FWPM_FILTER_ENUM_TEMPLATE0 {
         providerKey: &mut provider_key,
+        layerKey: layer_key,
+        actionMask: u32::MAX,
         ..Default::default()
     };
     let mut enum_handle = HANDLE::default();
@@ -1386,22 +1419,51 @@ unsafe fn classify_stored_filter(
     let is_raw_v6 = filter.layerKey == FWPM_LAYER_ALE_RESOURCE_ASSIGNMENT_V6;
 
     if filter.action.r#type == FWP_ACTION_PERMIT {
-        if (!is_connect_v4 && !is_connect_v6)
-            || filter.flags != FWPM_FILTER_FLAGS::default()
-            || weight != PERMIT_WEIGHT
-            || conditions.len() != 4
-        {
-            return Err(malformed("product permit filter shape is invalid"));
+        if !is_connect_v4 && !is_connect_v6 {
+            return Err(malformed("product permit filter layer is invalid"));
+        }
+        if !has_expected_product_filter_flags(
+            filter.flags,
+            FWPM_FILTER_FLAGS::default(),
+        ) {
+            return Err(malformed(format!(
+                "product permit filter flags are invalid: expected=0x00000000, actual=0x{:08x}",
+                filter.flags.0,
+            )));
+        }
+        if weight != PERMIT_WEIGHT {
+            return Err(malformed(format!(
+                "product permit filter weight is invalid: expected={PERMIT_WEIGHT}, actual={weight}",
+            )));
+        }
+        if conditions.len() != 4 {
+            return Err(malformed("product permit filter condition count is invalid"));
         }
         return permit_endpoint(conditions, is_connect_v4)
             .map(StoredFilterRole::Permit);
     }
 
-    if filter.action.r#type != FWP_ACTION_BLOCK
-        || filter.flags != FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT
-        || weight != BLOCK_WEIGHT
-    {
-        return Err(malformed("product block filter shape is invalid"));
+    if filter.action.r#type != FWP_ACTION_BLOCK {
+        return Err(malformed(format!(
+            "product block filter action is invalid: expected=0x{:08x}, actual=0x{:08x}",
+            FWP_ACTION_BLOCK.0,
+            filter.action.r#type.0,
+        )));
+    }
+    if !has_expected_product_filter_flags(
+        filter.flags,
+        FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT,
+    ) {
+        return Err(malformed(format!(
+            "product block filter flags are invalid: expected=0x{:08x}, actual=0x{:08x}",
+            FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT.0,
+            filter.flags.0,
+        )));
+    }
+    if weight != BLOCK_WEIGHT {
+        return Err(malformed(format!(
+            "product block filter weight is invalid: expected={BLOCK_WEIGHT}, actual={weight}",
+        )));
     }
     if is_connect_v4 || is_connect_v6 {
         if conditions.len() != 1 {
@@ -1424,6 +1486,13 @@ unsafe fn classify_stored_filter(
         });
     }
     Err(malformed("product filter layer is invalid"))
+}
+
+fn has_expected_product_filter_flags(
+    actual: FWPM_FILTER_FLAGS,
+    expected: FWPM_FILTER_FLAGS,
+) -> bool {
+    actual.0 & !FWPM_FILTER_FLAG_INDEXED.0 == expected.0
 }
 
 unsafe fn permit_endpoint(

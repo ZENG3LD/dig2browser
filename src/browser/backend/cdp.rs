@@ -18,6 +18,8 @@ use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 #[cfg(windows)]
 use tokio::io::AsyncReadExt;
+#[cfg(all(windows, feature = "containment-test-hooks"))]
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tracing::debug;
@@ -134,6 +136,50 @@ impl EphemeralProfileCleanup {
     }
 }
 
+#[cfg(all(windows, feature = "containment-test-hooks"))]
+async fn record_test_browser_lifecycle(
+    event: &'static str,
+    detail: serde_json::Value,
+) {
+    let Some(path) = std::env::var_os("DIG2BROWSER_BROWSER_LIFECYCLE_LOG") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let frame = serde_json::json!({
+        "at_unix_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+        "event": event,
+        "detail": detail,
+    });
+    let mut encoded = match serde_json::to_vec(&frame) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            debug!(%error, event, "browser lifecycle diagnostic serialization failed");
+            return;
+        }
+    };
+    encoded.push(b'\n');
+    let mut log = match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+    {
+        Ok(log) => log,
+        Err(error) => {
+            debug!(%error, event, "browser lifecycle diagnostic open failed");
+            return;
+        }
+    };
+    if let Err(error) = log.write_all(&encoded).await {
+        debug!(%error, event, "browser lifecycle diagnostic write failed");
+    }
+}
+
 impl Drop for EphemeralProfileCleanup {
     fn drop(&mut self) {
         if self.armed {
@@ -169,6 +215,42 @@ impl Drop for CdpBrowserBackend {
         }
         if self.profile_ephemeral {
             let _ = std::fs::remove_dir_all(&self.profile_dir);
+        }
+    }
+}
+
+#[cfg(windows)]
+const PROCESS_SINGLETON_LOCK_EXIT_CODE: i32 = 21;
+
+/// A single owned-pipe launch attempt failed. `singleton_lock_contention`
+/// is set when the failure signature matches Chromium's `ProcessSingleton`
+/// lock-creation failure (exit code 21 / "Lock file can not be created" /
+/// Windows `ERROR_SHARING_VIOLATION`, raw code 32) — evidence that a prior
+/// launch attempt on the same profile directory had not yet released its
+/// lock when this attempt started. That condition is transient, not a
+/// terminal launch failure.
+#[cfg(windows)]
+struct LaunchAttemptError {
+    error: BrowserError,
+    singleton_lock_contention: bool,
+}
+
+#[cfg(windows)]
+impl LaunchAttemptError {
+    fn terminal(error: BrowserError) -> Self {
+        Self {
+            error,
+            singleton_lock_contention: false,
+        }
+    }
+
+    fn from_signature(error: BrowserError, stderr: &str, exit_code: Option<i32>) -> Self {
+        let singleton_lock_contention = exit_code == Some(PROCESS_SINGLETON_LOCK_EXIT_CODE)
+            || stderr.contains("Lock file can not be created")
+            || stderr.contains("ProcessSingleton for your profile directory");
+        Self {
+            error,
+            singleton_lock_contention,
         }
     }
 }
@@ -312,108 +394,16 @@ impl CdpBrowserBackend {
                     discovery.browser_product,
                 )
             } else {
-                let prepared = PreparedWindowsCdpProcess::new()
-                    .map_err(|error| BrowserError::Launch(error.to_string()))?;
-                let (browser_read, browser_write) = prepared
-                    .child_cdp_handles()
-                    .map_err(|error| BrowserError::Launch(error.to_string()))?;
-                let args = launch.build_pipe_args(
-                    &profile_dir,
-                    locale,
-                    browser_read,
-                    browser_write,
-                );
-                debug!(
-                    "Launching CDP browser: {} with {} args over owned ASCIIZ pipes",
-                    binary.path.display(),
-                    args.len()
-                );
-                let mut spawned = prepared
-                    .spawn_suspended(&binary.path, &args)
-                    .map_err(|error| BrowserError::Launch(error.to_string()))?;
-                if let Err(error) = process_tree.assign_raw_handle(spawned.process.raw_handle()) {
-                    let _ = spawned.process.start_kill();
-                    return Err(BrowserError::Launch(format!(
-                        "could not contain browser process tree: {error}"
-                    )));
-                }
-                if let Err(error) = spawned.process.resume() {
-                    let _ = process_tree.terminate_now();
-                    return Err(BrowserError::Launch(format!(
-                        "could not resume contained browser process: {error}"
-                    )));
-                }
-                let (mut stderr_task, stderr_capture) =
-                    Self::spawn_stderr_logger(spawned.stderr);
-                let client = match CdpClient::connect_pipe(
-                    spawned.cdp_reader,
-                    spawned.cdp_writer,
-                )
-                .await
-                {
-                    Ok(client) => client,
-                    Err(error) => {
-                        let stderr = Self::finish_stderr_capture(
-                            &mut stderr_task,
-                            &stderr_capture,
-                        )
-                        .await;
-                        let status = Self::process_status_context(&mut spawned.process).await;
-                        let _ = process_tree.terminate_now();
-                        let _ = spawned.process.start_kill();
-                        return Err(BrowserError::Connect(
-                            Self::with_launch_context(error.to_string(), stderr, status),
-                        ));
-                    }
-                };
-                let root = client.root_session();
-                let version = match tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    root.call("Browser.getVersion", None),
-                )
-                .await
-                {
-                    Ok(Ok(version)) => version,
-                    Ok(Err(error)) => {
-                        let stderr = Self::finish_stderr_capture(
-                            &mut stderr_task,
-                            &stderr_capture,
-                        )
-                        .await;
-                        let status = Self::process_status_context(&mut spawned.process).await;
-                        let _ = process_tree.terminate_now();
-                        let _ = spawned.process.start_kill();
-                        return Err(BrowserError::Connect(
-                            Self::with_launch_context(error.to_string(), stderr, status),
-                        ));
-                    }
-                    Err(_) => {
-                        let stderr = Self::finish_stderr_capture(
-                            &mut stderr_task,
-                            &stderr_capture,
-                        )
-                        .await;
-                        let status = Self::process_status_context(&mut spawned.process).await;
-                        let _ = process_tree.terminate_now();
-                        let _ = spawned.process.start_kill();
-                        return Err(BrowserError::Connect(
-                            Self::with_launch_context(
-                                "timed out waiting for the CDP pipe".to_owned(),
-                                stderr,
-                                status,
-                            ),
-                        ));
-                    }
-                };
-                let browser_product = version["product"]
-                    .as_str()
-                    .map(str::to_owned);
-                (
-                    client,
-                    spawned.process,
-                    Some(stderr_task),
-                    browser_product,
-                )
+                let (client, process, stderr_task, browser_product) =
+                    Self::launch_owned_pipe_with_lock_retry(
+                        &process_tree,
+                        &binary.path,
+                        launch,
+                        &profile_dir,
+                        locale,
+                    )
+                    .await?;
+                (client, process, Some(stderr_task), browser_product)
             }
         };
 
@@ -581,12 +571,29 @@ impl CdpBrowserBackend {
         let capture = BoundedStderrCapture::new();
         let task_capture = capture.clone();
         let task = tokio::spawn(async move {
+            #[cfg(feature = "containment-test-hooks")]
+            let mut diagnostic_log = match std::env::var_os("DIG2BROWSER_BROWSER_STDERR_LOG") {
+                Some(path) if !path.is_empty() => tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .await
+                    .ok(),
+                _ => None,
+            };
             let mut buffer = [0_u8; 8 * 1024];
             loop {
                 match stderr.read(&mut buffer).await {
                     Ok(0) => break,
                     Ok(count) => {
                         task_capture.append(&buffer[..count]);
+                        #[cfg(feature = "containment-test-hooks")]
+                        if let Some(log) = diagnostic_log.as_mut() {
+                            if let Err(error) = log.write_all(&buffer[..count]).await {
+                                debug!(%error, "browser stderr diagnostic logger stopped");
+                                diagnostic_log = None;
+                            }
+                        }
                         let chunk = String::from_utf8_lossy(&buffer[..count]);
                         debug!("browser stderr: {chunk}");
                     }
@@ -614,17 +621,21 @@ impl CdpBrowserBackend {
         capture.snapshot()
     }
 
+    /// Returns a human-readable status string alongside the raw exit code
+    /// (when available), so callers can match launch-failure signatures
+    /// like Chromium's `ProcessSingleton` lock error (exit code 21)
+    /// without re-parsing the display string.
     #[cfg(windows)]
-    async fn process_status_context(process: &mut BrowserProcess) -> String {
+    async fn process_status_context(process: &mut BrowserProcess) -> (String, Option<i32>) {
         match tokio::time::timeout(
             std::time::Duration::from_millis(250),
             process.wait(),
         )
         .await
         {
-            Ok(Ok(status)) => status.to_string(),
-            Ok(Err(error)) => format!("status unavailable: {error}"),
-            Err(_) => "still running after pipe closure".to_owned(),
+            Ok(Ok(status)) => (status.to_string(), status.code()),
+            Ok(Err(error)) => (format!("status unavailable: {error}"), None),
+            Err(_) => ("still running after pipe closure".to_owned(), None),
         }
     }
 
@@ -634,6 +645,191 @@ impl CdpBrowserBackend {
             format!("{message}; browser process: {status}")
         } else {
             format!("{message}; browser process: {status}; browser stderr: {stderr}")
+        }
+    }
+
+    /// Deterministically wait for a failed launch attempt's own process
+    /// tree to fully exit (bounded) before returning control to the
+    /// caller. Chromium's `ProcessSingleton` lock file for a profile
+    /// directory is only released once the owning process has actually
+    /// exited — sending a termination signal and returning immediately
+    /// (the previous fire-and-forget behaviour) let an immediate
+    /// same-profile relaunch race the OS teardown of this attempt.
+    #[cfg(windows)]
+    async fn drain_failed_launch_attempt(
+        process_tree: &OwnedProcessTree,
+        process: &mut BrowserProcess,
+    ) {
+        const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+        if let Err(error) = process_tree.terminate_and_wait(DRAIN_TIMEOUT).await {
+            debug!(
+                %error,
+                "failed browser launch attempt did not fully drain its process tree within the bounded timeout"
+            );
+        }
+        // Safety net: non-blocking and a no-op once the process has exited.
+        let _ = process.start_kill();
+    }
+
+    /// Perform exactly one owned-pipe Chromium launch attempt against an
+    /// already-created (and possibly reused) process-tree containment.
+    /// Every failure path deterministically drains its own process before
+    /// returning, so a caller may safely retry on the same profile
+    /// directory once this returns.
+    #[cfg(windows)]
+    async fn attempt_owned_pipe_launch(
+        process_tree: &OwnedProcessTree,
+        binary_path: &std::path::Path,
+        launch: &LaunchConfig,
+        profile_dir: &std::path::Path,
+        locale: Option<&str>,
+    ) -> Result<(Arc<CdpClient>, BrowserProcess, JoinHandle<()>, Option<String>), LaunchAttemptError> {
+        let prepared = PreparedWindowsCdpProcess::new().map_err(|error| {
+            LaunchAttemptError::terminal(BrowserError::Launch(error.to_string()))
+        })?;
+        let (browser_read, browser_write) = prepared.child_cdp_handles().map_err(|error| {
+            LaunchAttemptError::terminal(BrowserError::Launch(error.to_string()))
+        })?;
+        let args = launch.build_pipe_args(profile_dir, locale, browser_read, browser_write);
+        debug!(
+            "Launching CDP browser: {} with {} args over owned ASCIIZ pipes",
+            binary_path.display(),
+            args.len()
+        );
+        let mut spawned = prepared.spawn_suspended(binary_path, &args).map_err(|error| {
+            LaunchAttemptError::terminal(BrowserError::Launch(error.to_string()))
+        })?;
+        if let Err(error) = process_tree.assign_raw_handle(spawned.process.raw_handle()) {
+            let _ = spawned.process.start_kill();
+            return Err(LaunchAttemptError::terminal(BrowserError::Launch(format!(
+                "could not contain browser process tree: {error}"
+            ))));
+        }
+        if let Err(error) = spawned.process.resume() {
+            Self::drain_failed_launch_attempt(process_tree, &mut spawned.process).await;
+            return Err(LaunchAttemptError::terminal(BrowserError::Launch(format!(
+                "could not resume contained browser process: {error}"
+            ))));
+        }
+        let (mut stderr_task, stderr_capture) = Self::spawn_stderr_logger(spawned.stderr);
+        let client = match CdpClient::connect_pipe(spawned.cdp_reader, spawned.cdp_writer).await {
+            Ok(client) => client,
+            Err(error) => {
+                let stderr =
+                    Self::finish_stderr_capture(&mut stderr_task, &stderr_capture).await;
+                let (status, exit_code) =
+                    Self::process_status_context(&mut spawned.process).await;
+                Self::drain_failed_launch_attempt(process_tree, &mut spawned.process).await;
+                let message =
+                    Self::with_launch_context(error.to_string(), stderr.clone(), status);
+                return Err(LaunchAttemptError::from_signature(
+                    BrowserError::Connect(message),
+                    &stderr,
+                    exit_code,
+                ));
+            }
+        };
+        let root = client.root_session();
+        let version = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            root.call("Browser.getVersion", None),
+        )
+        .await
+        {
+            Ok(Ok(version)) => version,
+            Ok(Err(error)) => {
+                let stderr =
+                    Self::finish_stderr_capture(&mut stderr_task, &stderr_capture).await;
+                let (status, exit_code) =
+                    Self::process_status_context(&mut spawned.process).await;
+                Self::drain_failed_launch_attempt(process_tree, &mut spawned.process).await;
+                let message =
+                    Self::with_launch_context(error.to_string(), stderr.clone(), status);
+                return Err(LaunchAttemptError::from_signature(
+                    BrowserError::Connect(message),
+                    &stderr,
+                    exit_code,
+                ));
+            }
+            Err(_) => {
+                let stderr =
+                    Self::finish_stderr_capture(&mut stderr_task, &stderr_capture).await;
+                let (status, exit_code) =
+                    Self::process_status_context(&mut spawned.process).await;
+                Self::drain_failed_launch_attempt(process_tree, &mut spawned.process).await;
+                let message = Self::with_launch_context(
+                    "timed out waiting for the CDP pipe".to_owned(),
+                    stderr.clone(),
+                    status,
+                );
+                return Err(LaunchAttemptError::from_signature(
+                    BrowserError::Connect(message),
+                    &stderr,
+                    exit_code,
+                ));
+            }
+        };
+        let browser_product = version["product"].as_str().map(str::to_owned);
+        Ok((client, spawned.process, stderr_task, browser_product))
+    }
+
+    /// Launch over owned pipes with a bounded retry when the failure
+    /// signature matches Chromium's `ProcessSingleton` lock-creation error.
+    /// That lock is transient: it clears once the prior attempt's process
+    /// tree — deterministically drained inside
+    /// [`Self::attempt_owned_pipe_launch`] — has fully exited. The retry is
+    /// bounded to a small total budget so a genuinely (not transiently)
+    /// locked profile still fails closed with a clear typed error instead
+    /// of looping unbounded.
+    #[cfg(windows)]
+    async fn launch_owned_pipe_with_lock_retry(
+        process_tree: &OwnedProcessTree,
+        binary_path: &std::path::Path,
+        launch: &LaunchConfig,
+        profile_dir: &std::path::Path,
+        locale: Option<&str>,
+    ) -> Result<(Arc<CdpClient>, BrowserProcess, JoinHandle<()>, Option<String>), BrowserError> {
+        const RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+        const RETRY_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+        let deadline = tokio::time::Instant::now() + RETRY_BUDGET;
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            match Self::attempt_owned_pipe_launch(
+                process_tree,
+                binary_path,
+                launch,
+                profile_dir,
+                locale,
+            )
+            .await
+            {
+                Ok(result) => return Ok(result),
+                Err(failure)
+                    if failure.singleton_lock_contention
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    debug!(
+                        attempt,
+                        profile = %profile_dir.display(),
+                        "browser launch hit a Chromium ProcessSingleton lock still held by \
+                         a prior launch attempt on this profile directory; retrying within \
+                         the bounded budget"
+                    );
+                    #[cfg(feature = "containment-test-hooks")]
+                    record_test_browser_lifecycle(
+                        "process_singleton_lock_retry",
+                        serde_json::json!({
+                            "attempt": attempt,
+                            "profile": profile_dir,
+                        }),
+                    )
+                    .await;
+                    tokio::time::sleep(RETRY_POLL).await;
+                }
+                Err(failure) => return Err(failure.error),
+            }
         }
     }
 
@@ -850,16 +1046,56 @@ impl CdpBrowserBackend {
     }
 }
 
-async fn remove_profile_dir_with_retry(path: &std::path::Path) -> Result<(), BrowserError> {
+async fn remove_profile_dir_with_retry(path: &std::path::Path) -> Result<usize, BrowserError> {
     const ATTEMPTS: usize = 20;
     const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
     for attempt in 0..ATTEMPTS {
         match tokio::fs::remove_dir_all(path).await {
-            Ok(()) => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(_) if attempt + 1 < ATTEMPTS => tokio::time::sleep(RETRY_DELAY).await,
-            Err(error) => return Err(BrowserError::Io(error)),
+            Ok(()) => return Ok(attempt + 1),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(attempt + 1);
+            }
+            Err(error) if attempt + 1 < ATTEMPTS => {
+                debug!(
+                    path = %path.display(),
+                    attempt = attempt + 1,
+                    max_attempts = ATTEMPTS,
+                    %error,
+                    "ephemeral browser profile cleanup is blocked"
+                );
+                #[cfg(all(windows, feature = "containment-test-hooks"))]
+                record_test_browser_lifecycle(
+                    "ephemeral_profile_cleanup_blocked",
+                    serde_json::json!({
+                        "attempt": attempt + 1,
+                        "max_attempts": ATTEMPTS,
+                        "profile": path,
+                        "error": error.to_string(),
+                        "os_error": error.raw_os_error(),
+                    }),
+                )
+                .await;
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            Err(error) => {
+                #[cfg(all(windows, feature = "containment-test-hooks"))]
+                record_test_browser_lifecycle(
+                    "ephemeral_profile_cleanup_failed",
+                    serde_json::json!({
+                        "attempt": attempt + 1,
+                        "max_attempts": ATTEMPTS,
+                        "profile": path,
+                        "error": error.to_string(),
+                        "os_error": error.raw_os_error(),
+                    }),
+                )
+                .await;
+                return Err(BrowserError::Other(format!(
+                    "ephemeral browser profile cleanup failed for '{}' after {ATTEMPTS} attempts: {error}",
+                    path.display()
+                )));
+            }
         }
     }
     unreachable!("profile cleanup attempts are non-zero")
@@ -1004,6 +1240,23 @@ impl BrowserBackend for CdpBrowserBackend {
 
     fn close<'a>(mut self: Box<Self>) -> BoxFuture<'a, Result<(), BrowserError>> {
         Box::pin(async move {
+            let shutdown_started = std::time::Instant::now();
+            #[cfg(all(windows, feature = "containment-test-hooks"))]
+            record_test_browser_lifecycle(
+                "shutdown_started",
+                serde_json::json!({
+                    "browser": format!("{:?}", self.launch.browser_pref),
+                    "process_id": self._child.as_ref().and_then(BrowserProcess::id),
+                    "profile": self.profile_dir,
+                }),
+            )
+            .await;
+            debug!(
+                browser = ?self.launch.browser_pref,
+                process_id = ?self._child.as_ref().and_then(BrowserProcess::id),
+                profile = %self.profile_dir.display(),
+                "owned CDP browser shutdown started"
+            );
             self.browser_closing.store(true, Ordering::Release);
             #[cfg(feature = "containment-test-hooks")]
             if let Some(delay) = self.test_close_delay {
@@ -1012,29 +1265,96 @@ impl BrowserBackend for CdpBrowserBackend {
             let edge_normal_exit_attempted = self.launch.browser_pref
                 == crate::detect::BrowserPreference::EdgeOnly;
             if edge_normal_exit_attempted {
-                let _ = self.root.create_target("edge://quit").await;
+                let edge_quit_started = std::time::Instant::now();
+                let edge_quit = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    self.root.create_target("edge://quit"),
+                )
+                .await;
+                let outcome = match edge_quit {
+                    Ok(Ok(_)) => "requested".to_owned(),
+                    Ok(Err(error)) => format!("failed: {error}"),
+                    Err(error) => format!("timed out: {error}"),
+                };
+                debug!(
+                    elapsed_ms = edge_quit_started.elapsed().as_millis() as u64,
+                    outcome = %outcome,
+                    "Edge normal-exit request finished"
+                );
+                #[cfg(all(windows, feature = "containment-test-hooks"))]
+                record_test_browser_lifecycle(
+                    "edge_normal_exit_requested",
+                    serde_json::json!({
+                        "elapsed_ms": edge_quit_started.elapsed().as_millis() as u64,
+                        "outcome": outcome,
+                    }),
+                )
+                .await;
             }
             let mut child_exited = false;
             if edge_normal_exit_attempted {
                 if let Some(ref mut child) = self._child {
-                    child_exited = tokio::time::timeout(
+                    let edge_exit_started = std::time::Instant::now();
+                    let edge_exit = tokio::time::timeout(
                         std::time::Duration::from_secs(5),
                         child.wait(),
                     )
-                    .await
-                    .is_ok();
+                    .await;
+                    let outcome = match edge_exit {
+                        Ok(Ok(status)) => {
+                            child_exited = true;
+                            format!("exited: {status}")
+                        }
+                        Ok(Err(error)) => format!("wait failed: {error}"),
+                        Err(error) => format!("timed out: {error}"),
+                    };
+                    debug!(
+                        elapsed_ms = edge_exit_started.elapsed().as_millis() as u64,
+                        outcome = %outcome,
+                        "Edge normal-exit wait finished"
+                    );
+                    #[cfg(all(windows, feature = "containment-test-hooks"))]
+                    record_test_browser_lifecycle(
+                        "edge_normal_exit_wait_finished",
+                        serde_json::json!({
+                            "elapsed_ms": edge_exit_started.elapsed().as_millis() as u64,
+                            "outcome": outcome,
+                        }),
+                    )
+                    .await;
                 }
             }
             // Ask the browser to close gracefully via CDP.
             let graceful_close_confirmed = if child_exited {
                 true
             } else {
+                let graceful_close_started = std::time::Instant::now();
                 let graceful_close = tokio::time::timeout(
                     std::time::Duration::from_secs(2),
                     self.root.call("Browser.close", None),
                 )
                 .await;
-                matches!(graceful_close, Ok(Ok(_)))
+                let confirmed = matches!(graceful_close, Ok(Ok(_)));
+                let outcome = match graceful_close {
+                    Ok(Ok(_)) => "confirmed".to_owned(),
+                    Ok(Err(error)) => format!("failed: {error}"),
+                    Err(error) => format!("timed out: {error}"),
+                };
+                debug!(
+                    elapsed_ms = graceful_close_started.elapsed().as_millis() as u64,
+                    outcome = %outcome,
+                    "CDP Browser.close finished"
+                );
+                #[cfg(all(windows, feature = "containment-test-hooks"))]
+                record_test_browser_lifecycle(
+                    "cdp_browser_close_finished",
+                    serde_json::json!({
+                        "elapsed_ms": graceful_close_started.elapsed().as_millis() as u64,
+                        "outcome": outcome,
+                    }),
+                )
+                .await;
+                confirmed
             };
             if self.exact_policy_claimed.load(Ordering::Acquire)
                 && !graceful_close_confirmed
@@ -1048,24 +1368,94 @@ impl BrowserBackend for CdpBrowserBackend {
             // Let Chromium drain its process tree before forcing the owned root
             // process down. This avoids leaving profile files open on Windows.
             if let Some(ref mut child) = self._child {
-                let child_wait_timed_out = tokio::time::timeout(
+                let child_wait_started = std::time::Instant::now();
+                let child_wait = tokio::time::timeout(
                     std::time::Duration::from_secs(3),
                     child.wait(),
                 )
-                .await
-                .is_err();
-                if child_wait_timed_out {
-                    let _ = child.kill().await;
+                .await;
+                let child_exit_confirmed = matches!(child_wait, Ok(Ok(_)));
+                let outcome = match child_wait {
+                    Ok(Ok(status)) => format!("exited: {status}"),
+                    Ok(Err(error)) => format!("wait failed: {error}"),
+                    Err(error) => format!("timed out: {error}"),
+                };
+                debug!(
+                    elapsed_ms = child_wait_started.elapsed().as_millis() as u64,
+                    outcome = %outcome,
+                    "owned browser root wait finished"
+                );
+                #[cfg(all(windows, feature = "containment-test-hooks"))]
+                record_test_browser_lifecycle(
+                    "root_process_wait_finished",
+                    serde_json::json!({
+                        "elapsed_ms": child_wait_started.elapsed().as_millis() as u64,
+                        "outcome": outcome,
+                    }),
+                )
+                .await;
+                if !child_exit_confirmed {
+                    let kill_started = std::time::Instant::now();
+                    let kill = child.kill().await;
+                    debug!(
+                        elapsed_ms = kill_started.elapsed().as_millis() as u64,
+                        outcome = %match &kill {
+                            Ok(()) => "terminated".to_owned(),
+                            Err(error) => format!("failed: {error}"),
+                        },
+                        "owned browser root forced termination finished"
+                    );
+                    #[cfg(all(windows, feature = "containment-test-hooks"))]
+                    record_test_browser_lifecycle(
+                        "root_process_forced_termination_finished",
+                        serde_json::json!({
+                            "elapsed_ms": kill_started.elapsed().as_millis() as u64,
+                            "outcome": match &kill {
+                                Ok(()) => "terminated".to_owned(),
+                                Err(error) => format!("failed: {error}"),
+                            },
+                        }),
+                    )
+                    .await;
+                    kill?;
                 }
             }
             if let Some(process_tree) = self._process_tree.as_ref() {
+                let tree_wait_started = std::time::Instant::now();
                 let process_tree_empty = process_tree
                     .wait_until_empty(std::time::Duration::from_secs(2))
                     .await?;
+                debug!(
+                    elapsed_ms = tree_wait_started.elapsed().as_millis() as u64,
+                    empty = process_tree_empty,
+                    "owned browser process-tree drain finished"
+                );
+                #[cfg(all(windows, feature = "containment-test-hooks"))]
+                record_test_browser_lifecycle(
+                    "process_tree_drain_finished",
+                    serde_json::json!({
+                        "elapsed_ms": tree_wait_started.elapsed().as_millis() as u64,
+                        "empty": process_tree_empty,
+                    }),
+                )
+                .await;
                 if !process_tree_empty {
+                    let tree_termination_started = std::time::Instant::now();
                     process_tree
                         .terminate_and_wait(std::time::Duration::from_secs(3))
                         .await?;
+                    debug!(
+                        elapsed_ms = tree_termination_started.elapsed().as_millis() as u64,
+                        "owned browser process-tree forced termination finished"
+                    );
+                    #[cfg(all(windows, feature = "containment-test-hooks"))]
+                    record_test_browser_lifecycle(
+                        "process_tree_forced_termination_finished",
+                        serde_json::json!({
+                            "elapsed_ms": tree_termination_started.elapsed().as_millis() as u64,
+                        }),
+                    )
+                    .await;
                 }
             }
             if let Some(mut task) = self._stderr_task.take() {
@@ -1081,9 +1471,38 @@ impl BrowserBackend for CdpBrowserBackend {
             }
             let _ = self.client.close_transport().await;
             if self.profile_ephemeral {
-                remove_profile_dir_with_retry(&self.profile_dir).await?;
+                let profile_cleanup_started = std::time::Instant::now();
+                let attempts = remove_profile_dir_with_retry(&self.profile_dir).await?;
                 self.profile_ephemeral = false;
+                debug!(
+                    elapsed_ms = profile_cleanup_started.elapsed().as_millis() as u64,
+                    attempts,
+                    profile = %self.profile_dir.display(),
+                    "ephemeral browser profile cleanup finished"
+                );
+                #[cfg(all(windows, feature = "containment-test-hooks"))]
+                record_test_browser_lifecycle(
+                    "ephemeral_profile_cleanup_finished",
+                    serde_json::json!({
+                        "elapsed_ms": profile_cleanup_started.elapsed().as_millis() as u64,
+                        "attempts": attempts,
+                        "profile": self.profile_dir,
+                    }),
+                )
+                .await;
             }
+            debug!(
+                elapsed_ms = shutdown_started.elapsed().as_millis() as u64,
+                "owned CDP browser shutdown finished"
+            );
+            #[cfg(all(windows, feature = "containment-test-hooks"))]
+            record_test_browser_lifecycle(
+                "shutdown_finished",
+                serde_json::json!({
+                    "elapsed_ms": shutdown_started.elapsed().as_millis() as u64,
+                }),
+            )
+            .await;
             Ok(())
         })
     }

@@ -1337,10 +1337,14 @@ async fn run_task(
         }
         Err(error) => {
             observation.failure(station_error_class(&error, FailureClass::Unavailable));
+            #[cfg(feature = "containment-test-hooks")]
+            let message = format!("browser unavailable: {error}");
+            #[cfg(not(feature = "containment-test-hooks"))]
+            let message = "browser unavailable".to_owned();
             return failure(
                 request,
                 ResponseStatus::Unavailable,
-                "browser unavailable",
+                &message,
                 started,
             );
         }
