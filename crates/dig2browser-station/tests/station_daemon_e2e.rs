@@ -274,6 +274,10 @@ ws.onmessage=(event)=>{{document.title='ws-recv';}};\
             "file-upload" => "<input type=\"file\" id=\"f\"><span id=\"picked\">none</span><script>document.getElementById('f').addEventListener('change',function(e){document.getElementById('picked').textContent='picked:'+(e.target.files[0]?e.target.files[0].name:'');});</script>",
             // A download link (the download attribute forces same-origin download).
             "download-page" => "<a id=\"dl\" href=\"/download-file\" download=\"report.txt\">get</a>",
+            // A same-origin iframe (its src is served by this same fixture) whose
+            // child document carries a button — targeted via `iframe#inner >>> #btn`.
+            "iframe-parent" => "<iframe id=\"inner\" src=\"/iframe-child\"></iframe>",
+            "iframe-child" => "<button id=\"btn\">Inner Button</button>",
             _ => "",
         }
     );
@@ -2118,6 +2122,79 @@ async fn stationd_wait_for_download_captures_a_triggered_download_e2e() {
     assert!(status.success(), "download station failed: {status}");
     let (_, stderr) = read_child_output(&mut daemon).await;
     assert!(stderr.is_empty(), "clean download station wrote stderr: {stderr}");
+    remove_tree(&profiles).await;
+}
+
+// A.4.5 acceptance: a frame-piercing compound selector (`iframe#inner >>> #btn`)
+// resolves an element INSIDE a same-origin iframe, so an agent can target frame
+// content with the ordinary inspect-only steps — no new step, no gate, no
+// protocol change. Navigates a page with a same-origin iframe, waits for the
+// pierced selector to resolve, and reads the inner button's text over the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stationd_frame_piercing_selector_reaches_same_origin_iframe_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-stationd-iframe-e2e-{unique}");
+    let profiles = e2e_temp_base().join(format!(
+        "dig2browser-stationd-iframe-e2e-{unique}"
+    ));
+    std::fs::create_dir_all(&profiles).expect("create iframe profiles root");
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+    let mut daemon = spawn_stationd(stationd, &pipe_name, &profiles);
+
+    let client = StationClient::connect(
+        ClientConfig::new(&pipe_name, Duration::from_secs(15), Duration::from_secs(90))
+            .expect("valid iframe client config"),
+    )
+    .await
+    .expect("connect iframe station client");
+
+    let url = fixture.url("/iframe-parent");
+    let pierced = "iframe#inner >>> #btn".to_owned();
+    let task = CollectionTask::new(vec![
+        TaskStep::Navigate { url: url.clone() },
+        // The child frame loads asynchronously; wait for the pierced selector.
+        TaskStep::WaitForSelector {
+            selector: pierced.clone(),
+            timeout: Duration::from_secs(10),
+        },
+        TaskStep::ReadSelectorText { selector: pierced },
+    ])
+    .expect("valid iframe task");
+    let mut result = None;
+    for attempt in 0..8 {
+        match client.run_task("iframe-profile", task.clone()).await {
+            Ok(value) => {
+                result = Some(value);
+                break;
+            }
+            Err(ClientError::Remote {
+                status: ResponseStatus::Unavailable,
+                ..
+            }) if attempt < 7 => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            other => panic!("iframe task failed: {other:?}"),
+        }
+    }
+    let result = result.expect("iframe task after retries");
+    assert_eq!(result.replies().len(), 3);
+    assert_eq!(result.replies()[1], TaskReply::Acknowledged);
+    assert_eq!(
+        result.replies()[2],
+        TaskReply::Text("Inner Button".to_owned()),
+        "frame-piercing selector did not resolve the inner button"
+    );
+
+    client.shutdown().await.expect("request iframe station drain");
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("iframe station exit timeout")
+        .expect("wait for iframe station");
+    assert!(status.success(), "iframe station failed: {status}");
+    let (_, stderr) = read_child_output(&mut daemon).await;
+    assert!(stderr.is_empty(), "clean iframe station wrote stderr: {stderr}");
     remove_tree(&profiles).await;
 }
 
