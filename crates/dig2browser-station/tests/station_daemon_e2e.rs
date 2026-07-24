@@ -1344,6 +1344,229 @@ async fn in_process_station_chrome_session_import_reuse_e2e() {
     remove_tree(&profiles).await;
 }
 
+// Authenticated-crawl gate acceptance (negative): `CrawlManager::begin`
+// (crates/dig2browser-station/src/crawl.rs) rejects a non-Public
+// `profile_class` fail-closed when `--allow-authenticated-crawl` is off, even
+// though the crawl/durable gates are all enabled. The rejection happens
+// before any navigation or profile creation, so this needs no real login and
+// no fixture traffic — only the exact wire-surfaced error matters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stationd_authenticated_crawl_gate_rejects_when_disabled_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-authenticated-crawl-gate-e2e-{unique}");
+    let root = e2e_temp_base().join(format!(
+        "dig2browser-authenticated-crawl-gate-e2e-{unique}"
+    ));
+    let profiles = root.join("profiles");
+    let traces = root.join("traces");
+    let crawls = root.join("crawls");
+    for path in [&profiles, &traces, &crawls] {
+        std::fs::create_dir_all(path).expect("create authenticated-crawl-gate durable root");
+    }
+
+    let mut daemon = spawn_stationd_for_authenticated_crawl(
+        stationd,
+        &pipe_name,
+        &profiles,
+        &traces,
+        &crawls,
+        false,
+    );
+    let client = StationClient::connect(
+        ClientConfig::new(
+            &pipe_name,
+            Duration::from_secs(15),
+            Duration::from_secs(90),
+        )
+        .expect("valid authenticated-crawl-gate client config"),
+    )
+    .await
+    .expect("connect authenticated-crawl-gate client");
+
+    let seed_url = fixture.url("/auth-check");
+    let job_id = CrawlJobId::new(*uuid::Uuid::new_v4().as_bytes())
+        .expect("valid authenticated-crawl-gate job id");
+    let error = client
+        .begin_crawl_with_identity(
+            "authenticated-crawl-gate-profile",
+            job_id,
+            ProfileClass::Authenticated,
+            BrowserPersona::desktop_default(),
+            CrawlSpec::new(vec![seed_url.clone()], vec![fixture.origin()], 1, 0, 0)
+                .expect("valid authenticated-crawl-gate spec"),
+        )
+        .await
+        .expect_err("authenticated crawl must fail closed when the gate is disabled");
+    match error {
+        ClientError::Remote { status, message } => {
+            assert_eq!(status, ResponseStatus::Unsupported);
+            assert_eq!(message, "authenticated crawling unsupported");
+        }
+        other => panic!("unexpected authenticated-crawl gate error: {other:?}"),
+    }
+    assert!(
+        client.crawl_status(job_id).await.is_err(),
+        "a fail-closed authenticated crawl must not persist a job"
+    );
+
+    client
+        .shutdown()
+        .await
+        .expect("shutdown authenticated-crawl-gate station");
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("authenticated-crawl-gate exit timeout")
+        .expect("wait for authenticated-crawl-gate station");
+    assert!(
+        status.success(),
+        "authenticated-crawl-gate station failed: {status}"
+    );
+    let (_, stderr) = read_child_output(&mut daemon).await;
+    assert!(
+        stderr.is_empty(),
+        "authenticated-crawl-gate station stderr: {stderr}"
+    );
+    remove_tree(&root).await;
+}
+
+// Authenticated-crawl session-reuse acceptance (positive): with the full gate
+// set enabled, a session imported via `import_session` (no headful login) is
+// reused by an authenticated crawl — `CrawlManager::execute_page` leases
+// `IdentityRequest::authenticated_persona` for a non-Public job binding, which
+// installs the browser's own imported cookie onto the request. The fixture's
+// `/auth-check` route only renders the `auth-check-ok` marker when the
+// request actually carried the marker cookie, so a page artifact containing
+// that marker proves the crawl reused the harvested session rather than a
+// bare public persona. The cookie value itself is never read back over IPC —
+// only the resulting DOM marker is asserted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stationd_authenticated_crawl_reuses_imported_session_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-authenticated-crawl-reuse-e2e-{unique}");
+    let root = e2e_temp_base().join(format!(
+        "dig2browser-authenticated-crawl-reuse-e2e-{unique}"
+    ));
+    let profiles = root.join("profiles");
+    let traces = root.join("traces");
+    let crawls = root.join("crawls");
+    for path in [&profiles, &traces, &crawls] {
+        std::fs::create_dir_all(path).expect("create authenticated-crawl-reuse durable root");
+    }
+
+    let mut daemon = spawn_stationd_for_authenticated_crawl(
+        stationd,
+        &pipe_name,
+        &profiles,
+        &traces,
+        &crawls,
+        true,
+    );
+    let client = StationClient::connect(
+        ClientConfig::new(
+            &pipe_name,
+            Duration::from_secs(15),
+            Duration::from_secs(90),
+        )
+        .expect("valid authenticated-crawl-reuse client config"),
+    )
+    .await
+    .expect("connect authenticated-crawl-reuse client");
+
+    let profile_id = "authenticated-crawl-reuse-profile";
+    let persona = BrowserPersona::desktop_default();
+
+    // The prepared session: the same marker cookie the fixture's /auth-check
+    // looks for, host-only for the fixture host (localhost). import_session
+    // reads this from a local file — the cookie bytes never cross the pipe.
+    let session_path = root.join("session.json");
+    std::fs::write(
+        &session_path,
+        r#"{"version":1,"cookies":[{"name":"dig2browser_auth_e2e","value":"cookie-secret","domain":"localhost","path":"/"}]}"#,
+    )
+    .expect("write authenticated-crawl-reuse session file");
+    client
+        .import_session(
+            profile_id,
+            persona.clone(),
+            session_path
+                .to_str()
+                .expect("session path is UTF-8")
+                .to_owned(),
+        )
+        .await
+        .expect("import authenticated-crawl-reuse session");
+
+    let seed_url = fixture.url("/auth-check");
+    let job_id = CrawlJobId::new(*uuid::Uuid::new_v4().as_bytes())
+        .expect("valid authenticated-crawl-reuse job id");
+    client
+        .begin_crawl_with_identity(
+            profile_id,
+            job_id,
+            ProfileClass::Authenticated,
+            persona,
+            CrawlSpec::new(vec![seed_url.clone()], vec![fixture.origin()], 1, 0, 0)
+                .expect("valid authenticated-crawl-reuse spec"),
+        )
+        .await
+        .expect("begin authenticated crawl reusing the imported session");
+
+    let events = wait_for_complete_product_crawl(&client, job_id).await;
+    assert_eq!(
+        client
+            .crawl_status(job_id)
+            .await
+            .expect("read authenticated-crawl-reuse status")
+            .phase(),
+        CrawlPhase::Succeeded,
+    );
+    let succeeded = events
+        .iter()
+        .find(|event| event.kind() == CrawlEventKind::PageSucceeded)
+        .expect("authenticated crawl page succeeded");
+    assert_eq!(succeeded.canonical_url(), Some(seed_url.as_str()));
+    assert_eq!(succeeded.http_status(), Some(200));
+    let page = succeeded
+        .page()
+        .expect("authenticated crawl page has a durable artifact");
+    let html_bytes = read_complete_artifact(&client, page.collection_id(), page.html()).await;
+    let html = String::from_utf8(html_bytes)
+        .expect("authenticated crawl artifact is UTF-8 HTML");
+    // Reuse proof: the fixture only renders auth-check-ok when the request
+    // carried the imported cookie, so this marker means the crawl leased the
+    // Authenticated identity and the browser transmitted the imported cookie.
+    assert!(
+        html.contains("data-daemon-e2e=\"auth-check-ok\""),
+        "authenticated crawl did not reuse the imported session: {html}"
+    );
+    assert!(!html.contains("cookie-secret"));
+
+    client
+        .shutdown()
+        .await
+        .expect("shutdown authenticated-crawl-reuse station");
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("authenticated-crawl-reuse exit timeout")
+        .expect("wait for authenticated-crawl-reuse station");
+    assert!(
+        status.success(),
+        "authenticated-crawl-reuse station failed: {status}"
+    );
+    let (_, stderr) = read_child_output(&mut daemon).await;
+    assert!(
+        stderr.is_empty(),
+        "authenticated-crawl-reuse station stderr: {stderr}"
+    );
+    remove_tree(&root).await;
+}
+
 // P1.1 acceptance: an agent starts a live monitor over the pipe and reads a
 // page's real WebSocket traffic — both directions, typed, with the endpoint
 // url correlated — without hand-rolling any browser plumbing. This is the
@@ -4413,6 +4636,60 @@ fn spawn_stationd_for_product_matrix(
         .kill_on_drop(true)
         .spawn()
         .expect("spawn product matrix station daemon")
+}
+
+/// The authenticated-crawl E2E gate set: the four crawl/durable gates plus
+/// `--allow-session-import` (needed by the positive reuse test) and, when
+/// `allow_authenticated_crawl` is set, `--allow-authenticated-crawl` itself —
+/// the negative gate test spawns with this flag `false` to prove the
+/// fail-closed rejection in `CrawlManager::begin`.
+fn spawn_stationd_for_authenticated_crawl(
+    stationd: &str,
+    pipe_name: &str,
+    profiles: &Path,
+    traces: &Path,
+    crawls: &Path,
+    allow_authenticated_crawl: bool,
+) -> tokio::process::Child {
+    let mut command = tokio::process::Command::new(stationd);
+    command.args([
+        "--pipe-name",
+        pipe_name,
+        "--profiles-root",
+        profiles.to_str().expect("profiles path is UTF-8"),
+        "--trace-root",
+        traces.to_str().expect("trace path is UTF-8"),
+        "--crawl-root",
+        crawls.to_str().expect("crawl path is UTF-8"),
+        "--runtime",
+        "chrome",
+        "--max-resident",
+        "2",
+        "--max-in-flight",
+        "4",
+        "--max-connections",
+        "8",
+        "--timeout-seconds",
+        "90",
+        "--drain-seconds",
+        "15",
+        "--allow-remote-shutdown",
+        "--allow-session-import",
+        "--allow-crawl-read",
+        "--allow-crawl-write",
+        "--allow-durable-read",
+        "--allow-durable-write",
+    ]);
+    if allow_authenticated_crawl {
+        command.arg("--allow-authenticated-crawl");
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn authenticated-crawl station daemon")
 }
 
 fn matrix_task(runtime: RuntimeKind, steps: Vec<TaskStep>) -> CollectionTask {
