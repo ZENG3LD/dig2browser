@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dig2browser::agentic::{AgentReply, CapabilitySet, CaptureArtifact};
+use dig2browser_protocol::shape::{ColumnType, OutputSchema, RowPage, ShapeCursor};
 use dig2browser_protocol::{
     ArtifactChunk, ArtifactMediaType, ArtifactRef, ArtifactRole, CollectionId,
     CollectionReceipt, CollectionReceiptArtifacts, CollectionReceiptMetadata,
@@ -17,6 +18,7 @@ use dig2browser_protocol::{
     MAX_PNG_BYTES, MAX_SELECTOR_BYTES, MAX_TITLE_BYTES, MAX_TRACE_EVENTS,
     PROTOCOL_VERSION,
 };
+use dig2browser_shape::CaptureMeta;
 use dig2browser_trace::{LedgerError, TraceLedger};
 use tokio::sync::Mutex;
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
@@ -480,6 +482,103 @@ impl CollectionManager {
         self.with_ledger(|ledger| {
             ledger.read_artifact(collection_id, sha256, offset, max_bytes)
         })
+    }
+
+    /// Declarative output shaping (Phase C, axis 7): project a collection's
+    /// captured HTML onto `schema` and return one page of the resulting
+    /// rows. Re-shapes the whole document on every call — `shape()` is pure
+    /// and synchronous and the HTML is bounded (`MAX_HTML_BYTES`), so this
+    /// is the accepted v1 simplification over caching projected rows across
+    /// pages.
+    pub(crate) fn read_shaped(
+        &self,
+        collection_id: CollectionId,
+        schema: &OutputSchema,
+        cursor: ShapeCursor,
+        limit: u16,
+    ) -> Result<RowPage, CollectionError> {
+        let receipt = self.read_receipt(collection_id)?;
+        let html = self.read_verified_artifact_bytes(
+            collection_id,
+            receipt.html(),
+            MAX_HTML_BYTES,
+        )?;
+        let meta = CaptureMeta {
+            url: receipt.final_url().to_owned(),
+            final_url: receipt.final_url().to_owned(),
+            http_status: receipt.http_status(),
+            title: receipt.title().unwrap_or_default().to_owned(),
+            ready_state: receipt.ready_state().to_owned(),
+            captured_at: i64::try_from(receipt.completed_at_unix_ms()).unwrap_or(i64::MAX),
+            source_id: hex_collection_id(collection_id),
+        };
+        let all_rows = dig2browser_shape::shape(&html, &meta, schema)
+            .map_err(|error| CollectionError::Shape(error.to_string()))?;
+
+        let columns: Vec<(String, ColumnType)> = schema
+            .columns()
+            .iter()
+            .map(|column| (column.name().to_owned(), column.ty()))
+            .collect();
+        let total = all_rows.len();
+        let start = usize::try_from(cursor.value()).unwrap_or(usize::MAX);
+        if start > total {
+            return RowPage::new(columns, Vec::new(), None, true).map_err(CollectionError::from);
+        }
+        let limit = usize::from(limit);
+        let end = start.saturating_add(limit).min(total);
+        let page_rows = all_rows[start..end].to_vec();
+        let complete = end >= total;
+        let next_cursor = if complete {
+            None
+        } else {
+            Some(ShapeCursor::new(u64::try_from(end).unwrap_or(u64::MAX)))
+        };
+        RowPage::new(columns, page_rows, next_cursor, complete).map_err(CollectionError::from)
+    }
+
+    /// Read one artifact's full bytes from the CAS via the existing chunked
+    /// re-hashing reader (`read_artifact`), assembling from offset 0 until
+    /// EOF, then asserting the assembled length matches `artifact.len()` and
+    /// the whole-blob digest matches `artifact.sha256()`. Shared by
+    /// [`Self::read_shaped`] and `verify_receipt_artifact`.
+    fn read_verified_artifact_bytes(
+        &self,
+        collection_id: CollectionId,
+        artifact: &ArtifactRef,
+        max_len: usize,
+    ) -> Result<Vec<u8>, CollectionError> {
+        let capacity = usize::try_from(artifact.len())
+            .map_err(|_| CollectionError::CorruptReceipt)?;
+        if capacity == 0 || capacity > max_len {
+            return Err(CollectionError::CorruptReceipt);
+        }
+        let mut bytes = Vec::with_capacity(capacity);
+        let mut offset = 0_u64;
+        loop {
+            let chunk = self.read_artifact(
+                collection_id,
+                *artifact.sha256(),
+                offset,
+                u32::try_from(MAX_ARTIFACT_CHUNK_BYTES).unwrap_or(u32::MAX),
+            )?;
+            bytes.extend_from_slice(chunk.bytes());
+            offset = offset
+                .checked_add(
+                    u64::try_from(chunk.bytes().len())
+                        .map_err(|_| CollectionError::CorruptReceipt)?,
+                )
+                .ok_or(CollectionError::CorruptReceipt)?;
+            if chunk.is_eof() {
+                break;
+            }
+        }
+        if offset != artifact.len()
+            || dig2browser::digest::sha256_bytes(&bytes) != *artifact.sha256()
+        {
+            return Err(CollectionError::CorruptReceipt);
+        }
+        Ok(bytes)
     }
 
     pub(crate) async fn cancel(
@@ -963,8 +1062,6 @@ fn verify_receipt_artifact(
     collection_id: CollectionId,
     artifact: &ArtifactRef,
 ) -> Result<(), CollectionError> {
-    let capacity = usize::try_from(artifact.len())
-        .map_err(|_| CollectionError::CorruptReceipt)?;
     let max_len = match artifact.media_type() {
         ArtifactMediaType::TextHtmlUtf8 => MAX_HTML_BYTES,
         ArtifactMediaType::ImagePng => MAX_PNG_BYTES,
@@ -975,35 +1072,21 @@ fn verify_receipt_artifact(
             return Err(CollectionError::CorruptReceipt)
         }
     };
-    if capacity == 0 || capacity > max_len {
-        return Err(CollectionError::CorruptReceipt);
+    manager
+        .read_verified_artifact_bytes(collection_id, artifact, max_len)
+        .map(|_| ())
+}
+
+/// Lower-hex encode a [`CollectionId`], used as `CaptureMeta::source_id` for
+/// declarative output shaping — the same rendering `capture_receipt_name`
+/// uses for receipt file names.
+fn hex_collection_id(collection_id: CollectionId) -> String {
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(32);
+    for byte in collection_id.as_bytes() {
+        let _ = write!(&mut hex, "{byte:02x}");
     }
-    let mut bytes = Vec::with_capacity(capacity);
-    let mut offset = 0_u64;
-    loop {
-        let chunk = manager.read_artifact(
-            collection_id,
-            *artifact.sha256(),
-            offset,
-            u32::try_from(MAX_ARTIFACT_CHUNK_BYTES).unwrap_or(u32::MAX),
-        )?;
-        bytes.extend_from_slice(chunk.bytes());
-        offset = offset
-            .checked_add(
-                u64::try_from(chunk.bytes().len())
-                    .map_err(|_| CollectionError::CorruptReceipt)?,
-            )
-            .ok_or(CollectionError::CorruptReceipt)?;
-        if chunk.is_eof() {
-            break;
-        }
-    }
-    if offset != artifact.len()
-        || dig2browser::digest::sha256_bytes(&bytes) != *artifact.sha256()
-    {
-        return Err(CollectionError::CorruptReceipt);
-    }
-    Ok(())
+    hex
 }
 
 fn read_capture_receipt(
@@ -1479,6 +1562,8 @@ pub enum CollectionError {
     ManagerStatePoisoned,
     #[error("trace ledger mutex is poisoned")]
     LedgerPoisoned,
+    #[error("output shaping failed: {0}")]
+    Shape(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

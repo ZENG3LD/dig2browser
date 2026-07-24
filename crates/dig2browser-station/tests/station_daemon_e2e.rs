@@ -22,6 +22,8 @@ use dig2browser_client::{
     RuntimeRequirements, RuntimeSelector, SessionHealthProbe, SessionPhase,
     SessionStateUpdate, StationClient, StationStatus, SupportLevel, TabInfo,
     TaskCapturePolicy, TaskReply, TaskRuntimeContract, TaskStep,
+    Cardinality, Column, ColumnType, CssPick, Extractor, OnError, OutputSchema,
+    ShapeCursor, Value,
     TerminalOutcome, TraceCursor, TraceEvent, TraceEventKind,
     WebSocketDirection, WebSocketOpcode, PROTOCOL_VERSION,
 };
@@ -281,6 +283,9 @@ ws.onmessage=(event)=>{{document.title='ws-recv';}};\
             // A link that opens a second same-origin tab (target=_blank) — used to
             // prove ListTabs sees the popup and SwitchToTab drives it.
             "popup-parent" => "<a id=\"pop\" href=\"/popup-child\" target=\"_blank\">open</a>",
+            // A catalog of repeating .product-card items — the item-scope
+            // acceptance fixture for declarative output shaping (read_shaped).
+            "catalog" => "<div class=\"product-card\"><span class=\"name\">Widget A</span><span class=\"price\">9.99</span><a href=\"/products/widget-a\">buy</a></div><div class=\"product-card\"><span class=\"name\">Widget B</span><span class=\"price\">14.50</span><a href=\"/products/widget-b\">buy</a></div><div class=\"product-card\"><span class=\"name\">Widget C</span><span class=\"price\">3.25</span><a href=\"/products/widget-c\">buy</a></div>",
             _ => "",
         }
     );
@@ -4415,6 +4420,256 @@ async fn run_auth_cli(
 
 fn spawn_stationd(stationd: &str, pipe_name: &str, profiles: &Path) -> tokio::process::Child {
     spawn_stationd_with_permissions(stationd, pipe_name, profiles, true, true, false)
+}
+
+// Phase C slice 3 acceptance: the full "declare a SQL-ish schema -> get typed
+// rows, no consumer-side HTML parsing" contract, over the wire. Capture a
+// catalog page of repeating .product-card items, declare an item-scope schema,
+// read_shaped it, and assert the exact projected rows — then page it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stationd_read_shaped_projects_captured_catalog_into_declared_rows_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-read-shaped-e2e-{unique}");
+    let root = e2e_temp_base().join(format!("dig2browser-read-shaped-e2e-{unique}"));
+    let profiles = root.join("profiles");
+    let traces = root.join("traces");
+    for path in [&profiles, &traces] {
+        std::fs::create_dir_all(path).expect("create read-shaped durable root");
+    }
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+    let mut daemon = spawn_stationd_for_output_shaping(stationd, &pipe_name, &profiles, &traces);
+    let client = StationClient::connect(
+        ClientConfig::new(&pipe_name, Duration::from_secs(15), Duration::from_secs(90))
+            .expect("valid read-shaped client config"),
+    )
+    .await
+    .expect("connect read-shaped client");
+
+    // Capture the catalog page into the CAS (HtmlOnly is all shaping needs).
+    let collection_id = CollectionId::new(*uuid::Uuid::new_v4().as_bytes())
+        .expect("nonzero read-shaped collection id");
+    let task = CollectionTask::new_with_runtime(
+        vec![
+            TaskStep::Navigate { url: fixture.url("/catalog") },
+            TaskStep::Capture { policy: TaskCapturePolicy::HtmlOnly },
+        ],
+        TaskRuntimeContract::new(
+            RuntimeSelector::Exact(RuntimeKind::Chrome),
+            RuntimeRequirements::new(Vec::new(), false)
+                .expect("valid read-shaped runtime requirements"),
+        )
+        .expect("valid read-shaped runtime contract"),
+    )
+    .expect("valid catalog capture task");
+    client
+        .begin_collection_with_id("read-shaped-profile", collection_id, task)
+        .await
+        .expect("begin catalog collection");
+    let events = wait_for_complete_trace(&client, collection_id).await;
+    assert!(
+        events.iter().any(|event| matches!(
+            event.kind(),
+            TraceEventKind::Terminal(terminal) if terminal.outcome() == TerminalOutcome::Succeeded
+        )),
+        "catalog collection did not reach a Succeeded terminal"
+    );
+
+    // Declare the item-scope schema and read shaped rows over the wire.
+    let schema = OutputSchema::new(
+        "products".to_owned(),
+        Cardinality::ItemScope(".product-card".to_owned()),
+        vec![
+            Column::new(
+                "name".to_owned(),
+                ColumnType::Text,
+                Extractor::Css { selector: ".name".to_owned(), pick: CssPick::Text },
+                OnError::Null,
+            )
+            .expect("name column"),
+            Column::new(
+                "price".to_owned(),
+                ColumnType::Real,
+                Extractor::Css { selector: ".price".to_owned(), pick: CssPick::Text },
+                OnError::Null,
+            )
+            .expect("price column"),
+            Column::new(
+                "link".to_owned(),
+                ColumnType::Text,
+                Extractor::Css { selector: "a".to_owned(), pick: CssPick::Attr("href".to_owned()) },
+                OnError::Null,
+            )
+            .expect("link column"),
+        ],
+    )
+    .expect("valid item-scope schema");
+
+    let page = client
+        .read_shaped(collection_id, schema.clone(), ShapeCursor::START, 10)
+        .await
+        .expect("read shaped catalog rows");
+    assert!(page.is_complete());
+    assert_eq!(page.next_cursor(), None);
+    assert_eq!(
+        page.columns(),
+        &[
+            ("name".to_owned(), ColumnType::Text),
+            ("price".to_owned(), ColumnType::Real),
+            ("link".to_owned(), ColumnType::Text),
+        ]
+    );
+    let rows: Vec<&[Value]> = page.rows().iter().map(|row| row.values()).collect();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        rows[0],
+        &[
+            Value::Text("Widget A".to_owned()),
+            Value::Real(9.99),
+            Value::Text("/products/widget-a".to_owned()),
+        ]
+    );
+    assert_eq!(
+        rows[1],
+        &[
+            Value::Text("Widget B".to_owned()),
+            Value::Real(14.5),
+            Value::Text("/products/widget-b".to_owned()),
+        ]
+    );
+    assert_eq!(
+        rows[2],
+        &[
+            Value::Text("Widget C".to_owned()),
+            Value::Real(3.25),
+            Value::Text("/products/widget-c".to_owned()),
+        ]
+    );
+
+    // Paging: limit 2 -> first two rows + a continuation cursor, then the rest.
+    let first = client
+        .read_shaped(collection_id, schema.clone(), ShapeCursor::START, 2)
+        .await
+        .expect("read shaped page 1");
+    assert!(!first.is_complete());
+    assert_eq!(first.rows().len(), 2);
+    let cursor = first.next_cursor().expect("continuation cursor after a partial page");
+    let second = client
+        .read_shaped(collection_id, schema, cursor, 2)
+        .await
+        .expect("read shaped page 2");
+    assert!(second.is_complete());
+    assert_eq!(second.rows().len(), 1);
+    assert_eq!(second.rows()[0].values()[0], Value::Text("Widget C".to_owned()));
+
+    client.shutdown().await.expect("shutdown read-shaped station");
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("read-shaped exit timeout")
+        .expect("wait for read-shaped station");
+    assert!(status.success(), "read-shaped station failed: {status}");
+    let (_, stderr) = read_child_output(&mut daemon).await;
+    assert!(stderr.is_empty(), "read-shaped station stderr: {stderr}");
+    remove_tree(&root).await;
+}
+
+// Phase C slice 3: read_shaped is default-deny — with the durable gates open
+// but --allow-output-shaping off, the request fails closed before any receipt
+// lookup, so a bare collection id is enough to prove the gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stationd_read_shaped_is_gated_by_allow_output_shaping_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-read-shaped-gate-e2e-{unique}");
+    let root = e2e_temp_base().join(format!("dig2browser-read-shaped-gate-e2e-{unique}"));
+    let profiles = root.join("profiles");
+    let traces = root.join("traces");
+    for path in [&profiles, &traces] {
+        std::fs::create_dir_all(path).expect("create read-shaped-gate durable root");
+    }
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+    // Durable gates enabled, but NOT --allow-output-shaping.
+    let mut daemon = spawn_stationd_with_trace(stationd, &pipe_name, &profiles, &traces);
+    let client = StationClient::connect(
+        ClientConfig::new(&pipe_name, Duration::from_secs(15), Duration::from_secs(90))
+            .expect("valid read-shaped-gate client config"),
+    )
+    .await
+    .expect("connect read-shaped-gate client");
+
+    let schema = OutputSchema::new(
+        "page".to_owned(),
+        Cardinality::PageLevel,
+        vec![Column::new(
+            "title".to_owned(),
+            ColumnType::Text,
+            Extractor::Css { selector: "title".to_owned(), pick: CssPick::Text },
+            OnError::Null,
+        )
+        .expect("title column")],
+    )
+    .expect("valid gate-test schema");
+    let collection_id = CollectionId::new(*uuid::Uuid::new_v4().as_bytes())
+        .expect("nonzero gate-test collection id");
+    let error = client
+        .read_shaped(collection_id, schema, ShapeCursor::START, 10)
+        .await
+        .expect_err("read_shaped must fail closed when --allow-output-shaping is off");
+    assert!(
+        matches!(error, ClientError::Remote { status: ResponseStatus::Invalid, .. }),
+        "unexpected read-shaped gate error: {error:?}"
+    );
+
+    client.shutdown().await.expect("shutdown read-shaped-gate station");
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("read-shaped-gate exit timeout")
+        .expect("wait for read-shaped-gate station");
+    assert!(status.success(), "read-shaped-gate station failed: {status}");
+    let (_, stderr) = read_child_output(&mut daemon).await;
+    assert!(stderr.is_empty(), "read-shaped-gate station stderr: {stderr}");
+    remove_tree(&root).await;
+}
+
+fn spawn_stationd_for_output_shaping(
+    stationd: &str,
+    pipe_name: &str,
+    profiles: &Path,
+    traces: &Path,
+) -> tokio::process::Child {
+    let mut command = tokio::process::Command::new(stationd);
+    command.args([
+        "--pipe-name",
+        pipe_name,
+        "--profiles-root",
+        profiles.to_str().expect("profiles path is UTF-8"),
+        "--trace-root",
+        traces.to_str().expect("trace path is UTF-8"),
+        "--runtime",
+        "chrome",
+        "--max-resident",
+        "1",
+        "--max-in-flight",
+        "4",
+        "--max-connections",
+        "8",
+        "--timeout-seconds",
+        "90",
+        "--drain-seconds",
+        "15",
+        "--allow-remote-shutdown",
+        "--allow-durable-read",
+        "--allow-durable-write",
+        "--allow-output-shaping",
+    ]);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn output-shaping station daemon")
 }
 
 fn spawn_stationd_with_trace(

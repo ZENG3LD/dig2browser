@@ -643,6 +643,7 @@ dependencies = [
  "dig2browser-probe",
  "dig2browser-protocol",
  "dig2browser-runtime-lightweight",
+ "dig2browser-shape",
  "dig2browser-trace",
  "futures",
  "serde",

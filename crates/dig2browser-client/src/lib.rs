@@ -40,6 +40,12 @@ pub use dig2browser_protocol::{
     MAX_LIVE_URL_BYTES, MAX_TAB_ID_BYTES, MAX_TABS, MAX_TRACE_EVENTS,
     DEFAULT_STATION_PIPE, HOST_DIRECT, PROTOCOL_VERSION,
 };
+pub use dig2browser_protocol::shape::{
+    Cardinality, Column, ColumnType, CssPick, Extractor, MetaField, OnError, OutputSchema,
+    Row, RowPage, ShapeCursor, Value, MAX_ATTR_NAME_BYTES, MAX_COLUMN_NAME_BYTES,
+    MAX_JSON_POINTER_BYTES, MAX_REGEX_PATTERN_BYTES, MAX_ROWS_PER_PAGE, MAX_SCHEMA_COLUMNS,
+    MAX_TABLE_NAME_BYTES, MAX_VALUE_BLOB_BYTES, MAX_VALUE_TEXT_BYTES,
+};
 
 const MIN_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -342,6 +348,28 @@ impl StationClient {
             .map_err(|_| ClientError::InvalidCollectionRequest)?;
         let response = require_collection_response(&self.call(request).await?)?;
         require_collection_receipt(response, collection_id)
+    }
+
+    /// Declarative output shaping (Phase C, axis 7): project a collection's
+    /// captured HTML onto `schema` and read one page of the resulting rows.
+    /// Requires the station operator's `--allow-output-shaping` (and, since
+    /// it reads a durable artifact, `--allow-durable-read`).
+    pub async fn read_shaped(
+        &self,
+        collection_id: CollectionId,
+        schema: OutputSchema,
+        cursor: ShapeCursor,
+        limit: u16,
+    ) -> Result<RowPage, ClientError> {
+        let collection = CollectionRequest::read_shaped(collection_id, schema, cursor, limit)
+            .map_err(|_| ClientError::InvalidCollectionRequest)?;
+        let request = WorkerRequest::collection(self.take_request_id(), collection)
+            .map_err(|_| ClientError::InvalidCollectionRequest)?;
+        let response = require_collection_response(&self.call(request).await?)?;
+        let CollectionResponse::ShapedRows(page) = response else {
+            return Err(ClientError::InvalidResponse);
+        };
+        Ok(page)
     }
 
     pub async fn cancel_collection(
@@ -1030,6 +1058,17 @@ impl BlockingStationClient {
     ) -> Result<CollectionReceipt, ClientError> {
         self.runtime
             .block_on(self.client.read_collection_receipt(collection_id))
+    }
+
+    pub fn read_shaped(
+        &self,
+        collection_id: CollectionId,
+        schema: OutputSchema,
+        cursor: ShapeCursor,
+        limit: u16,
+    ) -> Result<RowPage, ClientError> {
+        self.runtime
+            .block_on(self.client.read_shaped(collection_id, schema, cursor, limit))
     }
 
     pub fn cancel_collection(

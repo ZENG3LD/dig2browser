@@ -246,6 +246,12 @@ struct Cli {
         help = "Allow a WaitForDownload task step to capture a page-triggered download and return its bytes"
     )]
     allow_downloads: bool,
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Allow read-side declarative output shaping (read_shaped) over a collection's captured HTML; also requires --allow-durable-read"
+    )]
+    allow_output_shaping: bool,
 }
 
 #[cfg(windows)]
@@ -535,7 +541,8 @@ async fn run(cli: Cli) -> Result<DaemonReport, DaemonError> {
         .allow_live_events(cli.allow_live_events)
         .allow_session_import(cli.allow_session_import)
         .allow_file_upload(cli.allow_file_upload)
-        .allow_downloads(cli.allow_downloads);
+        .allow_downloads(cli.allow_downloads)
+        .allow_output_shaping(cli.allow_output_shaping);
         if let Some(trace_root) = cli.trace_root {
             server_config = server_config.trace_root(trace_root)?;
         }

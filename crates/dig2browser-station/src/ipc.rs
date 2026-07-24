@@ -199,6 +199,7 @@ pub struct ServerConfig {
     allow_session_import: bool,
     allow_file_upload: bool,
     allow_downloads: bool,
+    allow_output_shaping: bool,
 }
 
 impl ServerConfig {
@@ -240,6 +241,7 @@ impl ServerConfig {
             allow_session_import: false,
             allow_file_upload: false,
             allow_downloads: false,
+            allow_output_shaping: false,
         })
     }
 
@@ -364,6 +366,15 @@ impl ServerConfig {
     /// station reads the file locally, so no cookie material crosses the pipe.
     pub fn allow_session_import(mut self, allow: bool) -> Self {
         self.allow_session_import = allow;
+        self
+    }
+
+    /// Allow read-side declarative output shaping (`read_shaped`) over a
+    /// collection's captured HTML. Default-deny; the effective gate at the
+    /// dispatch site is this flag **and** `--allow-durable-read` (shaping
+    /// reads a durable artifact).
+    pub fn allow_output_shaping(mut self, allow: bool) -> Self {
+        self.allow_output_shaping = allow;
         self
     }
 
@@ -544,6 +555,7 @@ async fn run_windows_server(
                         session_import: config.allow_session_import,
                         file_upload: config.allow_file_upload,
                         download: config.allow_downloads,
+                        output_shaping: config.allow_output_shaping,
                     },
                 };
                 connections.spawn(async move {
@@ -800,6 +812,7 @@ struct TaskPermissions {
     session_import: bool,
     file_upload: bool,
     download: bool,
+    output_shaping: bool,
 }
 
 async fn crawl_request(
@@ -1230,6 +1243,26 @@ async fn collection_request(
                 .read_receipt(*collection_id)
                 .map(CollectionResponse::Receipt)
         }
+        CollectionRequest::ReadShaped {
+            collection_id,
+            schema,
+            cursor,
+            limit,
+        } => {
+            // Output shaping reads a durable artifact, so it is gated on
+            // both its own flag and the durable-read gate the sibling reads
+            // use.
+            if !permissions.output_shaping || !permissions.durable_read {
+                return WorkerResponse::failure(
+                    request,
+                    ResponseStatus::Invalid,
+                    "output shaping disabled",
+                );
+            }
+            collections
+                .read_shaped(*collection_id, schema, *cursor, *limit)
+                .map(CollectionResponse::ShapedRows)
+        }
         CollectionRequest::Cancel { collection_id } => {
             if !permissions.durable_write {
                 return WorkerResponse::failure(
@@ -1266,6 +1299,7 @@ fn collection_error_response(
     let (status, message) = match error {
         CollectionError::CollectionConflict
         | CollectionError::InvalidTask
+        | CollectionError::Shape(_)
         | CollectionError::Station(
             StationError::Identity(_)
             | StationError::PersonaMismatch

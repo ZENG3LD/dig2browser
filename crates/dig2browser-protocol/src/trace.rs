@@ -5,6 +5,7 @@ use crate::{
     MAX_REQUEST_BYTES, MAX_TITLE_BYTES, MAX_COLLECTOR_VERSION_BYTES,
     MAX_SELECTOR_BYTES, PROTOCOL_VERSION,
 };
+use crate::shape::{OutputSchema, RowPage, ShapeCursor, MAX_ROWS_PER_PAGE};
 
 pub const MAX_TRACE_EVENTS: usize = 64;
 pub const MAX_TRACE_STEP_SUMMARIES: usize = 64;
@@ -370,6 +371,14 @@ pub enum CollectionRequest {
     ReadReceipt {
         collection_id: CollectionId,
     },
+    /// Declarative output shaping (Phase C, axis 7) over a collection's
+    /// captured HTML: project it onto `schema` and page the resulting rows.
+    ReadShaped {
+        collection_id: CollectionId,
+        schema: OutputSchema,
+        cursor: ShapeCursor,
+        limit: u16,
+    },
     Cancel {
         collection_id: CollectionId,
     },
@@ -434,6 +443,22 @@ impl CollectionRequest {
         Ok(request)
     }
 
+    pub fn read_shaped(
+        collection_id: CollectionId,
+        schema: OutputSchema,
+        cursor: ShapeCursor,
+        limit: u16,
+    ) -> Result<Self, ProtocolError> {
+        let request = Self::ReadShaped {
+            collection_id,
+            schema,
+            cursor,
+            limit,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
     pub fn is_begin(&self) -> bool {
         matches!(self, Self::Begin { .. })
     }
@@ -444,6 +469,7 @@ impl CollectionRequest {
             | Self::ReadTrace { collection_id, .. }
             | Self::ReadArtifact { collection_id, .. }
             | Self::ReadReceipt { collection_id }
+            | Self::ReadShaped { collection_id, .. }
             | Self::Cancel { collection_id } => *collection_id,
         }
     }
@@ -503,6 +529,23 @@ impl CollectionRequest {
                 output.push(0);
                 output.extend_from_slice(collection_id.as_bytes());
             }
+            Self::ReadShaped {
+                collection_id,
+                schema,
+                cursor,
+                limit,
+            } => {
+                output.push(6);
+                output.push(0);
+                output.extend_from_slice(collection_id.as_bytes());
+                let schema_bytes = schema.encode()?;
+                let schema_len = u32::try_from(schema_bytes.len())
+                    .map_err(|_| ProtocolError::InvalidCollectionPayload)?;
+                output.extend_from_slice(&schema_len.to_le_bytes());
+                output.extend_from_slice(&schema_bytes);
+                output.extend_from_slice(&cursor.value().to_le_bytes());
+                output.extend_from_slice(&limit.to_le_bytes());
+            }
         }
         if output.len() > MAX_REQUEST_BYTES {
             return Err(ProtocolError::InvalidCollectionPayload);
@@ -546,6 +589,15 @@ impl CollectionRequest {
             )?,
             4 => Self::cancel(input.collection_id()?)?,
             5 => Self::read_receipt(input.collection_id()?)?,
+            6 => {
+                let collection_id = input.collection_id()?;
+                let schema_len = usize::try_from(input.u32()?)
+                    .map_err(|_| ProtocolError::InvalidCollectionPayload)?;
+                let schema = OutputSchema::decode(input.bytes(schema_len)?)?;
+                let cursor = ShapeCursor::new(input.u64()?);
+                let limit = input.u16()?;
+                Self::read_shaped(collection_id, schema, cursor, limit)?
+            }
             _ => return Err(ProtocolError::InvalidCollectionPayload),
         };
         if !input.is_empty() {
@@ -595,6 +647,19 @@ impl CollectionRequest {
                     || u64::from(*max_bytes)
                         > MAX_ARTIFACT_CHUNK_BYTES as u64
                 {
+                    return Err(ProtocolError::InvalidCollectionPayload);
+                }
+                Ok(())
+            }
+            Self::ReadShaped {
+                collection_id,
+                schema,
+                limit,
+                ..
+            } => {
+                CollectionId::new(*collection_id.as_bytes())?;
+                schema.validate()?;
+                if *limit == 0 || usize::from(*limit) > MAX_ROWS_PER_PAGE {
                     return Err(ProtocolError::InvalidCollectionPayload);
                 }
                 Ok(())
@@ -857,13 +922,19 @@ impl ArtifactChunk {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `PartialEq`-only (not `Eq`): `ShapedRows` carries a `RowPage`, whose cells
+// may be `Value::Real(f64)` — the same reason `CollectionRequest` (which
+// carries `OutputSchema`, also `f64`-bearing via `Extractor::Const`) is
+// `PartialEq`-only.
+#[derive(Debug, Clone, PartialEq)]
 pub enum CollectionResponse {
     Accepted { collection_id: CollectionId },
     TracePage(TracePage),
     ArtifactChunk(ArtifactChunk),
     Cancelled { collection_id: CollectionId },
     Receipt(CollectionReceipt),
+    /// One page of declarative output-shaping rows (Phase C, axis 7).
+    ShapedRows(RowPage),
 }
 
 impl CollectionResponse {
@@ -940,6 +1011,15 @@ impl CollectionResponse {
                 }
                 output.extend_from_slice(receipt.ready_state.as_bytes());
                 output.extend_from_slice(receipt.collector_version.as_bytes());
+            }
+            Self::ShapedRows(page) => {
+                output.push(6);
+                output.push(0);
+                let page_bytes = page.encode()?;
+                let page_len = u32::try_from(page_bytes.len())
+                    .map_err(|_| ProtocolError::InvalidCollectionPayload)?;
+                output.extend_from_slice(&page_len.to_le_bytes());
+                output.extend_from_slice(&page_bytes);
             }
         }
         Ok(output)
@@ -1066,6 +1146,11 @@ impl CollectionResponse {
                     },
                     CollectionReceiptArtifacts { html, viewport_png },
                 )?)
+            }
+            6 if flags == 0 => {
+                let page_len = usize::try_from(input.u32()?)
+                    .map_err(|_| ProtocolError::InvalidCollectionPayload)?;
+                Self::ShapedRows(RowPage::decode(input.bytes(page_len)?)?)
             }
             _ => return Err(ProtocolError::InvalidCollectionPayload),
         };
@@ -1418,6 +1503,9 @@ impl<'a> Input<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shape::{
+        Cardinality, Column, ColumnType, CssPick, Extractor, MetaField, OnError, Row, Value,
+    };
     use crate::{
         ControlTransport, EngineFamily, FeatureSupport, RuntimeFeature,
         RuntimeKind, RuntimeRequirements, SupportLevel, TaskStep,
@@ -1557,6 +1645,124 @@ mod tests {
                 request
             );
         }
+    }
+
+    fn page_level_schema() -> OutputSchema {
+        OutputSchema::new(
+            "page".to_owned(),
+            Cardinality::PageLevel,
+            vec![Column::new(
+                "title".to_owned(),
+                ColumnType::Text,
+                Extractor::Meta(MetaField::Title),
+                OnError::Null,
+            )
+            .expect("title column")],
+        )
+        .expect("valid page-level schema")
+    }
+
+    fn item_scope_schema() -> OutputSchema {
+        OutputSchema::new(
+            "products".to_owned(),
+            Cardinality::ItemScope(".product-card".to_owned()),
+            vec![Column::new(
+                "name".to_owned(),
+                ColumnType::Text,
+                Extractor::Css {
+                    selector: ".name".to_owned(),
+                    pick: CssPick::Text,
+                },
+                OnError::Null,
+            )
+            .expect("name column")],
+        )
+        .expect("valid item-scope schema")
+    }
+
+    #[test]
+    fn read_shaped_request_round_trips_page_level_and_item_scope_schemas() {
+        for schema in [page_level_schema(), item_scope_schema()] {
+            let request = CollectionRequest::read_shaped(
+                collection_id(),
+                schema.clone(),
+                ShapeCursor::new(3),
+                256,
+            )
+            .expect("read shaped request");
+            assert_eq!(
+                CollectionRequest::decode(&request.encode().expect("encode read shaped"))
+                    .expect("decode read shaped"),
+                request
+            );
+            let CollectionRequest::ReadShaped {
+                collection_id: decoded_id,
+                schema: decoded_schema,
+                cursor,
+                limit,
+            } = CollectionRequest::decode(&request.encode().unwrap()).unwrap()
+            else {
+                panic!("expected ReadShaped request");
+            };
+            assert_eq!(decoded_id, collection_id());
+            assert_eq!(decoded_schema, schema);
+            assert_eq!(cursor, ShapeCursor::new(3));
+            assert_eq!(limit, 256);
+        }
+    }
+
+    #[test]
+    fn read_shaped_request_rejects_zero_and_oversized_limit() {
+        assert!(CollectionRequest::read_shaped(
+            collection_id(),
+            page_level_schema(),
+            ShapeCursor::START,
+            0,
+        )
+        .is_err());
+        assert!(CollectionRequest::read_shaped(
+            collection_id(),
+            page_level_schema(),
+            ShapeCursor::START,
+            u16::try_from(MAX_ROWS_PER_PAGE + 1).unwrap(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn shaped_rows_response_round_trips_with_and_without_next_cursor() {
+        let columns = vec![("title".to_owned(), ColumnType::Text)];
+        let rows = vec![Row::new(vec![Value::Text("Catalog".to_owned())]).unwrap()];
+
+        let incomplete = RowPage::new(
+            columns.clone(),
+            rows.clone(),
+            Some(ShapeCursor::new(1)),
+            false,
+        )
+        .expect("incomplete row page");
+        let response = CollectionResponse::ShapedRows(incomplete);
+        let encoded = response.encode().expect("encode shaped rows");
+        assert_eq!(CollectionResponse::decode(&encoded).unwrap(), response);
+        let CollectionResponse::ShapedRows(decoded) =
+            CollectionResponse::decode(&encoded).unwrap()
+        else {
+            panic!("expected ShapedRows response");
+        };
+        assert_eq!(decoded.next_cursor(), Some(ShapeCursor::new(1)));
+        assert!(!decoded.is_complete());
+
+        let complete = RowPage::new(columns, rows, None, true).expect("complete row page");
+        let response = CollectionResponse::ShapedRows(complete);
+        let encoded = response.encode().expect("encode complete shaped rows");
+        assert_eq!(CollectionResponse::decode(&encoded).unwrap(), response);
+        let CollectionResponse::ShapedRows(decoded) =
+            CollectionResponse::decode(&encoded).unwrap()
+        else {
+            panic!("expected ShapedRows response");
+        };
+        assert_eq!(decoded.next_cursor(), None);
+        assert!(decoded.is_complete());
     }
 
     #[test]

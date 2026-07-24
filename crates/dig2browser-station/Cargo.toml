@@ -26,6 +26,7 @@ dig2browser-core = { path = "../dig2browser-core" }
 dig2browser-crawler = { path = "../dig2browser-crawler" }
 dig2browser-protocol = { path = "../dig2browser-protocol" }
 dig2browser-runtime-lightweight = { path = "../dig2browser-runtime-lightweight" }
+dig2browser-shape = { path = "../dig2browser-shape" }
 dig2browser-trace = { path = "../dig2browser-trace" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
