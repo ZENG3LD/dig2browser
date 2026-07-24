@@ -19,11 +19,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use dig2browser::agentic::{AgentCommand, CapabilitySet};
 use dig2browser::browser::{DevToolsEvent, NetworkEvent, PageDevTools};
+use dig2browser_protocol::shape::{ColumnType, OutputSchema, RowPage, ShapeCursor};
 use dig2browser_protocol::{
-    ArtifactRef, BrowserPersona, LiveFilter, MonitorCursor, MonitorEvent, MonitorEventPage,
-    MonitorFrame, MonitorStopReason, ProfileClass, ProtocolError, WebSocketDirection,
-    WebSocketOpcode, MAX_LIVE_NETWORK_PARAMS_BYTES,
+    ArtifactRef, BrowserPersona, LiveFilter, MonitorCursor, MonitorEvent, MonitorEventKind,
+    MonitorEventPage, MonitorFrame, MonitorStopReason, ProfileClass, ProtocolError,
+    WebSocketDirection, WebSocketOpcode, MAX_LIVE_NETWORK_PARAMS_BYTES,
 };
+use dig2browser_shape::{shape_json, CaptureMeta, ShapeError};
 use dig2browser_trace::{LedgerError, MonitorJournal, MonitorSink, TraceLedger};
 use tokio::task::JoinHandle;
 
@@ -200,6 +202,104 @@ impl DurableMonitorManager {
     /// the client already holds the `ArtifactRef` from a records page).
     pub fn read_frame_by_ref(&self, artifact: &ArtifactRef) -> Result<Vec<u8>, MonitorError> {
         Ok(self.inner.ledger.read_orphan_artifact(artifact)?)
+    }
+
+    /// Declarative output shaping (Phase C, axis 7) over a durable monitor's
+    /// captured JSON frames: project each committed frame's payload onto
+    /// `schema` via [`dig2browser_shape::shape_json`] and return one page of
+    /// the concatenated resulting rows, in journal order.
+    ///
+    /// A monitor legitimately carries non-JSON/binary/control frames (a
+    /// ping/pong, a binary WS frame, ...) alongside JSON ones, so a frame
+    /// whose payload fails to parse (`ShapeError::InvalidJson`) is silently
+    /// skipped rather than failing the whole read. Every OTHER `ShapeError`
+    /// — an unsupported extractor, a scope/source mismatch, an invalid
+    /// regex/selector — is a genuine schema problem and is propagated as
+    /// [`MonitorError::Shape`].
+    ///
+    /// `shape_json` compiles the schema before it ever touches a frame's
+    /// payload (`OutputSchema::validate` + extractor/cardinality
+    /// compilation happen before the JSON parse), so a bad schema normally
+    /// surfaces on the first frame processed — but a monitor with zero
+    /// committed frames, or whose frames are ALL non-JSON, would otherwise
+    /// never exercise that compile step and silently return an empty page
+    /// instead of failing closed. To guarantee "a bad schema errors even
+    /// with zero [JSON] frames" this probes the schema once, up front,
+    /// against a trivially-valid empty JSON object (`b"{}"`) — because that
+    /// payload always parses, the probe's only possible failure is a
+    /// genuine schema-compile error, propagated immediately before any real
+    /// frame is read.
+    ///
+    /// v1 re-shapes every committed frame's payload on each call — the same
+    /// per-call re-shape simplification `CollectionManager::read_shaped` and
+    /// `CrawlManager::read_shaped` accept; a shaped-row cache across
+    /// pages/calls is a later optimization.
+    pub fn read_shaped(
+        &self,
+        monitor_id: &str,
+        schema: &OutputSchema,
+        cursor: ShapeCursor,
+        limit: u16,
+    ) -> Result<RowPage, MonitorError> {
+        probe_schema_compiles(schema)?;
+
+        let events = self.read(monitor_id, MonitorCursor::START, usize::MAX)?;
+        let mut url = String::new();
+        let mut frames = Vec::new();
+        for event in &events {
+            match event.kind() {
+                MonitorEventKind::Started { url: started_url, .. } => {
+                    url = started_url.clone();
+                }
+                MonitorEventKind::FrameCommitted(frame) => {
+                    frames.push((event.timestamp_unix_ms(), frame));
+                }
+                MonitorEventKind::Stopped(_) => {}
+            }
+        }
+
+        let columns: Vec<(String, ColumnType)> = schema
+            .columns()
+            .iter()
+            .map(|column| (column.name().to_owned(), column.ty()))
+            .collect();
+
+        let mut all_rows = Vec::new();
+        for (timestamp_unix_ms, frame) in frames {
+            let payload = self.frame_payload(frame)?;
+            let meta = CaptureMeta {
+                url: url.clone(),
+                final_url: url.clone(),
+                http_status: None,
+                title: String::new(),
+                ready_state: String::new(),
+                captured_at: i64::try_from(timestamp_unix_ms).unwrap_or(i64::MAX),
+                source_id: monitor_id.to_owned(),
+            };
+            match shape_json(&payload, &meta, schema) {
+                Ok(rows) => all_rows.extend(rows),
+                // Not every monitor frame is JSON (control frames, binary
+                // payloads, ...) — skip it rather than failing the page.
+                Err(ShapeError::InvalidJson(_)) => continue,
+                Err(other) => return Err(MonitorError::Shape(other.to_string())),
+            }
+        }
+
+        let total = all_rows.len();
+        let start = usize::try_from(cursor.value()).unwrap_or(usize::MAX);
+        if start > total {
+            return RowPage::new(columns, Vec::new(), None, true).map_err(MonitorError::from);
+        }
+        let limit = usize::from(limit);
+        let end = start.saturating_add(limit).min(total);
+        let page_rows = all_rows[start..end].to_vec();
+        let complete = end >= total;
+        let next_cursor = if complete {
+            None
+        } else {
+            Some(ShapeCursor::new(u64::try_from(end).unwrap_or(u64::MAX)))
+        };
+        RowPage::new(columns, page_rows, next_cursor, complete).map_err(MonitorError::from)
     }
 
     /// Stop a resident monitor: append a terminal `Stopped(Requested)`, then
@@ -391,6 +491,20 @@ fn reconcile_journals(journals_dir: &Path) -> Result<(), MonitorError> {
     Ok(())
 }
 
+/// Compile `schema` against a trivially-valid empty JSON object, so a
+/// schema-compile failure (`ScopeSourceMismatch`, `UnsupportedExtractor`,
+/// `InvalidRegex`, ...) surfaces even when [`DurableMonitorManager::read_shaped`]
+/// never calls `shape_json` on a real frame (zero committed frames, or every
+/// frame is non-JSON). `b"{}"` always parses, so the only possible failure
+/// here is a genuine schema problem — `InvalidJson` is unreachable but
+/// tolerated defensively rather than asserted unreachable.
+fn probe_schema_compiles(schema: &OutputSchema) -> Result<(), MonitorError> {
+    match shape_json(b"{}", &CaptureMeta::default(), schema) {
+        Ok(_) | Err(ShapeError::InvalidJson(_)) => Ok(()),
+        Err(other) => Err(MonitorError::Shape(other.to_string())),
+    }
+}
+
 fn lock<T>(mutex: &StdMutex<T>) -> Result<std::sync::MutexGuard<'_, T>, MonitorError> {
     mutex.lock().map_err(|_| MonitorError::StatePoisoned)
 }
@@ -412,6 +526,8 @@ pub enum MonitorError {
     SessionNotFound,
     #[error("durable monitor manager state is poisoned")]
     StatePoisoned,
+    #[error("output shaping failed: {0}")]
+    Shape(String),
     #[error("durable monitor storage error: {0}")]
     Ledger(#[from] LedgerError),
     #[error("durable monitor protocol error: {0}")]

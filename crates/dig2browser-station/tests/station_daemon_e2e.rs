@@ -4921,6 +4921,168 @@ fn spawn_stationd_for_runtime(
     )
 }
 
+// Phase C monitor source: shape a durable monitor's live JSON WS frames into
+// rows. The fixture's WS server pushes `{"tick":N}` frames (JSON, Received) and
+// the page sends one non-JSON `hello-from-page` frame (Sent). read_monitor_shaped
+// projects each JSON frame's `/tick` into a row and SKIPS the non-JSON frame —
+// proving shape_json reaches a real live JSON source over the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stationd_read_monitor_shaped_projects_json_ws_frames_into_rows_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let ws_fixture = WebSocketFixture::start().await;
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-monitor-shaped-e2e-{unique}");
+    let base = e2e_temp_base().join(format!("dig2browser-monitor-shaped-e2e-{unique}"));
+    let profiles = base.join("profiles");
+    let monitor_root = base.join("monitors");
+    std::fs::create_dir_all(&profiles).expect("create monitor-shaping profiles");
+    std::fs::create_dir_all(&monitor_root).expect("create monitor-shaping monitor root");
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+    let mut daemon =
+        spawn_stationd_for_monitor_shaping(stationd, &pipe_name, &profiles, &monitor_root);
+    let client = StationClient::connect(
+        ClientConfig::new(&pipe_name, Duration::from_secs(15), Duration::from_secs(90))
+            .expect("valid monitor-shaping client config"),
+    )
+    .await
+    .expect("connect monitor-shaping client");
+
+    let page_url = fixture.url(&format!("/live-ws-page-{}", ws_fixture.port));
+    let mut monitor_id = None;
+    for attempt in 0..8 {
+        match client
+            .begin_durable_monitor(
+                "monitor-shaping-profile",
+                ProfileClass::Public,
+                BrowserPersona::desktop_default(),
+                page_url.clone(),
+                LiveFilter::new(true, true, false),
+            )
+            .await
+        {
+            Ok(id) => {
+                monitor_id = Some(id);
+                break;
+            }
+            Err(ClientError::Remote { status: ResponseStatus::Unavailable, .. }) if attempt < 7 => {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+            }
+            Err(error) => panic!("begin durable monitor: {error:?}"),
+        }
+    }
+    let monitor_id = monitor_id.expect("begin durable monitor after retries");
+
+    // Wait until at least two JSON (Received) frames AND the non-JSON (Sent)
+    // frame have been captured.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut received = 0;
+    let mut saw_sent = false;
+    while tokio::time::Instant::now() < deadline && (received < 2 || !saw_sent) {
+        let page = client
+            .read_durable_monitor(&monitor_id, MonitorCursor::START, 64)
+            .await
+            .expect("read durable monitor");
+        received = frame_records(page.events())
+            .iter()
+            .filter(|frame| frame.direction() == WebSocketDirection::Received)
+            .count();
+        saw_sent = frame_records(page.events())
+            .iter()
+            .any(|frame| frame.direction() == WebSocketDirection::Sent);
+        if received < 2 || !saw_sent {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }
+    assert!(received >= 2, "monitor did not capture at least two JSON frames");
+    assert!(saw_sent, "monitor did not capture the non-JSON page-send frame");
+
+    // Shape the monitor's frames: one row per frame, tick = the JSON pointer /tick.
+    let schema = OutputSchema::new(
+        "ticks".to_owned(),
+        Cardinality::PageLevel,
+        vec![Column::new(
+            "tick".to_owned(),
+            ColumnType::Integer,
+            Extractor::Json { pointer: "/tick".to_owned() },
+            OnError::Null,
+        )
+        .expect("tick column")],
+    )
+    .expect("valid tick schema");
+
+    let page = client
+        .read_monitor_shaped(monitor_id.clone(), schema, ShapeCursor::START, 64)
+        .await
+        .expect("read monitor-shaped rows");
+    let ticks: Vec<i64> = page
+        .rows()
+        .iter()
+        .map(|row| match row.values() {
+            [Value::Integer(n)] => *n,
+            other => panic!("shaped tick row is not a single integer: {other:?}"),
+        })
+        .collect();
+    // The non-JSON `hello-from-page` frame was skipped (InvalidJson) — every
+    // shaped row is a tick integer. The captured JSON frames are consecutive
+    // (the very first `{"tick":0}` may predate the devtools subscription, so the
+    // sequence need not start at 0, but it is contiguous).
+    assert!(ticks.len() >= 2, "expected at least two shaped tick rows, got {ticks:?}");
+    for pair in ticks.windows(2) {
+        assert_eq!(pair[1], pair[0] + 1, "shaped ticks are not consecutive: {ticks:?}");
+    }
+
+    client.shutdown().await.expect("shutdown monitor-shaping station");
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("monitor-shaping exit timeout")
+        .expect("wait for monitor-shaping station");
+    assert!(status.success(), "monitor-shaping station failed: {status}");
+    let (_, stderr) = read_child_output(&mut daemon).await;
+    assert!(stderr.is_empty(), "monitor-shaping station stderr: {stderr}");
+    remove_tree(&base).await;
+}
+
+fn spawn_stationd_for_monitor_shaping(
+    stationd: &str,
+    pipe_name: &str,
+    profiles: &Path,
+    monitor_root: &Path,
+) -> tokio::process::Child {
+    let mut command = tokio::process::Command::new(stationd);
+    command.args([
+        "--pipe-name",
+        pipe_name,
+        "--profiles-root",
+        profiles.to_str().expect("profiles path is UTF-8"),
+        "--monitor-root",
+        monitor_root.to_str().expect("monitor root is UTF-8"),
+        "--runtime",
+        "chrome",
+        "--max-resident",
+        "2",
+        "--max-in-flight",
+        "4",
+        "--max-connections",
+        "8",
+        "--timeout-seconds",
+        "90",
+        "--drain-seconds",
+        "15",
+        "--allow-remote-shutdown",
+        "--allow-durable-read",
+        "--allow-durable-write",
+        "--allow-output-shaping",
+    ]);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn monitor-shaping station daemon")
+}
+
 fn spawn_stationd_for_durable_monitor(
     stationd: &str,
     pipe_name: &str,

@@ -1009,9 +1009,15 @@ async fn monitor_request(
     };
     // Write operations (start/stop a monitor) need `--allow-durable-write`; read
     // operations (page records, fetch a frame) need `--allow-durable-read`.
+    // `ReadShaped` additionally needs `--allow-output-shaping` — a durable
+    // monitor read that shapes, gated the same way as the collection/crawl
+    // `ReadShaped` handlers.
     let permitted = match operation {
         MonitorRequest::Begin { .. } | MonitorRequest::Stop { .. } => permissions.durable_write,
         MonitorRequest::Read { .. } | MonitorRequest::ReadFrame { .. } => permissions.durable_read,
+        MonitorRequest::ReadShaped { .. } => {
+            permissions.output_shaping && permissions.durable_read
+        }
     };
     if !permitted {
         return WorkerResponse::failure(
@@ -1046,6 +1052,14 @@ async fn monitor_request(
         MonitorRequest::ReadFrame { artifact, .. } => manager
             .read_frame_by_ref(artifact)
             .map(|payload| MonitorResponse::Frame { payload }),
+        MonitorRequest::ReadShaped {
+            monitor_id,
+            schema,
+            cursor,
+            limit,
+        } => manager
+            .read_shaped(monitor_id, schema, *cursor, *limit)
+            .map(MonitorResponse::ShapedRows),
         MonitorRequest::Stop { monitor_id } => manager.stop(monitor_id).await.map(|()| {
             MonitorResponse::Stopped {
                 monitor_id: monitor_id.clone(),
@@ -1066,7 +1080,7 @@ async fn monitor_request(
 
 fn monitor_error_response(request: &WorkerRequest, error: &MonitorError) -> WorkerResponse {
     let (status, message) = match error {
-        MonitorError::SessionNotFound => {
+        MonitorError::SessionNotFound | MonitorError::Shape(_) => {
             (ResponseStatus::Invalid, "durable monitor request rejected")
         }
         MonitorError::SessionConflict | MonitorError::AdmissionClosed => {

@@ -677,6 +677,28 @@ impl StationClient {
         }
     }
 
+    /// Declarative output shaping (Phase C, axis 7) over a durable monitor's
+    /// captured JSON frames: project each committed frame's payload onto
+    /// `schema` and read one page of the concatenated resulting rows.
+    /// Requires the station operator's `--allow-output-shaping` (and, since
+    /// it reads durable monitor frame artifacts, `--allow-durable-read`).
+    pub async fn read_monitor_shaped(
+        &self,
+        monitor_id: impl Into<String>,
+        schema: OutputSchema,
+        cursor: ShapeCursor,
+        limit: u16,
+    ) -> Result<RowPage, ClientError> {
+        let monitor = MonitorRequest::read_shaped(monitor_id.into(), schema, cursor, limit)
+            .map_err(|_| ClientError::InvalidMonitorRequest)?;
+        let request = WorkerRequest::monitor(self.take_request_id(), monitor)
+            .map_err(|_| ClientError::InvalidMonitorRequest)?;
+        match require_monitor_response(&self.call(request).await?)? {
+            MonitorResponse::ShapedRows(page) => Ok(page),
+            _ => Err(ClientError::InvalidResponse),
+        }
+    }
+
     /// Stop a resident durable monitor (appends a clean terminal `Stopped`).
     /// Requires `--allow-durable-write`.
     pub async fn stop_durable_monitor(
@@ -1266,6 +1288,19 @@ impl BlockingStationClient {
     ) -> Result<Vec<u8>, ClientError> {
         self.runtime
             .block_on(self.client.read_durable_frame(monitor_id, artifact))
+    }
+
+    pub fn read_monitor_shaped(
+        &self,
+        monitor_id: impl Into<String>,
+        schema: OutputSchema,
+        cursor: ShapeCursor,
+        limit: u16,
+    ) -> Result<RowPage, ClientError> {
+        self.runtime.block_on(
+            self.client
+                .read_monitor_shaped(monitor_id, schema, cursor, limit),
+        )
     }
 
     pub fn stop_durable_monitor(

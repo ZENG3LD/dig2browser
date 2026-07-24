@@ -13,6 +13,7 @@
 //! trace, the stream is open-ended (no `step_count`, no event ceiling); a single
 //! terminal [`MonitorEventKind::Stopped`] closes it.
 
+use crate::shape::{OutputSchema, RowPage, ShapeCursor, MAX_ROWS_PER_PAGE};
 use crate::{
     ArtifactMediaType, ArtifactRef, BrowserPersona, InterruptedReason, LiveFilter, ProfileClass,
     ProtocolError, WebSocketDirection, WebSocketOpcode, MAX_HTML_BYTES,
@@ -584,6 +585,16 @@ pub enum MonitorRequest {
         monitor_id: String,
         artifact: ArtifactRef,
     },
+    /// Declarative output shaping (Phase C, axis 7) over a durable monitor's
+    /// captured JSON frames: project each committed frame's payload onto
+    /// `schema` via `dig2browser_shape::shape_json` and page the
+    /// concatenated resulting rows, in journal order.
+    ReadShaped {
+        monitor_id: String,
+        schema: OutputSchema,
+        cursor: ShapeCursor,
+        limit: u16,
+    },
     Stop {
         monitor_id: String,
     },
@@ -592,6 +603,22 @@ pub enum MonitorRequest {
 impl MonitorRequest {
     pub fn is_begin(&self) -> bool {
         matches!(self, Self::Begin { .. })
+    }
+
+    pub fn read_shaped(
+        monitor_id: String,
+        schema: OutputSchema,
+        cursor: ShapeCursor,
+        limit: u16,
+    ) -> Result<Self, ProtocolError> {
+        let request = Self::ReadShaped {
+            monitor_id,
+            schema,
+            cursor,
+            limit,
+        };
+        request.validate()?;
+        Ok(request)
     }
 
     pub fn validate(&self) -> Result<(), ProtocolError> {
@@ -610,6 +637,19 @@ impl MonitorRequest {
             } => {
                 validate_monitor_id(monitor_id)?;
                 if *limit == 0 || usize::from(*limit) > MAX_MONITOR_PAGE_EVENTS {
+                    return Err(ProtocolError::InvalidMonitorPayload);
+                }
+                Ok(())
+            }
+            Self::ReadShaped {
+                monitor_id,
+                schema,
+                limit,
+                ..
+            } => {
+                validate_monitor_id(monitor_id)?;
+                schema.validate()?;
+                if *limit == 0 || usize::from(*limit) > MAX_ROWS_PER_PAGE {
                     return Err(ProtocolError::InvalidMonitorPayload);
                 }
                 Ok(())
@@ -662,6 +702,22 @@ impl MonitorRequest {
                 output.extend_from_slice(&[3, 0]);
                 encode_bounded_string_u16(&mut output, monitor_id, MAX_MONITOR_ID_BYTES)?;
                 encode_artifact_ref(&mut output, artifact);
+            }
+            Self::ReadShaped {
+                monitor_id,
+                schema,
+                cursor,
+                limit,
+            } => {
+                output.extend_from_slice(&[5, 0]);
+                encode_bounded_string_u16(&mut output, monitor_id, MAX_MONITOR_ID_BYTES)?;
+                let schema_bytes = schema.encode()?;
+                let schema_len = u32::try_from(schema_bytes.len())
+                    .map_err(|_| ProtocolError::InvalidMonitorPayload)?;
+                output.extend_from_slice(&schema_len.to_le_bytes());
+                output.extend_from_slice(&schema_bytes);
+                output.extend_from_slice(&cursor.value().to_le_bytes());
+                output.extend_from_slice(&limit.to_le_bytes());
             }
             Self::Stop { monitor_id } => {
                 output.extend_from_slice(&[4, 0]);
@@ -728,6 +784,15 @@ impl MonitorRequest {
                     artifact,
                 }
             }
+            5 => {
+                let monitor_id = input.string_u16(MAX_MONITOR_ID_BYTES)?;
+                let schema_len = usize::try_from(input.u32()?)
+                    .map_err(|_| ProtocolError::InvalidMonitorPayload)?;
+                let schema = OutputSchema::decode(input.bytes(schema_len)?)?;
+                let cursor = ShapeCursor::new(input.u64()?);
+                let limit = input.u16()?;
+                Self::read_shaped(monitor_id, schema, cursor, limit)?
+            }
             4 => Self::Stop {
                 monitor_id: input.string_u16(MAX_MONITOR_ID_BYTES)?,
             },
@@ -742,11 +807,18 @@ impl MonitorRequest {
 }
 
 /// A durable-monitor response.
+///
+/// `PartialEq`-only (not `Eq`): `ShapedRows` carries a `RowPage`, whose cells
+/// may be `Value::Real(f64)` — the same reason `MonitorRequest` (which
+/// carries `OutputSchema`, also `f64`-bearing via `Extractor::Const`) is
+/// `PartialEq`-only.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MonitorResponse {
     Accepted { monitor_id: String },
     Events(MonitorEventPage),
     Frame { payload: Vec<u8> },
+    /// One page of declarative output-shaping rows (Phase C, axis 7).
+    ShapedRows(RowPage),
     Stopped { monitor_id: String },
 }
 
@@ -763,6 +835,12 @@ impl MonitorResponse {
                 }
                 Ok(())
             }
+            // `RowPage` has no public `validate()` of its own (unlike
+            // `MonitorEventPage`) — it is only constructible already-valid,
+            // via `RowPage::new`/`RowPage::decode`, both of which enforce
+            // their bounds internally. `encode()` below re-validates via
+            // `RowPage::encode`'s own internal check.
+            Self::ShapedRows(_) => Ok(()),
         }
     }
 
@@ -797,6 +875,14 @@ impl MonitorResponse {
                     .map_err(|_| ProtocolError::InvalidMonitorPayload)?;
                 output.extend_from_slice(&len.to_le_bytes());
                 output.extend_from_slice(payload);
+            }
+            Self::ShapedRows(page) => {
+                output.extend_from_slice(&[5, 0]);
+                let page_bytes = page.encode()?;
+                let page_len = u32::try_from(page_bytes.len())
+                    .map_err(|_| ProtocolError::InvalidMonitorPayload)?;
+                output.extend_from_slice(&page_len.to_le_bytes());
+                output.extend_from_slice(&page_bytes);
             }
             Self::Stopped { monitor_id } => {
                 output.extend_from_slice(&[4, 0]);
@@ -860,6 +946,11 @@ impl MonitorResponse {
                     payload: input.bytes(len)?.to_vec(),
                 }
             }
+            5 => {
+                let page_len = usize::try_from(input.u32()?)
+                    .map_err(|_| ProtocolError::InvalidMonitorPayload)?;
+                Self::ShapedRows(RowPage::decode(input.bytes(page_len)?)?)
+            }
             4 => Self::Stopped {
                 monitor_id: input.string_u16(MAX_MONITOR_ID_BYTES)?,
             },
@@ -902,6 +993,7 @@ impl Input<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shape::{Cardinality, Column, ColumnType, Extractor, MetaField, OnError, Row, ScopeSelector, Value};
 
     fn artifact() -> ArtifactRef {
         ArtifactRef::new([3; 32], 42, ArtifactMediaType::TextHtmlUtf8).expect("artifact ref")
@@ -1116,6 +1208,121 @@ mod tests {
             assert_eq!(&encoded[..4], b"D2MP");
             assert_eq!(MonitorResponse::decode(&encoded).expect("decode"), response);
         }
+    }
+
+    fn json_page_level_schema() -> OutputSchema {
+        OutputSchema::new(
+            "frame".to_owned(),
+            Cardinality::PageLevel,
+            vec![Column::new(
+                "url".to_owned(),
+                ColumnType::Text,
+                Extractor::Meta(MetaField::Url),
+                OnError::Null,
+            )
+            .expect("url column")],
+        )
+        .expect("valid page-level schema")
+    }
+
+    fn json_item_scope_schema() -> OutputSchema {
+        OutputSchema::new(
+            "ticks".to_owned(),
+            Cardinality::ItemScope(ScopeSelector::JsonPointer("/ticks".to_owned())),
+            vec![Column::new(
+                "price".to_owned(),
+                ColumnType::Real,
+                Extractor::Json {
+                    pointer: "/price".to_owned(),
+                },
+                OnError::Null,
+            )
+            .expect("price column")],
+        )
+        .expect("valid item-scope schema")
+    }
+
+    #[test]
+    fn read_shaped_request_round_trips_page_level_and_item_scope_schemas() {
+        for schema in [json_page_level_schema(), json_item_scope_schema()] {
+            let request = MonitorRequest::read_shaped(
+                "0123456789abcdef".to_owned(),
+                schema.clone(),
+                ShapeCursor::new(3),
+                256,
+            )
+            .expect("read shaped request");
+            assert_eq!(
+                MonitorRequest::decode(&request.encode().expect("encode read shaped"))
+                    .expect("decode read shaped"),
+                request
+            );
+            let MonitorRequest::ReadShaped {
+                monitor_id,
+                schema: decoded_schema,
+                cursor,
+                limit,
+            } = MonitorRequest::decode(&request.encode().unwrap()).unwrap()
+            else {
+                panic!("expected ReadShaped request");
+            };
+            assert_eq!(monitor_id, "0123456789abcdef");
+            assert_eq!(decoded_schema, schema);
+            assert_eq!(cursor, ShapeCursor::new(3));
+            assert_eq!(limit, 256);
+        }
+    }
+
+    #[test]
+    fn read_shaped_request_rejects_zero_and_oversized_limit() {
+        assert!(MonitorRequest::read_shaped(
+            "0123456789abcdef".to_owned(),
+            json_page_level_schema(),
+            ShapeCursor::START,
+            0,
+        )
+        .is_err());
+        assert!(MonitorRequest::read_shaped(
+            "0123456789abcdef".to_owned(),
+            json_page_level_schema(),
+            ShapeCursor::START,
+            u16::try_from(MAX_ROWS_PER_PAGE + 1).unwrap(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn shaped_rows_response_round_trips_with_and_without_next_cursor() {
+        let columns = vec![("price".to_owned(), ColumnType::Real)];
+        let rows = vec![Row::new(vec![Value::Real(9.99)]).unwrap()];
+
+        let incomplete = RowPage::new(
+            columns.clone(),
+            rows.clone(),
+            Some(ShapeCursor::new(1)),
+            false,
+        )
+        .expect("incomplete row page");
+        let response = MonitorResponse::ShapedRows(incomplete);
+        let encoded = response.encode().expect("encode shaped rows");
+        assert_eq!(MonitorResponse::decode(&encoded).unwrap(), response);
+        let MonitorResponse::ShapedRows(decoded) = MonitorResponse::decode(&encoded).unwrap()
+        else {
+            panic!("expected ShapedRows response");
+        };
+        assert_eq!(decoded.next_cursor(), Some(ShapeCursor::new(1)));
+        assert!(!decoded.is_complete());
+
+        let complete = RowPage::new(columns, rows, None, true).expect("complete row page");
+        let response = MonitorResponse::ShapedRows(complete);
+        let encoded = response.encode().expect("encode complete shaped rows");
+        assert_eq!(MonitorResponse::decode(&encoded).unwrap(), response);
+        let MonitorResponse::ShapedRows(decoded) = MonitorResponse::decode(&encoded).unwrap()
+        else {
+            panic!("expected ShapedRows response");
+        };
+        assert_eq!(decoded.next_cursor(), None);
+        assert!(decoded.is_complete());
     }
 
     #[test]
