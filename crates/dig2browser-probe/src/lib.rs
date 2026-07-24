@@ -59,6 +59,9 @@ pub struct BrowserObservationV1 {
     pub device_memory: u8,
     pub webgl_vendor: String,
     pub webgl_renderer: String,
+    /// `typeof RTCPeerConnection !== 'undefined'` — presence check only, no
+    /// ICE-candidate/IP-leak gathering.
+    pub webrtc_present: bool,
 }
 
 /// Server-visible request values normalized by the controlled probe origin.
@@ -412,6 +415,7 @@ impl ProbeTranscriptV1 {
         push_u8(&mut bytes, "browser.deviceMemory", browser.device_memory);
         push_field(&mut bytes, "browser.webglVendor", browser.webgl_vendor.as_bytes());
         push_field(&mut bytes, "browser.webglRenderer", browser.webgl_renderer.as_bytes());
+        push_bool(&mut bytes, "browser.webrtcPresent", browser.webrtc_present);
         let server = &self.observation.server;
         push_field(&mut bytes, "server.userAgent", server.user_agent.as_bytes());
         push_field(
@@ -538,6 +542,16 @@ fn validate_matrix(
         &browser.webgl_renderer,
         persona.webgl_renderer(),
     )?;
+    // `browser.webrtc_present` is recorded (transcript + canonical hash) but NOT
+    // gated against the persona. WebRTC removal is `StealthLevel::Full`-gated
+    // (`override_webrtc_leak`, dig2browser `stealth/scripts.rs`) while personas
+    // run at `Standard`, so `RTCPeerConnection` stays present regardless of the
+    // persona's `webrtc_policy`. Whether a persona should *enforce* removal
+    // (anti-deanon) or *retain* WebRTC and contain ICE egress at the kernel WFP
+    // layer (realism — a real browser keeps `RTCPeerConnection`; its absence is
+    // itself an automation signal) is an owner-gated egress-boundary decision
+    // (see the `WebrtcPolicy` doc in stealth `config.rs`). Until it is settled,
+    // the probe observes WebRTC presence without asserting a direction.
     if browser.webdriver {
         return Err(ProbeError::Mismatch("browser.webdriver"));
     }
@@ -818,7 +832,8 @@ mod tests {
                 "hardwareConcurrency": 8,
                 "deviceMemory": 8,
                 "webglVendor": "Google Inc. (NVIDIA)",
-                "webglRenderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 1080 Direct3D11 vs_5_0 ps_5_0, D3D11)"
+                "webglRenderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 1080 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+                "webrtcPresent": false
             },
             "server": {
                 "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
@@ -851,7 +866,8 @@ mod tests {
                 "hardwareConcurrency": 8,
                 "deviceMemory": 8,
                 "webglVendor": "ARM",
-                "webglRenderer": "Mali-G710"
+                "webglRenderer": "Mali-G710",
+                "webrtcPresent": false
             },
             "server": {
                 "userAgent": "Mozilla/5.0 (Linux; Android 13.0.0; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Mobile Safari/537.36",

@@ -78,6 +78,33 @@ impl PersonaDeviceClass {
             Self::MobileWeb => "Mali-G710",
         }
     }
+
+    /// WebRTC (`RTCPeerConnection`) presence policy for this device class.
+    ///
+    /// Both device classes currently resolve to [`PersonaWebrtc::Remove`],
+    /// matching the prior fixed behavior (`RTCPeerConnection` deleted for
+    /// every persona). This only adds the lever from the persona side — it
+    /// does not flip any preset's effective policy.
+    pub const fn webrtc(self) -> PersonaWebrtc {
+        match self {
+            Self::Desktop => PersonaWebrtc::Remove,
+            Self::MobileWeb => PersonaWebrtc::Remove,
+        }
+    }
+}
+
+/// WebRTC (`RTCPeerConnection`) presence policy carried by a persona.
+///
+/// Mirrors `dig2browser::stealth::config::WebrtcPolicy` without creating a
+/// dependency from this crate on the root `dig2browser` crate. The station
+/// (`apply_persona`) maps this onto `WebrtcPolicy` at the boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PersonaWebrtc {
+    /// `RTCPeerConnection` is deleted (current, default behavior).
+    #[default]
+    Remove,
+    /// `RTCPeerConnection` is kept present and unpatched.
+    Retain,
 }
 
 /// Versioned persona presets with stable names and runtime compatibility.
@@ -235,6 +262,7 @@ pub struct CompiledPersona {
     device_memory_gb: u8,
     webgl_vendor: &'static str,
     webgl_renderer: &'static str,
+    webrtc: PersonaWebrtc,
 }
 
 impl CompiledPersona {
@@ -316,6 +344,11 @@ impl CompiledPersona {
         self.webgl_renderer
     }
 
+    /// WebRTC (`RTCPeerConnection`) presence policy for this persona.
+    pub fn webrtc(&self) -> PersonaWebrtc {
+        self.webrtc
+    }
+
     pub fn is_mobile(&self) -> bool {
         self.device_class() == PersonaDeviceClass::MobileWeb
     }
@@ -355,6 +388,7 @@ impl PersonaCompiler {
             device_memory_gb: device_class.device_memory_gb(),
             webgl_vendor: device_class.webgl_vendor(),
             webgl_renderer: device_class.webgl_renderer(),
+            webrtc: device_class.webrtc(),
         }
     }
 }
@@ -771,6 +805,7 @@ mod tests {
                         compiled.webgl_renderer(),
                         "ANGLE (NVIDIA, NVIDIA GeForce GTX 1080 Direct3D11 vs_5_0 ps_5_0, D3D11)"
                     );
+                    assert_eq!(compiled.webrtc(), PersonaWebrtc::Remove);
                     assert!(!compiled.is_mobile());
                 }
                 PersonaDeviceClass::MobileWeb => {
@@ -787,6 +822,7 @@ mod tests {
                     assert_eq!(compiled.device_memory_gb(), 8);
                     assert_eq!(compiled.webgl_vendor(), "ARM");
                     assert_eq!(compiled.webgl_renderer(), "Mali-G710");
+                    assert_eq!(compiled.webrtc(), PersonaWebrtc::Remove);
                     assert!(compiled.is_mobile());
                 }
             }

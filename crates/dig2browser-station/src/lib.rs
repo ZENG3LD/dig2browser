@@ -27,15 +27,15 @@ use dig2browser::identity::{
     validate_profile_id, BrowserBackend, DevicePersona, IdentityClass,
     IdentityError, IdentityProfile, ProfileOwnershipGuard,
 };
-use dig2browser::stealth::{ClientHintsProfile, LocaleProfile};
+use dig2browser::stealth::{ClientHintsProfile, LocaleProfile, WebrtcPolicy};
 use dig2browser::BrowserProcessIsolation;
 use dig2browser_protocol::{
     BrowserPersona, IdentitySessionStatus, LoadState, PersonaKind, ProfileClass,
     SessionHealthProbe, SessionPhase, SessionStateUpdate,
 };
 use dig2browser_core::{
-    ControlTransport, EngineFamily, PersonaPreset, RouteRef, RuntimeFeature,
-    RuntimeRequirementsError,
+    ControlTransport, EngineFamily, PersonaPreset, PersonaWebrtc, RouteRef,
+    RuntimeFeature, RuntimeRequirementsError,
 };
 use tokio::sync::{Mutex, RwLock, Semaphore};
 
@@ -491,6 +491,10 @@ fn apply_persona(
     worker.stealth.webgl_vendor = persona.webgl_vendor().to_owned();
     worker.stealth.webgl_renderer = persona.webgl_renderer().to_owned();
     worker.stealth.max_touch_points = persona.max_touch_points();
+    worker.stealth.webrtc_policy = match persona.webrtc() {
+        PersonaWebrtc::Remove => WebrtcPolicy::Remove,
+        PersonaWebrtc::Retain => WebrtcPolicy::Retain,
+    };
     worker.launch.window_size = worker.stealth.viewport;
     worker.mobile_layout = match persona.kind() {
         PersonaKind::Desktop => None,

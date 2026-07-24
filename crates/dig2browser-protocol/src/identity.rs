@@ -1,6 +1,7 @@
 use crate::ProtocolError;
 use dig2browser_core::{
-    CompiledPersona, PersonaCompiler, PersonaDeviceClass, PersonaPreset, RouteRef,
+    CompiledPersona, PersonaCompiler, PersonaDeviceClass, PersonaPreset, PersonaWebrtc,
+    RouteRef,
 };
 
 const PERSONA_MAGIC: [u8; 4] = *b"D2IP";
@@ -230,6 +231,11 @@ impl BrowserPersona {
     /// `WEBGL_debug_renderer_info` `UNMASKED_RENDERER_WEBGL` string.
     pub fn webgl_renderer(&self) -> &'static str {
         self.device_class().webgl_renderer()
+    }
+
+    /// WebRTC (`RTCPeerConnection`) presence policy implied by this persona.
+    pub fn webrtc(&self) -> PersonaWebrtc {
+        self.device_class().webrtc()
     }
 
     pub fn is_mobile(&self) -> bool {

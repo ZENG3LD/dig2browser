@@ -351,7 +351,8 @@ const observation = {{
     hardwareConcurrency: navigator.hardwareConcurrency,
     deviceMemory: Math.round(navigator.deviceMemory),
     webglVendor: webglVendor,
-    webglRenderer: webglRenderer
+    webglRenderer: webglRenderer,
+    webrtcPresent: typeof RTCPeerConnection !== 'undefined'
   }},
   server: {{
     userAgent: {server_user_agent},
