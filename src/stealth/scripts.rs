@@ -24,6 +24,9 @@ pub fn get_scripts(config: &StealthConfig) -> Vec<String> {
     scripts.push(override_hardware_concurrency(config.hardware_concurrency));
     scripts.push(override_device_memory(config.device_memory_gb));
     scripts.push(override_max_touch_points(config.max_touch_points));
+    if config.webrtc_policy == WebrtcPolicy::Remove {
+        scripts.push(override_webrtc_leak());
+    }
     scripts.push(override_connection_info());
 
     if config.level == StealthLevel::StandardNoWebGL {
@@ -42,11 +45,8 @@ pub fn get_scripts(config: &StealthConfig) -> Vec<String> {
         return scripts;
     }
 
-    // Full: adds webrtc + timezone + media_devices + performance_timing + battery
+    // Full: adds timezone + media_devices + performance_timing + battery
     //       + outer window size + userAgentData
-    if config.webrtc_policy == WebrtcPolicy::Remove {
-        scripts.push(override_webrtc_leak());
-    }
     if let Some(tz) = &config.locale.timezone {
         scripts.push(override_timezone(tz));
     }
@@ -534,16 +534,21 @@ fn override_screen_resolution(width: u32, height: u32, device_scale_factor: f64)
     )
 }
 
-/// Disable WebRTC to prevent IP leaks via ICE candidates.
+/// Delete `RTCPeerConnection` so it is entirely absent.
 ///
-/// Map scraping never requires WebRTC, so the safest approach is to remove it
-/// entirely rather than wrapping it with a no-op that leaks local IPs anyway.
+/// Runs at the fingerprint tier (`StandardNoWebGL` and above — see
+/// `get_scripts`) whenever `StealthConfig::webrtc_policy` is
+/// `WebrtcPolicy::Remove`. This is a persona-realism behavior, not a
+/// `StealthLevel::Full`-only extra: a privacy-cohort persona's real browser
+/// authentically has no `RTCPeerConnection`, so its compiled persona sets
+/// `webrtc_policy = Remove` and this call makes that declaration take
+/// effect at the tier personas actually run at (`Standard`).
 ///
-/// Called only when `StealthConfig::webrtc_policy` is `WebrtcPolicy::Remove`
-/// (the default — see `get_scripts`). `WebrtcPolicy::Retain` skips this call
-/// so `RTCPeerConnection` stays present; that policy is a lever for routes
-/// with an egress boundary that already blocks non-proxy ICE candidates, not
-/// a change to this function's own default behavior.
+/// `WebrtcPolicy::Retain` skips this call so `RTCPeerConnection` stays
+/// present, matching a real browser for every other persona. Containing the
+/// IP-leak surface of a *present* `RTCPeerConnection` (real ICE candidates)
+/// is the isolation engine's job (WFP kernel egress containment), not this
+/// script's — this function only ever removes or leaves the API alone.
 fn override_webrtc_leak() -> String {
     r#"
     window.RTCPeerConnection = undefined;
@@ -829,5 +834,22 @@ mod tests {
         assert!(scripts.contains("get: () => 852"));
         assert!(scripts.contains("get: () => 3"));
         assert!(!scripts.contains("devicePixelRatio', {\n        get: () => 1,"));
+    }
+
+    /// Proves the removal-gating fix: `webrtc_policy` now takes effect at
+    /// `StealthLevel::Standard` (the level personas actually run at), not
+    /// only at `Full`.
+    #[test]
+    fn webrtc_removal_is_gated_on_policy_at_standard_level() {
+        let mut config = StealthConfig::default();
+        config.level = StealthLevel::Standard;
+
+        config.webrtc_policy = WebrtcPolicy::Remove;
+        let removed = get_scripts(&config).join("\n");
+        assert!(removed.contains("window.RTCPeerConnection = undefined"));
+
+        config.webrtc_policy = WebrtcPolicy::Retain;
+        let retained = get_scripts(&config).join("\n");
+        assert!(!retained.contains("window.RTCPeerConnection = undefined"));
     }
 }

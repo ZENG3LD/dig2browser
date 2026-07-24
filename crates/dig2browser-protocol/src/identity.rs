@@ -233,9 +233,17 @@ impl BrowserPersona {
         self.device_class().webgl_renderer()
     }
 
-    /// WebRTC (`RTCPeerConnection`) presence policy implied by this persona.
+    /// WebRTC (`RTCPeerConnection`) presence policy for this persona — a
+    /// per-preset realism invariant: a privacy-cohort persona strips WebRTC,
+    /// a normal browser retains it. Legacy (non-preset) personas fall back to
+    /// `Retain`, matching a real browser's default presence. Leak-prevention
+    /// for a retained connection is the isolation engine's (WFP) job, not the
+    /// persona's.
     pub fn webrtc(&self) -> PersonaWebrtc {
-        self.device_class().webrtc()
+        match self.preset {
+            Some(preset) => preset.webrtc(),
+            None => PersonaWebrtc::Retain,
+        }
     }
 
     pub fn is_mobile(&self) -> bool {

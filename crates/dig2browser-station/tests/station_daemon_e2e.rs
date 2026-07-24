@@ -2726,6 +2726,30 @@ async fn stationd_compiles_personas_binds_routes_and_validates_probe_e2e() {
     .await;
     assert_ne!(first_mobile.sha256(), [0_u8; 32]);
     assert!(first_mobile.observation().browser.ua_mobile);
+    // Desktop + mobile personas are WebRTC-Retain: their probes above validated
+    // only because RTCPeerConnection was present (the Retain arm of the WebRTC
+    // realism invariant). The privacy-cohort persona is WebRTC-Remove — it
+    // authentically strips RTCPeerConnection, and its probe proves the removal
+    // actually runs at the persona's Standard level (the Remove arm), on real
+    // Chrome. Both arms proven means the invariant is non-vacuous.
+    let privacy_cohort = BrowserPersona::compiled(
+        PersonaPreset::ChromiumDesktopPrivacyCohortV1,
+        alternate_route.clone(),
+    )
+    .expect("compile privacy-cohort persona");
+    let first_privacy = collect_persona_probe(
+        &client,
+        "compiled-privacy-cohort-profile",
+        ProfileClass::Public,
+        &privacy_cohort,
+        fixture.url("/persona-probe"),
+    )
+    .await;
+    assert_ne!(first_privacy.sha256(), [0_u8; 32]);
+    assert!(
+        !first_privacy.observation().browser.webrtc_present,
+        "privacy-cohort persona must strip RTCPeerConnection (WebRTC Remove arm)"
+    );
 
     let ready_expiry = unix_time_ms().saturating_add(60_000);
     client

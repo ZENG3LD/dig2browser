@@ -79,18 +79,6 @@ impl PersonaDeviceClass {
         }
     }
 
-    /// WebRTC (`RTCPeerConnection`) presence policy for this device class.
-    ///
-    /// Both device classes currently resolve to [`PersonaWebrtc::Remove`],
-    /// matching the prior fixed behavior (`RTCPeerConnection` deleted for
-    /// every persona). This only adds the lever from the persona side — it
-    /// does not flip any preset's effective policy.
-    pub const fn webrtc(self) -> PersonaWebrtc {
-        match self {
-            Self::Desktop => PersonaWebrtc::Remove,
-            Self::MobileWeb => PersonaWebrtc::Remove,
-        }
-    }
 }
 
 /// WebRTC (`RTCPeerConnection`) presence policy carried by a persona.
@@ -157,6 +145,26 @@ impl PersonaPreset {
             | Self::ChromeWindowsDesktopV1
             | Self::EdgeWindowsDesktopV1
             | Self::FirefoxWindowsDesktopV1 => PersonaDeviceClass::Desktop,
+        }
+    }
+
+    /// WebRTC (`RTCPeerConnection`) presence policy for this preset — a
+    /// realism declaration of what this identity's real browser would show,
+    /// decided per preset rather than per device class. A named-compatibility
+    /// desktop persona (Chrome/Edge/Firefox on Windows) authentically keeps
+    /// `RTCPeerConnection`, as does the mobile-web persona (real mobile
+    /// Chrome keeps it too). The privacy-cohort persona authentically strips
+    /// it — that is what distinguishes the cohort's real browser. IP-leak
+    /// containment for a retained `RTCPeerConnection` is the isolation
+    /// engine's (WFP kernel egress containment) responsibility, not this
+    /// declaration's.
+    pub const fn webrtc(self) -> PersonaWebrtc {
+        match self {
+            Self::ChromiumDesktopPrivacyCohortV1 => PersonaWebrtc::Remove,
+            Self::ChromeWindowsDesktopV1
+            | Self::EdgeWindowsDesktopV1
+            | Self::FirefoxWindowsDesktopV1
+            | Self::ChromeAndroidPixel7MobileWebV1 => PersonaWebrtc::Retain,
         }
     }
 
@@ -388,7 +396,7 @@ impl PersonaCompiler {
             device_memory_gb: device_class.device_memory_gb(),
             webgl_vendor: device_class.webgl_vendor(),
             webgl_renderer: device_class.webgl_renderer(),
-            webrtc: device_class.webrtc(),
+            webrtc: preset.webrtc(),
         }
     }
 }
@@ -787,6 +795,15 @@ mod tests {
             assert_eq!(compiled.route_ref(), &route);
             assert_eq!(compiled.locale(), "en-US");
             assert_eq!(compiled.timezone(), Some("UTC"));
+            let expected_webrtc = match preset {
+                PersonaPreset::ChromiumDesktopPrivacyCohortV1 => PersonaWebrtc::Remove,
+                PersonaPreset::ChromeWindowsDesktopV1
+                | PersonaPreset::EdgeWindowsDesktopV1
+                | PersonaPreset::FirefoxWindowsDesktopV1
+                | PersonaPreset::ChromeAndroidPixel7MobileWebV1 => PersonaWebrtc::Retain,
+            };
+            assert_eq!(preset.webrtc(), expected_webrtc);
+            assert_eq!(compiled.webrtc(), expected_webrtc);
             match device_class {
                 PersonaDeviceClass::Desktop => {
                     assert_eq!(compiled.width(), 1920);
@@ -805,7 +822,6 @@ mod tests {
                         compiled.webgl_renderer(),
                         "ANGLE (NVIDIA, NVIDIA GeForce GTX 1080 Direct3D11 vs_5_0 ps_5_0, D3D11)"
                     );
-                    assert_eq!(compiled.webrtc(), PersonaWebrtc::Remove);
                     assert!(!compiled.is_mobile());
                 }
                 PersonaDeviceClass::MobileWeb => {
@@ -822,7 +838,6 @@ mod tests {
                     assert_eq!(compiled.device_memory_gb(), 8);
                     assert_eq!(compiled.webgl_vendor(), "ARM");
                     assert_eq!(compiled.webgl_renderer(), "Mali-G710");
-                    assert_eq!(compiled.webrtc(), PersonaWebrtc::Remove);
                     assert!(compiled.is_mobile());
                 }
             }

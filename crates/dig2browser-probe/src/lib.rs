@@ -9,7 +9,7 @@
 use std::fmt;
 
 use dig2browser_core::{
-    ControlTransport, EngineFamily, PersonaPreset, RuntimeFeature, RuntimeKind,
+    ControlTransport, EngineFamily, PersonaPreset, PersonaWebrtc, RuntimeFeature, RuntimeKind,
 };
 use dig2browser_protocol::{BrowserPersona, ResolvedRuntimeRecord};
 use serde::{Deserialize, Serialize};
@@ -542,16 +542,13 @@ fn validate_matrix(
         &browser.webgl_renderer,
         persona.webgl_renderer(),
     )?;
-    // `browser.webrtc_present` is recorded (transcript + canonical hash) but NOT
-    // gated against the persona. WebRTC removal is `StealthLevel::Full`-gated
-    // (`override_webrtc_leak`, dig2browser `stealth/scripts.rs`) while personas
-    // run at `Standard`, so `RTCPeerConnection` stays present regardless of the
-    // persona's `webrtc_policy`. Whether a persona should *enforce* removal
-    // (anti-deanon) or *retain* WebRTC and contain ICE egress at the kernel WFP
-    // layer (realism — a real browser keeps `RTCPeerConnection`; its absence is
-    // itself an automation signal) is an owner-gated egress-boundary decision
-    // (see the `WebrtcPolicy` doc in stealth `config.rs`). Until it is settled,
-    // the probe observes WebRTC presence without asserting a direction.
+    // The probe verifies the persona's WebRTC realism invariant: presence
+    // must match what the persona declares (`PersonaWebrtc::Retain` keeps
+    // `RTCPeerConnection`, `PersonaWebrtc::Remove` deletes it).
+    let expected_webrtc = matches!(persona.webrtc(), PersonaWebrtc::Retain);
+    if browser.webrtc_present != expected_webrtc {
+        return Err(ProbeError::Mismatch("browser.webrtcPresent"));
+    }
     if browser.webdriver {
         return Err(ProbeError::Mismatch("browser.webdriver"));
     }
@@ -833,7 +830,7 @@ mod tests {
                 "deviceMemory": 8,
                 "webglVendor": "Google Inc. (NVIDIA)",
                 "webglRenderer": "ANGLE (NVIDIA, NVIDIA GeForce GTX 1080 Direct3D11 vs_5_0 ps_5_0, D3D11)",
-                "webrtcPresent": false
+                "webrtcPresent": true
             },
             "server": {
                 "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
@@ -867,7 +864,7 @@ mod tests {
                 "deviceMemory": 8,
                 "webglVendor": "ARM",
                 "webglRenderer": "Mali-G710",
-                "webrtcPresent": false
+                "webrtcPresent": true
             },
             "server": {
                 "userAgent": "Mozilla/5.0 (Linux; Android 13.0.0; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Mobile Safari/537.36",
@@ -918,6 +915,29 @@ mod tests {
 
         assert!(transcript.observation.browser.ua_mobile);
         assert_eq!(transcript.observation.browser.max_touch_points, 5);
+    }
+
+    #[test]
+    fn webrtc_presence_mismatch_is_rejected() {
+        // A Retain persona (Chrome desktop) whose page reports RTCPeerConnection
+        // absent is a persona-coherence failure — the probe rejects it. This
+        // makes the WebRTC realism invariant non-vacuous.
+        let persona = persona(PersonaPreset::ChromeWindowsDesktopV1);
+        let desktop_runtime = runtime(
+            RuntimeKind::Chrome,
+            RuntimeFeature::DesktopWeb,
+            SupportLevel::Native,
+        );
+        let mut absent = desktop_json();
+        absent["browser"]["webrtcPresent"] = json!(false);
+        assert!(matches!(
+            ProbeTranscriptV1::from_observation(
+                &persona,
+                &desktop_runtime,
+                &absent.to_string(),
+            ),
+            Err(ProbeError::Mismatch("browser.webrtcPresent"))
+        ));
     }
 
     #[test]

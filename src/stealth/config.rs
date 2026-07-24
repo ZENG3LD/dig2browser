@@ -7,12 +7,14 @@ use crate::detect::BrowserKind;
 pub enum StealthLevel {
     /// Only webdriver + chrome_runtime patches.
     Basic,
-    /// Basic + canvas, plugins, languages, permissions, hardware, memory, connection.
+    /// Basic + canvas, plugins, languages, permissions, hardware, memory,
+    /// max touch points, WebRTC (per `webrtc_policy`), connection.
     StandardNoWebGL,
     /// StandardNoWebGL + WebGL + screen resolution.
     #[default]
     Standard,
-    /// Standard + WebRTC, timezone, media devices, performance timing, battery, outer size, UA data.
+    /// Standard + timezone, media devices, performance timing, battery,
+    /// outer size, UA data.
     Full,
 }
 
@@ -177,18 +179,22 @@ impl UserAgentProfile {
 
 /// WebRTC handling policy.
 ///
-/// The default preserves current behavior: `RTCPeerConnection` is removed
-/// entirely, which is the safe choice absent a proven egress boundary. For a
-/// mobile persona this absence is itself an anomaly (real mobile Chrome
-/// keeps the API), but flipping the *default* is a separate decision that
-/// depends on the egress boundary guaranteeing no non-proxy ICE candidate can
-/// leak — this only adds the lever, it does not flip it.
+/// The default is `Retain`: the no-persona / library-direct default keeps
+/// `RTCPeerConnection` present, matching a real browser. This also matches
+/// today's *effective* prior behavior, since removal used to be wired only
+/// under `StealthLevel::Full` and so never actually ran at the `Standard`
+/// level a caller gets by default. Removal is now opt-in via
+/// `webrtc_policy = Remove` — set by a persona whose real browser
+/// authentically lacks WebRTC (the privacy-cohort persona). IP-leak
+/// containment for a retained `RTCPeerConnection` (real ICE candidates) is
+/// the isolation engine's job (WFP kernel egress containment), not this
+/// policy's — this only decides realism, never leak prevention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WebrtcPolicy {
-    /// Delete `RTCPeerConnection` (current, default behavior).
-    #[default]
+    /// Delete `RTCPeerConnection`.
     Remove,
-    /// Keep `RTCPeerConnection` present and unpatched.
+    /// Keep `RTCPeerConnection` present and unpatched (default).
+    #[default]
     Retain,
 }
 
