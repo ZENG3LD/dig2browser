@@ -1,0 +1,113 @@
+//! Raw (pre-coercion) extraction: resolving a compiled [`crate::CompiledPlan`]
+//! against a row scope (whole document or a matched item element) or against
+//! [`crate::CaptureMeta`].
+
+use dig2browser_protocol::shape::{CssPick, MetaField, Value};
+use scraper::{ElementRef, Html, Selector};
+
+use crate::CaptureMeta;
+
+/// A raw extraction result, before type coercion to the column's declared
+/// [`dig2browser_protocol::shape::ColumnType`].
+pub(crate) enum Extracted {
+    /// No match / missing attribute / absent [`CaptureMeta`] field.
+    Missing,
+    /// Extracted textual content (`Meta`, `Css::Text`, `Css::Attr`, `Css::Html`).
+    Text(String),
+    /// `Css::Exists` — a legitimate `false` on no-match, never a miss.
+    Bool(bool),
+    /// `Const` — already a typed protocol [`Value`], passed through as-is.
+    Value(Value),
+}
+
+/// Where a [`dig2browser_protocol::shape::Extractor::Css`] selector resolves:
+/// the whole document (`PageLevel`) or a single matched item element
+/// (`ItemScope`).
+pub(crate) enum RowScope<'a> {
+    Document(&'a Html),
+    Item(ElementRef<'a>),
+}
+
+impl<'a> RowScope<'a> {
+    fn select_first(&self, selector: &Selector) -> Option<ElementRef<'a>> {
+        match self {
+            Self::Document(document) => document.select(selector).next(),
+            Self::Item(element) => element.select(selector).next(),
+        }
+    }
+}
+
+pub(crate) fn resolve_meta(field: MetaField, meta: &CaptureMeta) -> Extracted {
+    match field {
+        MetaField::Url => Extracted::Text(meta.url.clone()),
+        MetaField::FinalUrl => Extracted::Text(meta.final_url.clone()),
+        MetaField::HttpStatus => match meta.http_status {
+            Some(status) => Extracted::Text(status.to_string()),
+            None => Extracted::Missing,
+        },
+        MetaField::Title => Extracted::Text(meta.title.clone()),
+        MetaField::ReadyState => Extracted::Text(meta.ready_state.clone()),
+        MetaField::CapturedAt => Extracted::Text(meta.captured_at.to_string()),
+        MetaField::SourceId => Extracted::Text(meta.source_id.clone()),
+    }
+}
+
+pub(crate) fn resolve_css(selector: &Selector, pick: &CssPick, scope: &RowScope<'_>) -> Extracted {
+    match pick {
+        CssPick::Exists => Extracted::Bool(scope.select_first(selector).is_some()),
+        CssPick::Text => match scope.select_first(selector) {
+            Some(element) => Extracted::Text(collapse_whitespace(&element.text().collect::<String>())),
+            None => Extracted::Missing,
+        },
+        CssPick::Attr(name) => {
+            match scope.select_first(selector).and_then(|element| element.attr(name)) {
+                Some(value) => Extracted::Text(value.to_owned()),
+                None => Extracted::Missing,
+            }
+        }
+        CssPick::Html => match scope.select_first(selector) {
+            Some(element) => Extracted::Text(element.inner_html()),
+            None => Extracted::Missing,
+        },
+    }
+}
+
+/// Text whitespace rule: concatenate every descendant text node with no
+/// separator, then normalize whitespace — any run of whitespace (spaces,
+/// tabs, newlines) collapses to a single ASCII space, and the result is
+/// trimmed of leading/trailing whitespace. This is the common
+/// "normalize-space" rule (matches the intuition of visually rendered text),
+/// not a byte-for-byte copy of the DOM's raw whitespace layout.
+pub(crate) fn collapse_whitespace(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut last_was_space = false;
+    for ch in input.chars() {
+        if ch.is_whitespace() {
+            if !last_was_space && !output.is_empty() {
+                output.push(' ');
+            }
+            last_was_space = true;
+        } else {
+            output.push(ch);
+            last_was_space = false;
+        }
+    }
+    if output.ends_with(' ') {
+        output.pop();
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collapse_whitespace;
+
+    #[test]
+    fn collapses_interior_runs_and_trims_edges() {
+        assert_eq!(collapse_whitespace("  hello   world  \n\t"), "hello world");
+        assert_eq!(collapse_whitespace("a\nb\tc"), "a b c");
+        assert_eq!(collapse_whitespace(""), "");
+        assert_eq!(collapse_whitespace("   "), "");
+        assert_eq!(collapse_whitespace("single"), "single");
+    }
+}

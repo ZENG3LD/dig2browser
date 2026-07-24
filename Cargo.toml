@@ -18,6 +18,7 @@ members = [
     "crates/dig2browser-probe",
     "crates/dig2browser-protocol",
     "crates/dig2browser-runtime-lightweight",
+    "crates/dig2browser-shape",
     "crates/dig2browser-station",
     "crates/dig2browser-trace",
 ]

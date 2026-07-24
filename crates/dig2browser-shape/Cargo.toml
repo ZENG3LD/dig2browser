@@ -1,0 +1,15 @@
+[package]
+name = "dig2browser-shape"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Declarative output-shaping extractor engine for dig2browser (Phase C, axis 7)"
+publish = false
+
+[lib]
+name = "dig2browser_shape"
+path = "src/lib.rs"
+
+[dependencies]
+dig2browser-protocol = { path = "../dig2browser-protocol" }
+scraper = { version = "0.27.0", default-features = false }
