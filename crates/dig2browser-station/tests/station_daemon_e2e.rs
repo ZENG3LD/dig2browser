@@ -286,6 +286,12 @@ ws.onmessage=(event)=>{{document.title='ws-recv';}};\
             // A catalog of repeating .product-card items — the item-scope
             // acceptance fixture for declarative output shaping (read_shaped).
             "catalog" => "<div class=\"product-card\"><span class=\"name\">Widget A</span><span class=\"price\">9.99</span><a href=\"/products/widget-a\">buy</a></div><div class=\"product-card\"><span class=\"name\">Widget B</span><span class=\"price\">14.50</span><a href=\"/products/widget-b\">buy</a></div><div class=\"product-card\"><span class=\"name\">Widget C</span><span class=\"price\">3.25</span><a href=\"/products/widget-c\">buy</a></div>",
+            // A two-page catalog for the crawl-source shaping E2E: page 1 links
+            // to page 2 (same-origin -> crawled), product links are absolute and
+            // off-origin (out of crawl scope -> NOT followed), so the crawl
+            // visits exactly the two catalog pages.
+            "catalog-p1" => "<div class=\"product-card\"><span class=\"name\">Widget A</span><span class=\"price\">9.99</span><a href=\"https://example.com/p/a\">buy</a></div><div class=\"product-card\"><span class=\"name\">Widget B</span><span class=\"price\">14.50</span><a href=\"https://example.com/p/b\">buy</a></div><a href=\"/catalog-p2\">next</a>",
+            "catalog-p2" => "<div class=\"product-card\"><span class=\"name\">Widget C</span><span class=\"price\">3.25</span><a href=\"https://example.com/p/c\">buy</a></div><div class=\"product-card\"><span class=\"name\">Widget D</span><span class=\"price\">7.00</span><a href=\"https://example.com/p/d\">buy</a></div>",
             _ => "",
         }
     );
@@ -4630,6 +4636,191 @@ async fn stationd_read_shaped_is_gated_by_allow_output_shaping_e2e() {
     let (_, stderr) = read_child_output(&mut daemon).await;
     assert!(stderr.is_empty(), "read-shaped-gate station stderr: {stderr}");
     remove_tree(&root).await;
+}
+
+// Phase C crawl source: shape an ENTIRE crawl into rows. Crawl a two-page
+// catalog (page 1 links to page 2), then read_crawl_shaped over the job id and
+// assert the product rows from BOTH pages, projected by one declared item-scope
+// schema — no consumer-side HTML parsing, across the whole crawl.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stationd_read_crawl_shaped_projects_a_two_page_crawl_into_rows_e2e() {
+    let _serial = e2e_serial_guard().await;
+    let fixture = FixtureServer::start();
+    let unique = uuid::Uuid::new_v4();
+    let pipe_name = format!("dig2browser-crawl-shaped-e2e-{unique}");
+    let root = e2e_temp_base().join(format!("dig2browser-crawl-shaped-e2e-{unique}"));
+    let profiles = root.join("profiles");
+    let traces = root.join("traces");
+    let crawls = root.join("crawls");
+    for path in [&profiles, &traces, &crawls] {
+        std::fs::create_dir_all(path).expect("create crawl-shaping durable root");
+    }
+    let stationd = env!("CARGO_BIN_EXE_dig2browser-stationd");
+    let mut daemon =
+        spawn_stationd_for_crawl_shaping(stationd, &pipe_name, &profiles, &traces, &crawls);
+    let client = StationClient::connect(
+        ClientConfig::new(&pipe_name, Duration::from_secs(15), Duration::from_secs(90))
+            .expect("valid crawl-shaping client config"),
+    )
+    .await
+    .expect("connect crawl-shaping client");
+
+    // Crawl the two-page catalog. Product links are off-origin (out of scope);
+    // the only in-scope link is page 1 -> page 2, so the crawl visits exactly
+    // the two catalog pages.
+    let job_id = CrawlJobId::new(*uuid::Uuid::new_v4().as_bytes())
+        .expect("nonzero crawl-shaping job id");
+    let spec = CrawlSpec::new(
+        vec![fixture.url("/catalog-p1")],
+        vec![fixture.origin()],
+        2,
+        1,
+        0,
+    )
+    .expect("valid crawl-shaping spec");
+    client
+        .begin_crawl_with_id("crawl-shaping-profile", job_id, spec)
+        .await
+        .expect("begin catalog crawl");
+    let events = wait_for_complete_product_crawl(&client, job_id).await;
+    let succeeded = events
+        .iter()
+        .filter(|event| event.kind() == CrawlEventKind::PageSucceeded)
+        .count();
+    assert_eq!(succeeded, 2, "crawl did not capture exactly the two catalog pages");
+
+    let schema = OutputSchema::new(
+        "products".to_owned(),
+        Cardinality::ItemScope(".product-card".to_owned()),
+        vec![
+            Column::new(
+                "name".to_owned(),
+                ColumnType::Text,
+                Extractor::Css { selector: ".name".to_owned(), pick: CssPick::Text },
+                OnError::Null,
+            )
+            .expect("name column"),
+            Column::new(
+                "price".to_owned(),
+                ColumnType::Real,
+                Extractor::Css { selector: ".price".to_owned(), pick: CssPick::Text },
+                OnError::Null,
+            )
+            .expect("price column"),
+            Column::new(
+                "link".to_owned(),
+                ColumnType::Text,
+                Extractor::Css { selector: "a".to_owned(), pick: CssPick::Attr("href".to_owned()) },
+                OnError::Null,
+            )
+            .expect("link column"),
+        ],
+    )
+    .expect("valid item-scope schema");
+
+    let page = client
+        .read_crawl_shaped(job_id, schema.clone(), ShapeCursor::START, 10)
+        .await
+        .expect("read crawl-shaped rows");
+    assert!(page.is_complete());
+    assert_eq!(page.next_cursor(), None);
+    assert_eq!(page.rows().len(), 4, "expected 4 product rows across the two crawled pages");
+
+    // Order-robust exact check: the rows are the union of both pages' cards.
+    let mut got: Vec<(String, Value, String)> = page
+        .rows()
+        .iter()
+        .map(|row| {
+            let values = row.values();
+            let Value::Text(name) = &values[0] else {
+                panic!("name column is not text: {:?}", values[0])
+            };
+            let Value::Text(link) = &values[2] else {
+                panic!("link column is not text: {:?}", values[2])
+            };
+            (name.clone(), values[1].clone(), link.clone())
+        })
+        .collect();
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        got,
+        vec![
+            ("Widget A".to_owned(), Value::Real(9.99), "https://example.com/p/a".to_owned()),
+            ("Widget B".to_owned(), Value::Real(14.5), "https://example.com/p/b".to_owned()),
+            ("Widget C".to_owned(), Value::Real(3.25), "https://example.com/p/c".to_owned()),
+            ("Widget D".to_owned(), Value::Real(7.0), "https://example.com/p/d".to_owned()),
+        ]
+    );
+
+    // Paging across the page boundary: limit 3 -> 3 rows + a cursor, then 1 more.
+    let first = client
+        .read_crawl_shaped(job_id, schema.clone(), ShapeCursor::START, 3)
+        .await
+        .expect("crawl-shaped page 1");
+    assert!(!first.is_complete());
+    assert_eq!(first.rows().len(), 3);
+    let cursor = first.next_cursor().expect("continuation cursor after a partial crawl page");
+    let second = client
+        .read_crawl_shaped(job_id, schema, cursor, 3)
+        .await
+        .expect("crawl-shaped page 2");
+    assert!(second.is_complete());
+    assert_eq!(second.rows().len(), 1);
+
+    client.shutdown().await.expect("shutdown crawl-shaping station");
+    let status = tokio::time::timeout(Duration::from_secs(30), daemon.wait())
+        .await
+        .expect("crawl-shaping exit timeout")
+        .expect("wait for crawl-shaping station");
+    assert!(status.success(), "crawl-shaping station failed: {status}");
+    let (_, stderr) = read_child_output(&mut daemon).await;
+    assert!(stderr.is_empty(), "crawl-shaping station stderr: {stderr}");
+    remove_tree(&root).await;
+}
+
+fn spawn_stationd_for_crawl_shaping(
+    stationd: &str,
+    pipe_name: &str,
+    profiles: &Path,
+    traces: &Path,
+    crawls: &Path,
+) -> tokio::process::Child {
+    let mut command = tokio::process::Command::new(stationd);
+    command.args([
+        "--pipe-name",
+        pipe_name,
+        "--profiles-root",
+        profiles.to_str().expect("profiles path is UTF-8"),
+        "--trace-root",
+        traces.to_str().expect("trace path is UTF-8"),
+        "--crawl-root",
+        crawls.to_str().expect("crawl path is UTF-8"),
+        "--runtime",
+        "chrome",
+        "--max-resident",
+        "2",
+        "--max-in-flight",
+        "4",
+        "--max-connections",
+        "8",
+        "--timeout-seconds",
+        "90",
+        "--drain-seconds",
+        "15",
+        "--allow-remote-shutdown",
+        "--allow-crawl-read",
+        "--allow-crawl-write",
+        "--allow-durable-read",
+        "--allow-durable-write",
+        "--allow-output-shaping",
+    ]);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn crawl-shaping station daemon")
 }
 
 fn spawn_stationd_for_output_shaping(

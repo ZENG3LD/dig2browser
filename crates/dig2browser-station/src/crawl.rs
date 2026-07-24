@@ -14,6 +14,7 @@ use dig2browser_crawler::{
     CrawlSpec as EngineSpec, EngineError, Failure, FileStore, JobState,
     LeaseRecovery, Scope,
 };
+use dig2browser_protocol::shape::{ColumnType, OutputSchema, RowPage, ShapeCursor};
 use dig2browser_protocol::{
     ArtifactMediaType, ArtifactRef, BrowserPersona, CollectionId,
     CrawlCounts, CrawlCursor, CrawlEvent, CrawlEventKind, CrawlEventPage,
@@ -24,8 +25,8 @@ use dig2browser_protocol::{
 use tokio::task::JoinHandle;
 
 use crate::collection::{
-    BeginCollection, CaptureReceiptPolicy, CollectionExecution, CollectionManager,
-    ReconciledCollection,
+    BeginCollection, CaptureReceiptPolicy, CollectionError, CollectionExecution,
+    CollectionManager, ReconciledCollection,
 };
 use crate::{
     BrowserStation, BrowserTask, BrowserTaskStep, IdentityRequest,
@@ -226,6 +227,14 @@ impl CrawlManager {
                 cursor,
                 limit,
             )?)),
+            CrawlRequest::ReadShaped {
+                job_id,
+                schema,
+                cursor,
+                limit,
+            } => Ok(CrawlResponse::ShapedRows(self.read_shaped(
+                job_id, &schema, cursor, limit,
+            )?)),
             CrawlRequest::Cancel { job_id } => {
                 self.cancel(job_id)?;
                 Ok(CrawlResponse::Cancelled { job_id })
@@ -394,6 +403,78 @@ impl CrawlManager {
             next_cursor,
             complete,
         )?)
+    }
+
+    /// Declarative output shaping (Phase C, axis 7) over an entire crawl
+    /// job: shape every succeeded page's captured HTML onto `schema` and
+    /// return one page of the concatenated resulting rows. Succeeded pages
+    /// are enumerated from the same journal `Completed` events
+    /// `read_events`/`to_protocol_event` translate into
+    /// `CrawlEventKind::PageSucceeded`, in journal (crawl-completion)
+    /// order — a page that never reached `Completed` (mid-flight, failed,
+    /// or still retrying) never appears here, so it is skipped structurally
+    /// rather than by catching a read error. v1 re-shapes every succeeded
+    /// page's collection on each call (mirroring the collection source's
+    /// per-call re-shape simplification in
+    /// [`CollectionManager::read_shaped`]), bounded by the crawl's page cap
+    /// (`MAX_CRAWL_PAGES`); a shaped-row cache across pages/calls is a
+    /// later optimization.
+    fn read_shaped(
+        &self,
+        job_id: CrawlJobId,
+        schema: &OutputSchema,
+        cursor: ShapeCursor,
+        limit: u16,
+    ) -> Result<RowPage, CrawlError> {
+        let job = self.job(job_id)?;
+        ensure_job_available(&job)?;
+        let mut collection_ids = Vec::new();
+        {
+            let engine = lock(&job.engine)?;
+            for event in engine.events_after(0) {
+                if let EngineEventKind::Completed { artifact_ref, .. } = event.kind() {
+                    let page = artifact_ref
+                        .as_deref()
+                        .ok_or(CrawlError::InvalidArtifactReference)
+                        .and_then(decode_artifact_ref)?;
+                    collection_ids.push(page.collection_id());
+                }
+            }
+        }
+
+        let columns: Vec<(String, ColumnType)> = schema
+            .columns()
+            .iter()
+            .map(|column| (column.name().to_owned(), column.ty()))
+            .collect();
+        let mut all_rows = Vec::new();
+        for collection_id in collection_ids {
+            let rows = self
+                .inner
+                .collections
+                .shape_all(collection_id, schema)
+                .map_err(|error| match error {
+                    CollectionError::Shape(message) => CrawlError::Shape(message),
+                    other => CrawlError::Collection(other),
+                })?;
+            all_rows.extend(rows);
+        }
+
+        let total = all_rows.len();
+        let start = usize::try_from(cursor.value()).unwrap_or(usize::MAX);
+        if start > total {
+            return RowPage::new(columns, Vec::new(), None, true).map_err(CrawlError::from);
+        }
+        let limit = usize::from(limit);
+        let end = start.saturating_add(limit).min(total);
+        let page_rows = all_rows[start..end].to_vec();
+        let complete = end >= total;
+        let next_cursor = if complete {
+            None
+        } else {
+            Some(ShapeCursor::new(u64::try_from(end).unwrap_or(u64::MAX)))
+        };
+        RowPage::new(columns, page_rows, next_cursor, complete).map_err(CrawlError::from)
     }
 
     fn cancel(&self, job_id: CrawlJobId) -> Result<(), CrawlError> {
@@ -1362,6 +1443,8 @@ pub enum CrawlError {
     InvalidArtifactReference,
     #[error("crawl hexadecimal identifier is invalid")]
     InvalidHex,
+    #[error("crawl output shaping failed: {0}")]
+    Shape(String),
     #[error("crawl counter exceeds the wire representation")]
     CountOverflow,
     #[error("crawl manager state is poisoned")]

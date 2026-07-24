@@ -1,3 +1,4 @@
+use crate::shape::{OutputSchema, RowPage, ShapeCursor, MAX_ROWS_PER_PAGE};
 use crate::{
     ArtifactMediaType, ArtifactRef, BrowserPersona, CollectionId, ProfileClass,
     ProtocolError, MAX_REQUEST_BYTES,
@@ -151,7 +152,10 @@ impl CrawlSpec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `PartialEq`-only (not `Eq`): `ReadShaped` carries an `OutputSchema`, whose
+// columns may hold `Extractor::Const(Value::Real(f64))` — the same reason
+// `CollectionRequest` (which also carries `OutputSchema`) is `PartialEq`-only.
+#[derive(Debug, Clone, PartialEq)]
 pub enum CrawlRequest {
     Begin {
         job_id: CrawlJobId,
@@ -166,6 +170,15 @@ pub enum CrawlRequest {
         job_id: CrawlJobId,
         cursor: CrawlCursor,
         limit: u8,
+    },
+    /// Declarative output shaping (Phase C, axis 7) over an entire crawl
+    /// job's succeeded pages: project each page's captured HTML onto
+    /// `schema` and page the concatenated resulting rows.
+    ReadShaped {
+        job_id: CrawlJobId,
+        schema: OutputSchema,
+        cursor: ShapeCursor,
+        limit: u16,
     },
     Cancel {
         job_id: CrawlJobId,
@@ -209,6 +222,22 @@ impl CrawlRequest {
         Ok(request)
     }
 
+    pub fn read_shaped(
+        job_id: CrawlJobId,
+        schema: OutputSchema,
+        cursor: ShapeCursor,
+        limit: u16,
+    ) -> Result<Self, ProtocolError> {
+        let request = Self::ReadShaped {
+            job_id,
+            schema,
+            cursor,
+            limit,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+
     pub fn cancel(job_id: CrawlJobId) -> Result<Self, ProtocolError> {
         let request = Self::Cancel { job_id };
         request.validate()?;
@@ -220,6 +249,7 @@ impl CrawlRequest {
             Self::Begin { job_id, .. }
             | Self::Status { job_id }
             | Self::ReadEvents { job_id, .. }
+            | Self::ReadShaped { job_id, .. }
             | Self::Cancel { job_id } => *job_id,
         }
     }
@@ -248,6 +278,13 @@ impl CrawlRequest {
             }
             Self::ReadEvents { limit, .. } => {
                 if *limit == 0 || usize::from(*limit) > MAX_CRAWL_EVENTS {
+                    return Err(ProtocolError::InvalidCrawlPayload);
+                }
+                Ok(())
+            }
+            Self::ReadShaped { schema, limit, .. } => {
+                schema.validate()?;
+                if *limit == 0 || usize::from(*limit) > MAX_ROWS_PER_PAGE {
                     return Err(ProtocolError::InvalidCrawlPayload);
                 }
                 Ok(())
@@ -299,6 +336,22 @@ impl CrawlRequest {
                 output.extend_from_slice(&cursor.value().to_le_bytes());
                 output.push(*limit);
             }
+            Self::ReadShaped {
+                job_id,
+                schema,
+                cursor,
+                limit,
+            } => {
+                output.extend_from_slice(&[5, 0]);
+                output.extend_from_slice(job_id.as_bytes());
+                let schema_bytes = schema.encode()?;
+                let schema_len = u32::try_from(schema_bytes.len())
+                    .map_err(|_| ProtocolError::InvalidCrawlPayload)?;
+                output.extend_from_slice(&schema_len.to_le_bytes());
+                output.extend_from_slice(&schema_bytes);
+                output.extend_from_slice(&cursor.value().to_le_bytes());
+                output.extend_from_slice(&limit.to_le_bytes());
+            }
             Self::Cancel { job_id } => {
                 output.extend_from_slice(&[4, 0]);
                 output.extend_from_slice(job_id.as_bytes());
@@ -346,6 +399,15 @@ impl CrawlRequest {
                 input.u8()?,
             )?,
             4 => Self::cancel(input.job_id()?)?,
+            5 => {
+                let job_id = input.job_id()?;
+                let schema_len = usize::try_from(input.u32()?)
+                    .map_err(|_| ProtocolError::InvalidCrawlPayload)?;
+                let schema = OutputSchema::decode(input.bytes(schema_len)?)?;
+                let cursor = ShapeCursor::new(input.u64()?);
+                let limit = input.u16()?;
+                Self::read_shaped(job_id, schema, cursor, limit)?
+            }
             _ => return Err(ProtocolError::InvalidCrawlPayload),
         };
         if !input.is_empty() {
@@ -871,11 +933,17 @@ impl CrawlEventPage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// `PartialEq`-only (not `Eq`): `ShapedRows` carries a `RowPage`, whose cells
+// may be `Value::Real(f64)` — the same reason `CrawlRequest` (which carries
+// `OutputSchema`, also `f64`-bearing) is `PartialEq`-only.
+#[derive(Debug, Clone, PartialEq)]
 pub enum CrawlResponse {
     Accepted { job_id: CrawlJobId },
     Status(CrawlStatus),
     Events(CrawlEventPage),
+    /// One page of declarative output-shaping rows over a crawl job's
+    /// succeeded pages (Phase C, axis 7).
+    ShapedRows(RowPage),
     Cancelled { job_id: CrawlJobId },
 }
 
@@ -887,6 +955,10 @@ impl CrawlResponse {
             }
             Self::Status(status) => status.validate(),
             Self::Events(page) => page.validate(),
+            // `RowPage`'s fields are private to `shape.rs`, so a `RowPage`
+            // can only reach here through `RowPage::new`/`RowPage::decode`,
+            // both of which already validate it — nothing further to check.
+            Self::ShapedRows(_) => Ok(()),
         }
     }
 
@@ -918,6 +990,14 @@ impl CrawlResponse {
                     output.extend_from_slice(&len.to_le_bytes());
                     output.extend_from_slice(&event);
                 }
+            }
+            Self::ShapedRows(page) => {
+                output.extend_from_slice(&[5, 0]);
+                let page_bytes = page.encode()?;
+                let page_len = u32::try_from(page_bytes.len())
+                    .map_err(|_| ProtocolError::InvalidCrawlPayload)?;
+                output.extend_from_slice(&page_len.to_le_bytes());
+                output.extend_from_slice(&page_bytes);
             }
             Self::Cancelled { job_id } => {
                 output.extend_from_slice(&[4, 0]);
@@ -976,6 +1056,11 @@ impl CrawlResponse {
             4 => Self::Cancelled {
                 job_id: input.job_id()?,
             },
+            5 => {
+                let page_len = usize::try_from(input.u32()?)
+                    .map_err(|_| ProtocolError::InvalidCrawlPayload)?;
+                Self::ShapedRows(RowPage::decode(input.bytes(page_len)?)?)
+            }
             _ => return Err(ProtocolError::InvalidCrawlPayload),
         };
         if !input.is_empty() {
@@ -1413,6 +1498,9 @@ impl<'a> Input<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shape::{
+        Cardinality, Column, ColumnType, CssPick, Extractor, MetaField, OnError, Row, Value,
+    };
 
     fn job_id() -> CrawlJobId {
         CrawlJobId::new([7; 16]).expect("job id")
@@ -1441,6 +1529,39 @@ mod tests {
         .expect("page artifact")
     }
 
+    fn page_level_schema() -> OutputSchema {
+        OutputSchema::new(
+            "page".to_owned(),
+            Cardinality::PageLevel,
+            vec![Column::new(
+                "title".to_owned(),
+                ColumnType::Text,
+                Extractor::Meta(MetaField::Title),
+                OnError::Null,
+            )
+            .expect("title column")],
+        )
+        .expect("valid page-level schema")
+    }
+
+    fn item_scope_schema() -> OutputSchema {
+        OutputSchema::new(
+            "products".to_owned(),
+            Cardinality::ItemScope(".product-card".to_owned()),
+            vec![Column::new(
+                "name".to_owned(),
+                ColumnType::Text,
+                Extractor::Css {
+                    selector: ".name".to_owned(),
+                    pick: CssPick::Text,
+                },
+                OnError::Null,
+            )
+            .expect("name column")],
+        )
+        .expect("valid item-scope schema")
+    }
+
     #[test]
     fn requests_round_trip_with_separate_magic_and_bounded_spec() {
         let requests = [
@@ -1463,6 +1584,88 @@ mod tests {
         }
         assert!(CrawlJobId::new([0; 16]).is_err());
         assert!(CrawlRequest::read_events(job_id(), CrawlCursor::START, 0).is_err());
+    }
+
+    #[test]
+    fn read_shaped_request_round_trips_page_level_and_item_scope_schemas() {
+        for schema in [page_level_schema(), item_scope_schema()] {
+            let request = CrawlRequest::read_shaped(
+                job_id(),
+                schema.clone(),
+                ShapeCursor::new(3),
+                256,
+            )
+            .expect("read shaped request");
+            let encoded = request.encode().expect("encode read shaped");
+            assert_eq!(&encoded[..4], b"D2WQ");
+            assert_eq!(CrawlRequest::decode(&encoded).unwrap(), request);
+            let CrawlRequest::ReadShaped {
+                job_id: decoded_id,
+                schema: decoded_schema,
+                cursor,
+                limit,
+            } = CrawlRequest::decode(&encoded).unwrap()
+            else {
+                panic!("expected ReadShaped request");
+            };
+            assert_eq!(decoded_id, job_id());
+            assert_eq!(decoded_schema, schema);
+            assert_eq!(cursor, ShapeCursor::new(3));
+            assert_eq!(limit, 256);
+        }
+    }
+
+    #[test]
+    fn read_shaped_request_rejects_zero_and_oversized_limit() {
+        assert!(CrawlRequest::read_shaped(
+            job_id(),
+            page_level_schema(),
+            ShapeCursor::START,
+            0,
+        )
+        .is_err());
+        assert!(CrawlRequest::read_shaped(
+            job_id(),
+            page_level_schema(),
+            ShapeCursor::START,
+            u16::try_from(MAX_ROWS_PER_PAGE + 1).unwrap(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn shaped_rows_response_round_trips_with_and_without_next_cursor() {
+        let columns = vec![("title".to_owned(), ColumnType::Text)];
+        let rows = vec![Row::new(vec![Value::Text("Catalog".to_owned())]).unwrap()];
+
+        let incomplete = RowPage::new(
+            columns.clone(),
+            rows.clone(),
+            Some(ShapeCursor::new(1)),
+            false,
+        )
+        .expect("incomplete row page");
+        let response = CrawlResponse::ShapedRows(incomplete);
+        let encoded = response.encode().expect("encode shaped rows");
+        assert_eq!(&encoded[..4], b"D2WP");
+        assert_eq!(CrawlResponse::decode(&encoded).unwrap(), response);
+        let CrawlResponse::ShapedRows(decoded) = CrawlResponse::decode(&encoded).unwrap()
+        else {
+            panic!("expected ShapedRows response");
+        };
+        assert_eq!(decoded.next_cursor(), Some(ShapeCursor::new(1)));
+        assert!(!decoded.is_complete());
+
+        let complete = RowPage::new(columns, rows, None, true).expect("complete row page");
+        let response = CrawlResponse::ShapedRows(complete);
+        let encoded = response.encode().expect("encode complete shaped rows");
+        assert_eq!(CrawlResponse::decode(&encoded).unwrap(), response);
+        let CrawlResponse::ShapedRows(decoded) = CrawlResponse::decode(&encoded).unwrap()
+        else {
+            panic!("expected ShapedRows response");
+        };
+        assert_eq!(decoded.next_cursor(), None);
+        assert!(decoded.is_complete());
     }
 
     #[test]

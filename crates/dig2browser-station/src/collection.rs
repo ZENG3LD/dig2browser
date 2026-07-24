@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dig2browser::agentic::{AgentReply, CapabilitySet, CaptureArtifact};
-use dig2browser_protocol::shape::{ColumnType, OutputSchema, RowPage, ShapeCursor};
+use dig2browser_protocol::shape::{ColumnType, OutputSchema, Row, RowPage, ShapeCursor};
 use dig2browser_protocol::{
     ArtifactChunk, ArtifactMediaType, ArtifactRef, ArtifactRole, CollectionId,
     CollectionReceipt, CollectionReceiptArtifacts, CollectionReceiptMetadata,
@@ -497,24 +497,7 @@ impl CollectionManager {
         cursor: ShapeCursor,
         limit: u16,
     ) -> Result<RowPage, CollectionError> {
-        let receipt = self.read_receipt(collection_id)?;
-        let html = self.read_verified_artifact_bytes(
-            collection_id,
-            receipt.html(),
-            MAX_HTML_BYTES,
-        )?;
-        let meta = CaptureMeta {
-            url: receipt.final_url().to_owned(),
-            final_url: receipt.final_url().to_owned(),
-            http_status: receipt.http_status(),
-            title: receipt.title().unwrap_or_default().to_owned(),
-            ready_state: receipt.ready_state().to_owned(),
-            captured_at: i64::try_from(receipt.completed_at_unix_ms()).unwrap_or(i64::MAX),
-            source_id: hex_collection_id(collection_id),
-        };
-        let all_rows = dig2browser_shape::shape(&html, &meta, schema)
-            .map_err(|error| CollectionError::Shape(error.to_string()))?;
-
+        let all_rows = self.shape_all(collection_id, schema)?;
         let columns: Vec<(String, ColumnType)> = schema
             .columns()
             .iter()
@@ -535,6 +518,37 @@ impl CollectionManager {
             Some(ShapeCursor::new(u64::try_from(end).unwrap_or(u64::MAX)))
         };
         RowPage::new(columns, page_rows, next_cursor, complete).map_err(CollectionError::from)
+    }
+
+    /// The un-paged core of [`Self::read_shaped`]: read the collection's
+    /// capture receipt and its full verified HTML artifact, then project
+    /// every row `schema` produces from that document. Shared by
+    /// [`Self::read_shaped`] (single-collection reads) and the crawl
+    /// source's per-page shaping (`CrawlManager::read_shaped`), which calls
+    /// this once per succeeded page and concatenates the results before
+    /// paging.
+    pub(crate) fn shape_all(
+        &self,
+        collection_id: CollectionId,
+        schema: &OutputSchema,
+    ) -> Result<Vec<Row>, CollectionError> {
+        let receipt = self.read_receipt(collection_id)?;
+        let html = self.read_verified_artifact_bytes(
+            collection_id,
+            receipt.html(),
+            MAX_HTML_BYTES,
+        )?;
+        let meta = CaptureMeta {
+            url: receipt.final_url().to_owned(),
+            final_url: receipt.final_url().to_owned(),
+            http_status: receipt.http_status(),
+            title: receipt.title().unwrap_or_default().to_owned(),
+            ready_state: receipt.ready_state().to_owned(),
+            captured_at: i64::try_from(receipt.completed_at_unix_ms()).unwrap_or(i64::MAX),
+            source_id: hex_collection_id(collection_id),
+        };
+        dig2browser_shape::shape(&html, &meta, schema)
+            .map_err(|error| CollectionError::Shape(error.to_string()))
     }
 
     /// Read one artifact's full bytes from the CAS via the existing chunked

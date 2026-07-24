@@ -856,6 +856,20 @@ async fn crawl_request(
                 "crawl reads disabled",
             )
         }
+        // Output shaping reads a durable page artifact via the collection
+        // store, so it is gated on its own flag plus the two sibling read
+        // gates the collection `ReadShaped` handler uses.
+        CrawlRequest::ReadShaped { .. }
+            if !permissions.output_shaping
+                || !permissions.crawl_read
+                || !permissions.durable_read =>
+        {
+            return WorkerResponse::failure(
+                request,
+                ResponseStatus::Invalid,
+                "output shaping disabled",
+            )
+        }
         CrawlRequest::Cancel { .. } if !permissions.crawl_write => {
             return WorkerResponse::failure(
                 request,
@@ -896,7 +910,8 @@ fn crawl_error_response(request: &WorkerRequest, error: &CrawlError) -> WorkerRe
         | CrawlError::InvalidHex
         | CrawlError::CanonicalUrl(_)
         | CrawlError::Spec(_)
-        | CrawlError::Task(_) => (ResponseStatus::Invalid, "crawl request rejected"),
+        | CrawlError::Task(_)
+        | CrawlError::Shape(_) => (ResponseStatus::Invalid, "crawl request rejected"),
         CrawlError::ArtifactTooLarge => {
             (ResponseStatus::TooLarge, "crawl artifact exceeds limit")
         }

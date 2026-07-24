@@ -478,6 +478,30 @@ impl StationClient {
         Ok(page)
     }
 
+    /// Declarative output shaping (Phase C, axis 7) over an entire crawl
+    /// job's succeeded pages: project every succeeded page's captured HTML
+    /// onto `schema` and read one page of the concatenated resulting rows.
+    /// Requires the station operator's `--allow-output-shaping` (and,
+    /// since it reads durable crawl page artifacts, `--allow-crawl-read`
+    /// and `--allow-durable-read`).
+    pub async fn read_crawl_shaped(
+        &self,
+        job_id: CrawlJobId,
+        schema: OutputSchema,
+        cursor: ShapeCursor,
+        limit: u16,
+    ) -> Result<RowPage, ClientError> {
+        let crawl = CrawlRequest::read_shaped(job_id, schema, cursor, limit)
+            .map_err(|_| ClientError::InvalidCrawlRequest)?;
+        let request = WorkerRequest::crawl(self.take_request_id(), crawl)
+            .map_err(|_| ClientError::InvalidCrawlRequest)?;
+        let response = require_crawl_response(&self.call(request).await?)?;
+        let CrawlResponse::ShapedRows(page) = response else {
+            return Err(ClientError::InvalidResponse);
+        };
+        Ok(page)
+    }
+
     pub async fn cancel_crawl(&self, job_id: CrawlJobId) -> Result<(), ClientError> {
         let crawl = CrawlRequest::cancel(job_id)
             .map_err(|_| ClientError::InvalidCrawlRequest)?;
@@ -1132,6 +1156,17 @@ impl BlockingStationClient {
     ) -> Result<CrawlEventPage, ClientError> {
         self.runtime
             .block_on(self.client.read_crawl_events(job_id, cursor, limit))
+    }
+
+    pub fn read_crawl_shaped(
+        &self,
+        job_id: CrawlJobId,
+        schema: OutputSchema,
+        cursor: ShapeCursor,
+        limit: u16,
+    ) -> Result<RowPage, ClientError> {
+        self.runtime
+            .block_on(self.client.read_crawl_shaped(job_id, schema, cursor, limit))
     }
 
     pub fn cancel_crawl(&self, job_id: CrawlJobId) -> Result<(), ClientError> {
