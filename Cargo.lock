@@ -627,6 +627,7 @@ name = "dig2browser-shape"
 version = "0.1.0"
 dependencies = [
  "dig2browser-protocol",
+ "regex",
  "scraper",
 ]
 

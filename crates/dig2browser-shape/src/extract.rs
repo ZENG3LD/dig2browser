@@ -35,6 +35,19 @@ impl<'a> RowScope<'a> {
             Self::Item(element) => element.select(selector).next(),
         }
     }
+
+    /// The scope's whole text content, collapsed per [`collapse_whitespace`]:
+    /// every descendant text node under the item element for `Item`, or the
+    /// whole document's root element for `Document`. This is what
+    /// `dig2browser_protocol::shape::Extractor::Regex` matches against.
+    pub(crate) fn text(&self) -> String {
+        match self {
+            Self::Document(document) => {
+                collapse_whitespace(&document.root_element().text().collect::<String>())
+            }
+            Self::Item(element) => collapse_whitespace(&element.text().collect::<String>()),
+        }
+    }
 }
 
 pub(crate) fn resolve_meta(field: MetaField, meta: &CaptureMeta) -> Extracted {
@@ -69,6 +82,22 @@ pub(crate) fn resolve_css(selector: &Selector, pick: &CssPick, scope: &RowScope<
             Some(element) => Extracted::Text(element.inner_html()),
             None => Extracted::Missing,
         },
+    }
+}
+
+/// Resolve a compiled regex against the row scope's whole text (see
+/// [`RowScope::text`]), returning the numbered capture group `group`
+/// (`0` = whole match). A no-match haystack, an out-of-range `group`, or a
+/// group that didn't participate in the match are all a normal
+/// [`Extracted::Missing`] — not an error — and fold into the column's
+/// `OnError` policy same as any other extraction miss.
+pub(crate) fn resolve_regex(regex: &regex::Regex, group: u32, scope: &RowScope<'_>) -> Extracted {
+    let text = scope.text();
+    match regex.captures(&text) {
+        Some(captures) => captures.get(group as usize).map_or(Extracted::Missing, |m| {
+            Extracted::Text(m.as_str().to_owned())
+        }),
+        None => Extracted::Missing,
     }
 }
 

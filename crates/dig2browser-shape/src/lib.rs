@@ -8,8 +8,12 @@
 //! for the design and `docs/dig2browser/audits/html-parse-crate-supply-chain-2026-07-24.md`
 //! for the `scraper` dependency decision this crate implements.
 //!
-//! `Extractor::Json`/`Extractor::Regex` are **deferred** to a later slice —
-//! a schema that declares one fails closed with
+//! `Extractor::Regex` is supported: it is matched against the row scope's
+//! whole text (the item element's text for `ItemScope`, the document's text
+//! for `PageLevel`), returning the declared numbered capture group. See
+//! `docs/dig2browser/audits/regex-crate-supply-chain-2026-07-24.md` for the
+//! `regex` dependency decision. `Extractor::Json` remains **deferred** to a
+//! later slice — a schema that declares one fails closed with
 //! [`ShapeError::UnsupportedExtractor`], never a silent null.
 
 mod coerce;
@@ -23,7 +27,7 @@ use dig2browser_protocol::ProtocolError;
 use scraper::{Html, Selector};
 
 use coerce::coerce;
-use extract::{resolve_css, resolve_meta, Extracted, RowScope};
+use extract::{resolve_css, resolve_meta, resolve_regex, Extracted, RowScope};
 
 /// Capture metadata a schema's [`dig2browser_protocol::shape::Extractor::Meta`]
 /// columns read from. Only `http_status` is ever an extraction-miss (the
@@ -45,9 +49,14 @@ pub enum ShapeError {
     /// A schema-declared CSS selector (row-scope root or a column's `Css`
     /// selector) failed to parse.
     InvalidSelector(String),
-    /// `Json`/`Regex` extractors are deferred to a later slice; a schema
-    /// that declares one fails closed here rather than emitting a silent
-    /// null cell. Carries `"json"` or `"regex"`.
+    /// A schema-declared `Regex` column's pattern failed to compile (invalid
+    /// syntax, or rejected by `regex::Regex`'s always-on compiled-size
+    /// limit). Caught once at schema-compile time, before any row scope is
+    /// visited — mirrors [`Self::InvalidSelector`].
+    InvalidRegex(String),
+    /// `Json` extractors are deferred to a later slice; a schema that
+    /// declares one fails closed here rather than emitting a silent null
+    /// cell. Carries `"json"`.
     UnsupportedExtractor(&'static str),
     /// Reserved for a direct (non-`OnError`-gated) coercion failure path.
     /// Not constructed by `shape()` today: every coercion failure this
@@ -71,6 +80,7 @@ impl std::fmt::Display for ShapeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidSelector(detail) => write!(formatter, "invalid CSS selector: {detail}"),
+            Self::InvalidRegex(detail) => write!(formatter, "invalid regex: {detail}"),
             Self::UnsupportedExtractor(kind) => {
                 write!(formatter, "unsupported extractor `{kind}` (deferred to a later slice)")
             }
@@ -94,12 +104,14 @@ impl std::error::Error for ShapeError {
     }
 }
 
-/// A column's extraction rule after selector parsing, so an invalid CSS
-/// selector or a deferred `Json`/`Regex` extractor is caught once for the
-/// whole schema, before any row scope is visited.
+/// A column's extraction rule after selector/pattern compilation, so an
+/// invalid CSS selector, an invalid regex pattern, or a deferred `Json`
+/// extractor is caught once for the whole schema, before any row scope is
+/// visited.
 enum CompiledPlan {
     Meta(MetaField),
     Css { selector: Selector, pick: CssPick },
+    Regex { regex: regex::Regex, group: u32 },
     Const(Value),
 }
 
@@ -163,7 +175,18 @@ fn compile_column(column: &Column) -> Result<CompiledColumn, ShapeError> {
             }
         }
         Extractor::Json { .. } => return Err(ShapeError::UnsupportedExtractor("json")),
-        Extractor::Regex { .. } => return Err(ShapeError::UnsupportedExtractor("regex")),
+        Extractor::Regex { pattern, group } => {
+            let compiled = regex::Regex::new(pattern).map_err(|error| {
+                ShapeError::InvalidRegex(format!(
+                    "column `{}` pattern `{pattern}`: {error}",
+                    column.name()
+                ))
+            })?;
+            CompiledPlan::Regex {
+                regex: compiled,
+                group: *group,
+            }
+        }
         Extractor::Const(value) => CompiledPlan::Const(value.clone()),
     };
     Ok(CompiledColumn {
@@ -186,6 +209,7 @@ fn build_row(
         let extracted = match &column.plan {
             CompiledPlan::Meta(field) => resolve_meta(*field, meta),
             CompiledPlan::Css { selector, pick } => resolve_css(selector, pick, scope),
+            CompiledPlan::Regex { regex, group } => resolve_regex(regex, *group, scope),
             CompiledPlan::Const(value) => Extracted::Value(value.clone()),
         };
         match coerce(extracted, column.ty) {
@@ -234,6 +258,19 @@ mod tests {
                 <span class="name">Widget C</span>
                 <span class="price">not-a-number</span>
                 <a href="/products/widget-c">link</a>
+            </div>
+        </body></html>
+    "#;
+
+    const REGEX_CATALOG_HTML: &str = r#"
+        <html><body>
+            <div class="product-card">
+                <span class="name">Widget A</span>
+                <span class="sku">SKU-12345</span>
+            </div>
+            <div class="product-card">
+                <span class="name">Widget B</span>
+                <span class="sku">SKU-67890</span>
             </div>
         </body></html>
     "#;
@@ -490,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_json_and_regex_extractors_fail_closed() {
+    fn unsupported_json_extractor_fails_closed() {
         let json_schema = OutputSchema::new(
             "frames".to_owned(),
             Cardinality::PageLevel,
@@ -507,28 +544,10 @@ mod tests {
         .expect("valid schema");
         let error = shape(b"<html></html>", &meta(), &json_schema).expect_err("must fail");
         assert!(matches!(error, ShapeError::UnsupportedExtractor("json")));
-
-        let regex_schema = OutputSchema::new(
-            "frames".to_owned(),
-            Cardinality::PageLevel,
-            vec![Column::new(
-                "sku".to_owned(),
-                ColumnType::Text,
-                Extractor::Regex {
-                    pattern: r"SKU-(\d+)".to_owned(),
-                    group: 1,
-                },
-                OnError::Null,
-            )
-            .expect("regex column")],
-        )
-        .expect("valid schema");
-        let error = shape(b"<html></html>", &meta(), &regex_schema).expect_err("must fail");
-        assert!(matches!(error, ShapeError::UnsupportedExtractor("regex")));
     }
 
     #[test]
-    fn unsupported_extractor_fails_even_with_zero_matching_rows() {
+    fn unsupported_json_extractor_fails_even_with_zero_matching_rows() {
         // The Unsupported check runs at schema-compile time, before any row
         // scope is visited, so it fires even when the item-scope root would
         // match nothing.
@@ -538,8 +557,156 @@ mod tests {
             vec![Column::new(
                 "value".to_owned(),
                 ColumnType::Text,
+                Extractor::Json {
+                    pointer: "/a/b".to_owned(),
+                },
+                OnError::Null,
+            )
+            .expect("json column")],
+        )
+        .expect("valid schema");
+        let error = shape(b"<html></html>", &meta(), &schema).expect_err("must fail");
+        assert!(matches!(error, ShapeError::UnsupportedExtractor("json")));
+    }
+
+    #[test]
+    fn regex_item_scope_extracts_capture_group_per_row() {
+        let schema = OutputSchema::new(
+            "products".to_owned(),
+            Cardinality::ItemScope(".product-card".to_owned()),
+            vec![Column::new(
+                "sku".to_owned(),
+                ColumnType::Integer,
                 Extractor::Regex {
-                    pattern: "x".to_owned(),
+                    pattern: r"SKU-(\d+)".to_owned(),
+                    group: 1,
+                },
+                OnError::Null,
+            )
+            .expect("sku column")],
+        )
+        .expect("valid schema");
+
+        let rows = shape(REGEX_CATALOG_HTML.as_bytes(), &meta(), &schema).expect("shape");
+        assert_eq!(rows.len(), 2);
+        // Each row's capture group comes from its own item scope's text,
+        // not the whole document's.
+        assert_eq!(rows[0].values(), &[Value::Integer(12345)]);
+        assert_eq!(rows[1].values(), &[Value::Integer(67890)]);
+    }
+
+    #[test]
+    fn regex_group_zero_returns_whole_match() {
+        let schema = OutputSchema::new(
+            "products".to_owned(),
+            Cardinality::ItemScope(".product-card".to_owned()),
+            vec![Column::new(
+                "sku".to_owned(),
+                ColumnType::Text,
+                Extractor::Regex {
+                    pattern: r"SKU-\d+".to_owned(),
+                    group: 0,
+                },
+                OnError::Null,
+            )
+            .expect("sku column")],
+        )
+        .expect("valid schema");
+
+        let rows = shape(REGEX_CATALOG_HTML.as_bytes(), &meta(), &schema).expect("shape");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values(), &[Value::Text("SKU-12345".to_owned())]);
+        assert_eq!(rows[1].values(), &[Value::Text("SKU-67890".to_owned())]);
+    }
+
+    fn regex_no_match_schema(on_error: OnError) -> OutputSchema {
+        OutputSchema::new(
+            "products".to_owned(),
+            Cardinality::ItemScope(".product-card".to_owned()),
+            vec![Column::new(
+                "sku".to_owned(),
+                ColumnType::Text,
+                Extractor::Regex {
+                    pattern: r"SKU-(\d+)".to_owned(),
+                    group: 1,
+                },
+                on_error,
+            )
+            .expect("sku column")],
+        )
+        .expect("valid regex schema")
+    }
+
+    /// Exercises `Null` / `DropRow` / `Fail` against one HTML fixture on the
+    /// `sku` column's `Regex` extractor when the pattern does not match the
+    /// row scope's text.
+    fn assert_regex_no_match_on_error_matrix(html: &str) {
+        let rows = shape(html.as_bytes(), &meta(), &regex_no_match_schema(OnError::Null))
+            .expect("null");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values()[0], Value::Null);
+
+        let rows = shape(html.as_bytes(), &meta(), &regex_no_match_schema(OnError::DropRow))
+            .expect("drop");
+        assert_eq!(rows.len(), 0);
+
+        let error = shape(html.as_bytes(), &meta(), &regex_no_match_schema(OnError::Fail))
+            .expect_err("fail");
+        match error {
+            ShapeError::RowFailed(column) => assert_eq!(column, "sku"),
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn regex_no_match_under_each_on_error() {
+        assert_regex_no_match_on_error_matrix(
+            r#"<div class="product-card"><span class="name">No Sku Here</span></div>"#,
+        );
+    }
+
+    #[test]
+    fn regex_out_of_range_group_is_a_miss_not_an_error() {
+        let schema = OutputSchema::new(
+            "products".to_owned(),
+            Cardinality::ItemScope(".product-card".to_owned()),
+            vec![Column::new(
+                "sku".to_owned(),
+                ColumnType::Text,
+                Extractor::Regex {
+                    pattern: r"SKU-(\d+)".to_owned(),
+                    group: 9,
+                },
+                OnError::Null,
+            )
+            .expect("sku column")],
+        )
+        .expect("valid schema");
+
+        // The pattern matches, but group 9 doesn't exist in it —
+        // `Captures::get` returns `None`, the same `Extracted::Missing`
+        // path as a no-match, folded into `OnError::Null` rather than
+        // surfaced as a distinct error.
+        let rows = shape(REGEX_CATALOG_HTML.as_bytes(), &meta(), &schema).expect("shape");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values(), &[Value::Null]);
+        assert_eq!(rows[1].values(), &[Value::Null]);
+    }
+
+    #[test]
+    fn invalid_regex_pattern_fails_even_with_zero_matching_rows() {
+        // Mirrors the unsupported-extractor compile-time checks: an invalid
+        // pattern is caught once for the whole schema, before any row scope
+        // is visited, so it fires even when the item-scope root would match
+        // nothing.
+        let schema = OutputSchema::new(
+            "frames".to_owned(),
+            Cardinality::ItemScope(".does-not-exist".to_owned()),
+            vec![Column::new(
+                "value".to_owned(),
+                ColumnType::Text,
+                Extractor::Regex {
+                    pattern: r"(".to_owned(),
                     group: 0,
                 },
                 OnError::Null,
@@ -548,7 +715,37 @@ mod tests {
         )
         .expect("valid schema");
         let error = shape(b"<html></html>", &meta(), &schema).expect_err("must fail");
-        assert!(matches!(error, ShapeError::UnsupportedExtractor("regex")));
+        assert!(matches!(error, ShapeError::InvalidRegex(_)));
+    }
+
+    #[test]
+    fn regex_page_level_matches_whole_document_text() {
+        const ORDER_HTML: &str = r#"
+            <html><body>
+                <p>Order confirmation</p>
+                <p>Reference: ORD-98765</p>
+            </body></html>
+        "#;
+
+        let schema = OutputSchema::new(
+            "order".to_owned(),
+            Cardinality::PageLevel,
+            vec![Column::new(
+                "order_id".to_owned(),
+                ColumnType::Text,
+                Extractor::Regex {
+                    pattern: r"ORD-(\d+)".to_owned(),
+                    group: 1,
+                },
+                OnError::Fail,
+            )
+            .expect("order_id column")],
+        )
+        .expect("valid schema");
+
+        let rows = shape(ORDER_HTML.as_bytes(), &meta(), &schema).expect("shape");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values(), &[Value::Text("98765".to_owned())]);
     }
 
     #[test]
