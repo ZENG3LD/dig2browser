@@ -62,17 +62,23 @@ A persona is a versioned coherent preset (`ChromeWindowsDesktopV1`, `EdgeWindows
 
 Consistent (CDP-native, drives headers + media queries): UA / Client Hints, viewport / screen / DPR, touch + `pointer:coarse` / `hover:none`, `navigator.platform`, timezone; locale via launch flags (`--lang`/`--accept-lang`; `Emulation.setLocaleOverride` is defined but unused).
 
-Known gaps that contradict a mobile claim under fingerprinting (leak the real desktop host):
+Now emulated from the persona **and probe-verified** (`dig2browser-probe::validate_matrix`, Phase 0):
 
 | Surface | State |
 |---|---|
-| WebGL `UNMASKED_RENDERER`/`VENDOR` | Hardcoded `Google Inc. (NVIDIA)` / D3D11-ANGLE for **every** persona, not device-class gated (`scripts.rs`). Real Pixel 7 = Mali/Adreno GLES. Underlying GL behavior is the real desktop GPU regardless. |
+| `hardwareConcurrency` / `deviceMemory` | Set from the persona by `apply_persona` (P0.1); probe-asserted `browser ↔ persona`. |
+| WebGL `UNMASKED_VENDOR`/`RENDERER` | Device-class gated (`Google Inc. (NVIDIA)`/D3D11-ANGLE desktop, `ARM`/`Mali-G710` mobile); probe-asserted. Deeper gap remains: the reported strings are emulated, but the underlying GL *behavior* is the real GPU (pixel/extension probing can still tell). |
+| `maxTouchPoints` | JS-patched via `override_max_touch_points` (P0.3); probe-asserted. |
+| WebRTC | Per-persona **realism invariant** (`PersonaPreset::webrtc`): normal browsers Retain `RTCPeerConnection`, the privacy-cohort persona strips it (`override_webrtc_leak` at the fingerprint tier, gated on `webrtc_policy == Remove`); probe-asserts `present ⇔ persona`, both arms proven on real Chrome. IP-leak containment for a *retained* connection is the isolation engine's (WFP) job, never the persona's — see the persona=realism doctrine. |
+
+Still open (deferred persona-fidelity depth — only when a real target demands it):
+
+| Surface | State |
+|---|---|
 | TLS ClientHello (JA3/JA4) | Not addressed — compiled-in BoringSSL of the real Windows binary; matches desktop Chrome, not Chrome-for-Android. |
 | Media codecs (`canPlayType`) | Not patched — desktop set leaks. |
-| AudioContext, fonts | Not patched — real host leaks. |
-| `hardwareConcurrency` / `deviceMemory` | Hardcoded 8/8 for **all** personas; `apply_persona` never sets them from the persona. |
-| `maxTouchPoints` | Not JS-patched (relies on the CDP touch-emulation side effect only). |
-| WebRTC | `RTCPeerConnection` deleted entirely — a real mobile Chrome keeps it; absence is itself an automation signal. |
+| AudioContext | Noise added (`randomize_audio_fingerprint`) but not persona-shaped or probe-verified — mitigation, not attestation. |
+| Fonts | Not patched — real host leaks. |
 
 The code declares this honestly: `dig2browser-probe` attests only the allowlisted browser/server transcript, and `ChromiumRuntimeFactory` declares `MobileWebEmulation` as `SupportLevel::Emulated` (never `Native`) with `RuntimeLimitation::{NoNativeMobileApis, NoCarrierState, NoHardwareAttestation}`. Mobile personas pass server-side + basic JS checks but are distinguishable by GPU/TLS/codec/audio/font probes.
 
