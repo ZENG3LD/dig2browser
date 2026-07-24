@@ -1499,7 +1499,8 @@ impl<'a> Input<'a> {
 mod tests {
     use super::*;
     use crate::shape::{
-        Cardinality, Column, ColumnType, CssPick, Extractor, MetaField, OnError, Row, Value,
+        Cardinality, Column, ColumnType, CssPick, Extractor, MetaField, OnError, Row,
+        ScopeSelector, Value,
     };
 
     fn job_id() -> CrawlJobId {
@@ -1547,7 +1548,7 @@ mod tests {
     fn item_scope_schema() -> OutputSchema {
         OutputSchema::new(
             "products".to_owned(),
-            Cardinality::ItemScope(".product-card".to_owned()),
+            Cardinality::ItemScope(ScopeSelector::Css(".product-card".to_owned())),
             vec![Column::new(
                 "name".to_owned(),
                 ColumnType::Text,

@@ -23,7 +23,7 @@ use dig2browser_client::{
     SessionStateUpdate, StationClient, StationStatus, SupportLevel, TabInfo,
     TaskCapturePolicy, TaskReply, TaskRuntimeContract, TaskStep,
     Cardinality, Column, ColumnType, CssPick, Extractor, OnError, OutputSchema,
-    ShapeCursor, Value,
+    ScopeSelector, ShapeCursor, Value,
     TerminalOutcome, TraceCursor, TraceEvent, TraceEventKind,
     WebSocketDirection, WebSocketOpcode, PROTOCOL_VERSION,
 };
@@ -4485,7 +4485,7 @@ async fn stationd_read_shaped_projects_captured_catalog_into_declared_rows_e2e()
     // Declare the item-scope schema and read shaped rows over the wire.
     let schema = OutputSchema::new(
         "products".to_owned(),
-        Cardinality::ItemScope(".product-card".to_owned()),
+        Cardinality::ItemScope(ScopeSelector::Css(".product-card".to_owned())),
         vec![
             Column::new(
                 "name".to_owned(),
@@ -4691,7 +4691,7 @@ async fn stationd_read_crawl_shaped_projects_a_two_page_crawl_into_rows_e2e() {
 
     let schema = OutputSchema::new(
         "products".to_owned(),
-        Cardinality::ItemScope(".product-card".to_owned()),
+        Cardinality::ItemScope(ScopeSelector::Css(".product-card".to_owned())),
         vec![
             Column::new(
                 "name".to_owned(),

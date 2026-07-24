@@ -629,6 +629,7 @@ dependencies = [
  "dig2browser-protocol",
  "regex",
  "scraper",
+ "serde_json",
 ]
 
 [[package]]

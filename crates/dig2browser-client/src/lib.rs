@@ -42,7 +42,7 @@ pub use dig2browser_protocol::{
 };
 pub use dig2browser_protocol::shape::{
     Cardinality, Column, ColumnType, CssPick, Extractor, MetaField, OnError, OutputSchema,
-    Row, RowPage, ShapeCursor, Value, MAX_ATTR_NAME_BYTES, MAX_COLUMN_NAME_BYTES,
+    Row, RowPage, ScopeSelector, ShapeCursor, Value, MAX_ATTR_NAME_BYTES, MAX_COLUMN_NAME_BYTES,
     MAX_JSON_POINTER_BYTES, MAX_REGEX_PATTERN_BYTES, MAX_ROWS_PER_PAGE, MAX_SCHEMA_COLUMNS,
     MAX_TABLE_NAME_BYTES, MAX_VALUE_BLOB_BYTES, MAX_VALUE_TEXT_BYTES,
 };

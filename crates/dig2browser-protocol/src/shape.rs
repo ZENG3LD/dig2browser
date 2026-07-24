@@ -52,22 +52,49 @@ const ROW_MAGIC: [u8; 4] = *b"D2XR";
 const ROW_PAGE_MAGIC: [u8; 4] = *b"D2XP";
 const SHAPE_SCHEMA_VERSION: u16 = 1;
 
+/// An [`Cardinality::ItemScope`] row-scope root, typed by source kind: a CSS
+/// selector for an HTML source (`shape()`) or an RFC 6901 JSON pointer for a
+/// JSON source (`shape_json()`). One `Cardinality` serves both engines —
+/// each accepts only its matching variant and fails closed on the other
+/// (`dig2browser_shape::ShapeError::ScopeSourceMismatch`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeSelector {
+    /// Matched with [`Extractor::Css`]'s selector syntax against an HTML
+    /// document. Same emptiness rule as a selector-typed value elsewhere in
+    /// this module: non-empty required.
+    Css(String),
+    /// Resolved with [`serde_json::Value::pointer`]-style RFC 6901 lookup
+    /// against a JSON document. Unlike `Css`, an empty pointer (the document
+    /// root) is valid — same rule as [`Extractor::Json`]'s pointer.
+    JsonPointer(String),
+}
+
+impl ScopeSelector {
+    fn validate(&self) -> Result<(), ProtocolError> {
+        match self {
+            Self::Css(selector) => validate_text(selector, MAX_SELECTOR_BYTES, false),
+            Self::JsonPointer(pointer) => validate_text(pointer, MAX_JSON_POINTER_BYTES, true),
+        }
+    }
+}
+
 /// How an [`OutputSchema`] maps captured content to rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cardinality {
     /// One row per captured page/frame; every column extracts from the
     /// whole document.
     PageLevel,
-    /// One row per element matched by the root selector; each column's
-    /// [`Extractor::Css`] resolves relative to that matched element.
-    ItemScope(String),
+    /// One row per element/array-entry matched by the root
+    /// [`ScopeSelector`]; each column's extractor resolves relative to that
+    /// matched scope.
+    ItemScope(ScopeSelector),
 }
 
 impl Cardinality {
     fn validate(&self) -> Result<(), ProtocolError> {
         match self {
             Self::PageLevel => Ok(()),
-            Self::ItemScope(selector) => validate_text(selector, MAX_SELECTOR_BYTES, false),
+            Self::ItemScope(selector) => selector.validate(),
         }
     }
 }
@@ -676,7 +703,7 @@ fn encode_cardinality(
         Cardinality::PageLevel => output.push(1),
         Cardinality::ItemScope(selector) => {
             output.push(2);
-            put_string_u16(output, selector, MAX_SELECTOR_BYTES)?;
+            encode_scope_selector(output, selector)?;
         }
     }
     Ok(())
@@ -685,11 +712,39 @@ fn encode_cardinality(
 fn decode_cardinality(input: &mut Input<'_>) -> Result<Cardinality, ProtocolError> {
     let cardinality = match input.u8()? {
         1 => Cardinality::PageLevel,
-        2 => Cardinality::ItemScope(input.string_u16(MAX_SELECTOR_BYTES)?),
+        2 => Cardinality::ItemScope(decode_scope_selector(input)?),
         _ => return Err(ProtocolError::InvalidShapePayload),
     };
     cardinality.validate()?;
     Ok(cardinality)
+}
+
+fn encode_scope_selector(
+    output: &mut Vec<u8>,
+    selector: &ScopeSelector,
+) -> Result<(), ProtocolError> {
+    selector.validate()?;
+    match selector {
+        ScopeSelector::Css(value) => {
+            output.push(1);
+            put_string_u16(output, value, MAX_SELECTOR_BYTES)?;
+        }
+        ScopeSelector::JsonPointer(value) => {
+            output.push(2);
+            put_string_u16(output, value, MAX_JSON_POINTER_BYTES)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_scope_selector(input: &mut Input<'_>) -> Result<ScopeSelector, ProtocolError> {
+    let selector = match input.u8()? {
+        1 => ScopeSelector::Css(input.string_u16(MAX_SELECTOR_BYTES)?),
+        2 => ScopeSelector::JsonPointer(input.string_u16(MAX_JSON_POINTER_BYTES)?),
+        _ => return Err(ProtocolError::InvalidShapePayload),
+    };
+    selector.validate()?;
+    Ok(selector)
 }
 
 fn encode_meta_field(output: &mut Vec<u8>, field: MetaField) {
@@ -1085,7 +1140,7 @@ mod tests {
     fn output_schema_round_trips_item_scope_cardinality() {
         let schema = OutputSchema::new(
             "product_cards".to_owned(),
-            Cardinality::ItemScope(".product-card".to_owned()),
+            Cardinality::ItemScope(ScopeSelector::Css(".product-card".to_owned())),
             vec![Column::new(
                 "name".to_owned(),
                 ColumnType::Text,
@@ -1104,8 +1159,57 @@ mod tests {
         assert_eq!(decoded, schema);
         assert_eq!(
             decoded.cardinality(),
-            &Cardinality::ItemScope(".product-card".to_owned())
+            &Cardinality::ItemScope(ScopeSelector::Css(".product-card".to_owned()))
         );
+    }
+
+    #[test]
+    fn output_schema_round_trips_item_scope_json_pointer_cardinality() {
+        let schema = OutputSchema::new(
+            "frames".to_owned(),
+            Cardinality::ItemScope(ScopeSelector::JsonPointer("/data/items".to_owned())),
+            vec![Column::new(
+                "value".to_owned(),
+                ColumnType::Text,
+                Extractor::Json {
+                    pointer: "/value".to_owned(),
+                },
+                OnError::Null,
+            )
+            .expect("column")],
+        )
+        .expect("valid schema");
+
+        let encoded = schema.encode().expect("encode schema");
+        let decoded = OutputSchema::decode(&encoded).expect("decode schema");
+        assert_eq!(decoded, schema);
+        assert_eq!(
+            decoded.cardinality(),
+            &Cardinality::ItemScope(ScopeSelector::JsonPointer("/data/items".to_owned()))
+        );
+    }
+
+    #[test]
+    fn scope_selector_round_trips_both_variants_incl_empty_json_pointer() {
+        let selectors = [
+            ScopeSelector::Css(".product-card".to_owned()),
+            ScopeSelector::JsonPointer("/data/items".to_owned()),
+            // RFC 6901 root: valid and empty, unlike `Css`.
+            ScopeSelector::JsonPointer(String::new()),
+        ];
+        for selector in selectors {
+            let mut output = Vec::new();
+            encode_scope_selector(&mut output, &selector).expect("encode scope selector");
+            let mut input = Input::new(&output);
+            assert_eq!(decode_scope_selector(&mut input).unwrap(), selector);
+            assert!(input.is_empty());
+        }
+    }
+
+    #[test]
+    fn scope_selector_css_rejects_empty_but_json_pointer_allows_it() {
+        assert!(ScopeSelector::Css(String::new()).validate().is_err());
+        assert!(ScopeSelector::JsonPointer(String::new()).validate().is_ok());
     }
 
     #[test]
@@ -1321,7 +1425,7 @@ mod tests {
     fn output_schema_validate_rejects_empty_item_scope_selector() {
         assert!(OutputSchema::new(
             "t".to_owned(),
-            Cardinality::ItemScope(String::new()),
+            Cardinality::ItemScope(ScopeSelector::Css(String::new())),
             sample_columns(),
         )
         .is_err());

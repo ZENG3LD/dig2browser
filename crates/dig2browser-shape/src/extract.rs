@@ -18,6 +18,11 @@ pub(crate) enum Extracted {
     Bool(bool),
     /// `Const` — already a typed protocol [`Value`], passed through as-is.
     Value(Value),
+    /// `shape_json`'s `Extractor::Json` pointer resolution — the pointed-to
+    /// `serde_json::Value`, kept typed rather than stringified so numeric
+    /// (`Integer`/`Real`) and `Boolean` columns coerce without a round trip
+    /// through text.
+    Json(serde_json::Value),
 }
 
 /// Where a [`dig2browser_protocol::shape::Extractor::Css`] selector resolves:
@@ -93,6 +98,43 @@ pub(crate) fn resolve_css(selector: &Selector, pick: &CssPick, scope: &RowScope<
 /// `OnError` policy same as any other extraction miss.
 pub(crate) fn resolve_regex(regex: &regex::Regex, group: u32, scope: &RowScope<'_>) -> Extracted {
     let text = scope.text();
+    match regex.captures(&text) {
+        Some(captures) => captures.get(group as usize).map_or(Extracted::Missing, |m| {
+            Extracted::Text(m.as_str().to_owned())
+        }),
+        None => Extracted::Missing,
+    }
+}
+
+/// Resolve a [`dig2browser_protocol::shape::Extractor::Json`] pointer
+/// against a `shape_json` row scope (RFC 6901, matching
+/// `serde_json::Value::pointer`'s own resolution rules — including that an
+/// empty pointer resolves to the whole scope). A pointer that does not
+/// resolve is a miss; a pointer that resolves to JSON `null` is *not* a miss
+/// here — that distinction is drawn during coercion (`coerce::coerce_json`),
+/// mirroring how `resolve_meta`/`resolve_css` hand raw non-missing results
+/// to `coerce` uniformly.
+pub(crate) fn resolve_json_pointer(scope: &serde_json::Value, pointer: &str) -> Extracted {
+    match scope.pointer(pointer) {
+        Some(value) => Extracted::Json(value.clone()),
+        None => Extracted::Missing,
+    }
+}
+
+/// Resolve a compiled regex against a `shape_json` row scope's compact JSON
+/// serialization (`serde_json::to_string`), returning the numbered capture
+/// group `group` (`0` = whole match) — the JSON-source counterpart of
+/// [`resolve_regex`]'s HTML-scope text match. A no-match haystack, an
+/// out-of-range `group`, or a group that didn't participate in the match are
+/// all a normal [`Extracted::Missing`], same as the HTML path.
+pub(crate) fn resolve_json_regex(
+    regex: &regex::Regex,
+    group: u32,
+    scope: &serde_json::Value,
+) -> Extracted {
+    let Ok(text) = serde_json::to_string(scope) else {
+        return Extracted::Missing;
+    };
     match regex.captures(&text) {
         Some(captures) => captures.get(group as usize).map_or(Extracted::Missing, |m| {
             Extracted::Text(m.as_str().to_owned())

@@ -3,31 +3,47 @@
 //! [`shape`] projects a captured HTML document onto a consumer-declared
 //! [`dig2browser_protocol::shape::OutputSchema`], returning typed
 //! [`dig2browser_protocol::shape::Row`]s — no consumer-side HTML parsing.
-//! Pure and synchronous: no browser, no network, no filesystem access. See
+//! [`shape_json`] does the same for a JSON payload (a live WS/SSE frame, or
+//! a JSON HTTP response), resolving `Extractor::Json` RFC 6901 pointers
+//! against a parsed `serde_json::Value` instead of a DOM. Both are pure and
+//! synchronous: no browser, no network, no filesystem access. See
 //! `docs/dig2browser/plans/phase-c-declarative-output-shaping.md` (signed)
-//! for the design and `docs/dig2browser/audits/html-parse-crate-supply-chain-2026-07-24.md`
-//! for the `scraper` dependency decision this crate implements.
+//! for the design, `docs/dig2browser/audits/html-parse-crate-supply-chain-2026-07-24.md`
+//! for the `scraper` dependency decision, and
+//! `docs/dig2browser/audits/serde-json-crate-supply-chain-2026-07-24.md` for
+//! the `serde_json` dependency decision `shape_json` implements.
 //!
-//! `Extractor::Regex` is supported: it is matched against the row scope's
-//! whole text (the item element's text for `ItemScope`, the document's text
-//! for `PageLevel`), returning the declared numbered capture group. See
+//! `Extractor::Regex` is supported by both engines: matched against the row
+//! scope's whole text — the item element's collapsed text for HTML
+//! `ItemScope`, the document's collapsed text for HTML `PageLevel`, or the
+//! row scope's compact JSON serialization (`serde_json::to_string`) for
+//! `shape_json` — returning the declared numbered capture group. See
 //! `docs/dig2browser/audits/regex-crate-supply-chain-2026-07-24.md` for the
-//! `regex` dependency decision. `Extractor::Json` remains **deferred** to a
-//! later slice — a schema that declares one fails closed with
-//! [`ShapeError::UnsupportedExtractor`], never a silent null.
+//! `regex` dependency decision.
+//!
+//! A schema's `Cardinality::ItemScope` root and each column's extractor must
+//! match the function's source kind: `shape` (HTML) accepts only
+//! `ScopeSelector::Css` + `Extractor::{Meta,Css,Regex,Const}`; `shape_json`
+//! accepts only `ScopeSelector::JsonPointer` +
+//! `Extractor::{Meta,Json,Regex,Const}`. The wrong pairing fails closed with
+//! [`ShapeError::ScopeSourceMismatch`] at schema-compile time, before any
+//! row scope is visited.
 
 mod coerce;
 mod extract;
 
 use dig2browser_protocol::shape::{
     Cardinality, Column, ColumnType, CssPick, Extractor, MetaField, OnError, OutputSchema, Row,
-    Value,
+    ScopeSelector, Value,
 };
 use dig2browser_protocol::ProtocolError;
 use scraper::{Html, Selector};
 
 use coerce::coerce;
-use extract::{resolve_css, resolve_meta, resolve_regex, Extracted, RowScope};
+use extract::{
+    resolve_css, resolve_json_pointer, resolve_json_regex, resolve_meta, resolve_regex,
+    Extracted, RowScope,
+};
 
 /// Capture metadata a schema's [`dig2browser_protocol::shape::Extractor::Meta`]
 /// columns read from. Only `http_status` is ever an extraction-miss (the
@@ -54,10 +70,22 @@ pub enum ShapeError {
     /// limit). Caught once at schema-compile time, before any row scope is
     /// visited — mirrors [`Self::InvalidSelector`].
     InvalidRegex(String),
-    /// `Json` extractors are deferred to a later slice; a schema that
-    /// declares one fails closed here rather than emitting a silent null
-    /// cell. Carries `"json"`.
+    /// An extractor `shape()` cannot resolve against an HTML source.
+    /// `Extractor::Json` is the only such case today — resolving an RFC 6901
+    /// pointer needs `shape_json`'s parsed `serde_json::Value`, not a DOM —
+    /// so a schema that declares one against an HTML source fails closed
+    /// here rather than emitting a silent null cell. Carries `"json"`.
     UnsupportedExtractor(&'static str),
+    /// A schema's `Cardinality::ItemScope` root selector or a column's
+    /// extractor does not match the source kind of the function it was
+    /// passed to (an HTML `ScopeSelector::Css`/`Extractor::Css` used with
+    /// `shape_json`, or a JSON `ScopeSelector::JsonPointer`/`Extractor::Json`
+    /// used with `shape()`). Caught once at schema-compile time, before any
+    /// row scope is visited — mirrors [`Self::InvalidSelector`] /
+    /// [`Self::InvalidRegex`] / [`Self::UnsupportedExtractor`].
+    ScopeSourceMismatch(&'static str),
+    /// `shape_json`'s `payload` failed to parse as JSON.
+    InvalidJson(String),
     /// Reserved for a direct (non-`OnError`-gated) coercion failure path.
     /// Not constructed by `shape()` today: every coercion failure this
     /// engine can produce is an extraction-miss-equivalent and is routed
@@ -84,6 +112,10 @@ impl std::fmt::Display for ShapeError {
             Self::UnsupportedExtractor(kind) => {
                 write!(formatter, "unsupported extractor `{kind}` (deferred to a later slice)")
             }
+            Self::ScopeSourceMismatch(detail) => {
+                write!(formatter, "scope/source mismatch: {detail}")
+            }
+            Self::InvalidJson(detail) => write!(formatter, "invalid JSON payload: {detail}"),
             Self::Coercion { column, detail } => {
                 write!(formatter, "coercion failed for column `{column}`: {detail}")
             }
@@ -122,31 +154,45 @@ struct CompiledColumn {
     plan: CompiledPlan,
 }
 
+/// A schema's compiled `Cardinality` for `shape()` (HTML): either the whole
+/// document, or a pre-parsed root [`Selector`] for `ItemScope`. Compiling
+/// this alongside the columns (in [`compile_schema`]) means an invalid root
+/// selector, and a `ScopeSelector::JsonPointer` root used against an HTML
+/// source, are both caught once at schema-compile time, before any row
+/// scope is visited — the same guarantee the column-level checks already
+/// gave `Extractor::Json`/`Regex`.
+enum CompiledCardinality {
+    PageLevel,
+    ItemScope(Selector),
+}
+
+struct CompiledSchema {
+    cardinality: CompiledCardinality,
+    columns: Vec<CompiledColumn>,
+}
+
 /// Project `html` onto `schema`, returning the shaped rows in document
 /// order. `html` is decoded as UTF-8 (lossy — invalid byte sequences are
 /// replaced, never rejected) before parsing.
 pub fn shape(html: &[u8], meta: &CaptureMeta, schema: &OutputSchema) -> Result<Vec<Row>, ShapeError> {
     schema.validate().map_err(ShapeError::Protocol)?;
+    let compiled = compile_schema(schema)?;
 
     let text = String::from_utf8_lossy(html);
     let document = Html::parse_document(&text);
-    let plan = compile_schema(schema)?;
 
     let mut rows = Vec::new();
-    match schema.cardinality() {
-        Cardinality::PageLevel => {
+    match &compiled.cardinality {
+        CompiledCardinality::PageLevel => {
             let scope = RowScope::Document(&document);
-            if let Some(row) = build_row(&plan, &scope, meta)? {
+            if let Some(row) = build_row(&compiled.columns, &scope, meta)? {
                 rows.push(row);
             }
         }
-        Cardinality::ItemScope(root_selector) => {
-            let selector = Selector::parse(root_selector).map_err(|error| {
-                ShapeError::InvalidSelector(format!("row scope `{root_selector}`: {error:?}"))
-            })?;
-            for element in document.select(&selector) {
+        CompiledCardinality::ItemScope(selector) => {
+            for element in document.select(selector) {
                 let scope = RowScope::Item(element);
-                if let Some(row) = build_row(&plan, &scope, meta)? {
+                if let Some(row) = build_row(&compiled.columns, &scope, meta)? {
                     rows.push(row);
                 }
             }
@@ -155,8 +201,23 @@ pub fn shape(html: &[u8], meta: &CaptureMeta, schema: &OutputSchema) -> Result<V
     Ok(rows)
 }
 
-fn compile_schema(schema: &OutputSchema) -> Result<Vec<CompiledColumn>, ShapeError> {
-    schema.columns().iter().map(compile_column).collect()
+fn compile_schema(schema: &OutputSchema) -> Result<CompiledSchema, ShapeError> {
+    let cardinality = match schema.cardinality() {
+        Cardinality::PageLevel => CompiledCardinality::PageLevel,
+        Cardinality::ItemScope(ScopeSelector::Css(root_selector)) => {
+            let selector = Selector::parse(root_selector).map_err(|error| {
+                ShapeError::InvalidSelector(format!("row scope `{root_selector}`: {error:?}"))
+            })?;
+            CompiledCardinality::ItemScope(selector)
+        }
+        Cardinality::ItemScope(ScopeSelector::JsonPointer(_)) => {
+            return Err(ShapeError::ScopeSourceMismatch(
+                "json-pointer item scope in an html source",
+            ));
+        }
+    };
+    let columns = schema.columns().iter().map(compile_column).collect::<Result<Vec<_>, _>>()?;
+    Ok(CompiledSchema { cardinality, columns })
 }
 
 fn compile_column(column: &Column) -> Result<CompiledColumn, ShapeError> {
@@ -224,6 +285,162 @@ fn build_row(
     Row::new(values).map(Some).map_err(ShapeError::Protocol)
 }
 
+/// A column's extraction rule for `shape_json`, after pattern compilation —
+/// the JSON-source counterpart of [`CompiledPlan`]. `Extractor::Css` has no
+/// entry: a schema that declares one against a JSON source is rejected at
+/// [`compile_json_schema`] time.
+enum JsonCompiledPlan {
+    Meta(MetaField),
+    Json { pointer: String },
+    Regex { regex: regex::Regex, group: u32 },
+    Const(Value),
+}
+
+struct JsonCompiledColumn {
+    name: String,
+    ty: ColumnType,
+    on_error: OnError,
+    plan: JsonCompiledPlan,
+}
+
+/// `shape_json`'s compiled `Cardinality` — the JSON-source counterpart of
+/// [`CompiledCardinality`]. `ItemScope` carries the already-`ScopeSelector`-
+/// unwrapped RFC 6901 pointer string (pointer syntax itself has nothing to
+/// pre-compile, unlike a CSS selector or a regex).
+enum JsonCompiledCardinality {
+    PageLevel,
+    ItemScope(String),
+}
+
+struct JsonCompiledSchema {
+    cardinality: JsonCompiledCardinality,
+    columns: Vec<JsonCompiledColumn>,
+}
+
+/// Project a JSON `payload` onto `schema`, returning the shaped rows. Unlike
+/// [`shape`], `payload` must parse as JSON — a malformed payload is
+/// [`ShapeError::InvalidJson`], not a lossy best-effort decode.
+///
+/// `Cardinality::PageLevel` yields at most one row, scoped to the whole
+/// parsed document. `Cardinality::ItemScope(ScopeSelector::JsonPointer(ptr))`
+/// resolves `ptr` against the document: if it resolves to a JSON array, one
+/// row is built per element (array order); if the pointer is missing, or
+/// resolves to anything other than an array, `shape_json` returns zero rows
+/// — not an error, mirroring `shape()`'s empty CSS item-scope match.
+pub fn shape_json(
+    payload: &[u8],
+    meta: &CaptureMeta,
+    schema: &OutputSchema,
+) -> Result<Vec<Row>, ShapeError> {
+    schema.validate().map_err(ShapeError::Protocol)?;
+    let compiled = compile_json_schema(schema)?;
+
+    let document: serde_json::Value =
+        serde_json::from_slice(payload).map_err(|error| ShapeError::InvalidJson(error.to_string()))?;
+
+    let mut rows = Vec::new();
+    match &compiled.cardinality {
+        JsonCompiledCardinality::PageLevel => {
+            if let Some(row) = build_json_row(&compiled.columns, &document, meta)? {
+                rows.push(row);
+            }
+        }
+        JsonCompiledCardinality::ItemScope(pointer) => {
+            if let Some(serde_json::Value::Array(items)) = document.pointer(pointer) {
+                for item in items {
+                    if let Some(row) = build_json_row(&compiled.columns, item, meta)? {
+                        rows.push(row);
+                    }
+                }
+            }
+            // A missing pointer, or one that resolves to a non-array value,
+            // is a legitimate empty result set — not an error.
+        }
+    }
+    Ok(rows)
+}
+
+fn compile_json_schema(schema: &OutputSchema) -> Result<JsonCompiledSchema, ShapeError> {
+    let cardinality = match schema.cardinality() {
+        Cardinality::PageLevel => JsonCompiledCardinality::PageLevel,
+        Cardinality::ItemScope(ScopeSelector::JsonPointer(pointer)) => {
+            JsonCompiledCardinality::ItemScope(pointer.clone())
+        }
+        Cardinality::ItemScope(ScopeSelector::Css(_)) => {
+            return Err(ShapeError::ScopeSourceMismatch(
+                "css item scope in a json source",
+            ));
+        }
+    };
+    let columns = schema
+        .columns()
+        .iter()
+        .map(compile_json_column)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(JsonCompiledSchema { cardinality, columns })
+}
+
+fn compile_json_column(column: &Column) -> Result<JsonCompiledColumn, ShapeError> {
+    let plan = match column.extractor() {
+        Extractor::Meta(field) => JsonCompiledPlan::Meta(*field),
+        Extractor::Json { pointer } => JsonCompiledPlan::Json {
+            pointer: pointer.clone(),
+        },
+        Extractor::Regex { pattern, group } => {
+            let compiled = regex::Regex::new(pattern).map_err(|error| {
+                ShapeError::InvalidRegex(format!(
+                    "column `{}` pattern `{pattern}`: {error}",
+                    column.name()
+                ))
+            })?;
+            JsonCompiledPlan::Regex {
+                regex: compiled,
+                group: *group,
+            }
+        }
+        Extractor::Const(value) => JsonCompiledPlan::Const(value.clone()),
+        Extractor::Css { .. } => {
+            return Err(ShapeError::ScopeSourceMismatch(
+                "css extractor in a json source",
+            ));
+        }
+    };
+    Ok(JsonCompiledColumn {
+        name: column.name().to_owned(),
+        ty: column.ty(),
+        on_error: column.on_error(),
+        plan,
+    })
+}
+
+/// Resolve every column for one JSON row scope, in schema column order.
+/// Returns `Ok(None)` when a `DropRow` column discards the whole row — the
+/// JSON-source counterpart of [`build_row`].
+fn build_json_row(
+    columns: &[JsonCompiledColumn],
+    scope: &serde_json::Value,
+    meta: &CaptureMeta,
+) -> Result<Option<Row>, ShapeError> {
+    let mut values = Vec::with_capacity(columns.len());
+    for column in columns {
+        let extracted = match &column.plan {
+            JsonCompiledPlan::Meta(field) => resolve_meta(*field, meta),
+            JsonCompiledPlan::Json { pointer } => resolve_json_pointer(scope, pointer),
+            JsonCompiledPlan::Regex { regex, group } => resolve_json_regex(regex, *group, scope),
+            JsonCompiledPlan::Const(value) => Extracted::Value(value.clone()),
+        };
+        match coerce(extracted, column.ty) {
+            Ok(value) => values.push(value),
+            Err(()) => match column.on_error {
+                OnError::Null => values.push(Value::Null),
+                OnError::DropRow => return Ok(None),
+                OnError::Fail => return Err(ShapeError::RowFailed(column.name.clone())),
+            },
+        }
+    }
+    Row::new(values).map(Some).map_err(ShapeError::Protocol)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,7 +495,7 @@ mod tests {
     fn item_scope_schema(price_on_error: OnError) -> OutputSchema {
         OutputSchema::new(
             "products".to_owned(),
-            Cardinality::ItemScope(".product-card".to_owned()),
+            Cardinality::ItemScope(ScopeSelector::Css(".product-card".to_owned())),
             vec![
                 Column::new(
                     "name".to_owned(),
@@ -465,7 +682,7 @@ mod tests {
     fn link_schema(on_error: OnError) -> OutputSchema {
         OutputSchema::new(
             "products".to_owned(),
-            Cardinality::ItemScope(".product-card".to_owned()),
+            Cardinality::ItemScope(ScopeSelector::Css(".product-card".to_owned())),
             vec![
                 Column::new(
                     "name".to_owned(),
@@ -553,7 +770,7 @@ mod tests {
         // match nothing.
         let schema = OutputSchema::new(
             "frames".to_owned(),
-            Cardinality::ItemScope(".does-not-exist".to_owned()),
+            Cardinality::ItemScope(ScopeSelector::Css(".does-not-exist".to_owned())),
             vec![Column::new(
                 "value".to_owned(),
                 ColumnType::Text,
@@ -573,7 +790,7 @@ mod tests {
     fn regex_item_scope_extracts_capture_group_per_row() {
         let schema = OutputSchema::new(
             "products".to_owned(),
-            Cardinality::ItemScope(".product-card".to_owned()),
+            Cardinality::ItemScope(ScopeSelector::Css(".product-card".to_owned())),
             vec![Column::new(
                 "sku".to_owned(),
                 ColumnType::Integer,
@@ -599,7 +816,7 @@ mod tests {
     fn regex_group_zero_returns_whole_match() {
         let schema = OutputSchema::new(
             "products".to_owned(),
-            Cardinality::ItemScope(".product-card".to_owned()),
+            Cardinality::ItemScope(ScopeSelector::Css(".product-card".to_owned())),
             vec![Column::new(
                 "sku".to_owned(),
                 ColumnType::Text,
@@ -622,7 +839,7 @@ mod tests {
     fn regex_no_match_schema(on_error: OnError) -> OutputSchema {
         OutputSchema::new(
             "products".to_owned(),
-            Cardinality::ItemScope(".product-card".to_owned()),
+            Cardinality::ItemScope(ScopeSelector::Css(".product-card".to_owned())),
             vec![Column::new(
                 "sku".to_owned(),
                 ColumnType::Text,
@@ -669,7 +886,7 @@ mod tests {
     fn regex_out_of_range_group_is_a_miss_not_an_error() {
         let schema = OutputSchema::new(
             "products".to_owned(),
-            Cardinality::ItemScope(".product-card".to_owned()),
+            Cardinality::ItemScope(ScopeSelector::Css(".product-card".to_owned())),
             vec![Column::new(
                 "sku".to_owned(),
                 ColumnType::Text,
@@ -701,7 +918,7 @@ mod tests {
         // nothing.
         let schema = OutputSchema::new(
             "frames".to_owned(),
-            Cardinality::ItemScope(".does-not-exist".to_owned()),
+            Cardinality::ItemScope(ScopeSelector::Css(".does-not-exist".to_owned())),
             vec![Column::new(
                 "value".to_owned(),
                 ColumnType::Text,
@@ -752,7 +969,7 @@ mod tests {
     fn empty_item_scope_match_yields_empty_rows_not_an_error() {
         let schema = OutputSchema::new(
             "products".to_owned(),
-            Cardinality::ItemScope(".does-not-exist".to_owned()),
+            Cardinality::ItemScope(ScopeSelector::Css(".does-not-exist".to_owned())),
             vec![Column::new(
                 "name".to_owned(),
                 ColumnType::Text,
@@ -788,5 +1005,342 @@ mod tests {
         let rows = shape(CATALOG_HTML.as_bytes(), &meta(), &schema).expect("shape const");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values(), &[Value::Text("catalog-crawl".to_owned())]);
+    }
+
+    // ---- shape_json ----
+
+    const CATALOG_JSON: &str = r#"{
+        "products": [
+            {"name": "Widget A", "price": 9.99, "in_stock": true, "sku": "SKU-12345"},
+            {"name": "Widget B", "price": 14.5, "in_stock": false, "sku": "SKU-67890"}
+        ]
+    }"#;
+
+    const ORDER_DOC_JSON: &str = r#"{"order": {"id": 987, "total": 42.5}}"#;
+
+    fn json_item_scope_schema() -> OutputSchema {
+        OutputSchema::new(
+            "products".to_owned(),
+            Cardinality::ItemScope(ScopeSelector::JsonPointer("/products".to_owned())),
+            vec![
+                Column::new(
+                    "name".to_owned(),
+                    ColumnType::Text,
+                    Extractor::Json {
+                        pointer: "/name".to_owned(),
+                    },
+                    OnError::Null,
+                )
+                .expect("name column"),
+                Column::new(
+                    "price".to_owned(),
+                    ColumnType::Real,
+                    Extractor::Json {
+                        pointer: "/price".to_owned(),
+                    },
+                    OnError::Null,
+                )
+                .expect("price column"),
+                Column::new(
+                    "in_stock".to_owned(),
+                    ColumnType::Boolean,
+                    Extractor::Json {
+                        pointer: "/in_stock".to_owned(),
+                    },
+                    OnError::Null,
+                )
+                .expect("in_stock column"),
+            ],
+        )
+        .expect("valid item-scope json schema")
+    }
+
+    #[test]
+    fn json_item_scope_array_of_objects_yields_one_row_per_element() {
+        let rows = shape_json(CATALOG_JSON.as_bytes(), &meta(), &json_item_scope_schema())
+            .expect("shape_json catalog");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].values(),
+            &[
+                Value::Text("Widget A".to_owned()),
+                Value::Real(9.99),
+                Value::Boolean(true),
+            ]
+        );
+        assert_eq!(
+            rows[1].values(),
+            &[
+                Value::Text("Widget B".to_owned()),
+                Value::Real(14.5),
+                Value::Boolean(false),
+            ]
+        );
+    }
+
+    #[test]
+    fn json_page_level_mixes_meta_and_json_pointer_columns() {
+        let schema = OutputSchema::new(
+            "order".to_owned(),
+            Cardinality::PageLevel,
+            vec![
+                Column::new(
+                    "url".to_owned(),
+                    ColumnType::Text,
+                    Extractor::Meta(MetaField::Url),
+                    OnError::Null,
+                )
+                .expect("url column"),
+                Column::new(
+                    "order_id".to_owned(),
+                    ColumnType::Integer,
+                    Extractor::Json {
+                        pointer: "/order/id".to_owned(),
+                    },
+                    OnError::Null,
+                )
+                .expect("order_id column"),
+                Column::new(
+                    "total".to_owned(),
+                    ColumnType::Real,
+                    Extractor::Json {
+                        pointer: "/order/total".to_owned(),
+                    },
+                    OnError::Null,
+                )
+                .expect("total column"),
+            ],
+        )
+        .expect("valid page-level json schema");
+
+        let rows =
+            shape_json(ORDER_DOC_JSON.as_bytes(), &meta(), &schema).expect("shape_json order");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].values(),
+            &[
+                Value::Text("https://example.com/catalog".to_owned()),
+                Value::Integer(987),
+                Value::Real(42.5),
+            ]
+        );
+    }
+
+    fn json_missing_pointer_schema(on_error: OnError) -> OutputSchema {
+        OutputSchema::new(
+            "products".to_owned(),
+            Cardinality::ItemScope(ScopeSelector::JsonPointer("/products".to_owned())),
+            vec![
+                Column::new(
+                    "name".to_owned(),
+                    ColumnType::Text,
+                    Extractor::Json {
+                        pointer: "/name".to_owned(),
+                    },
+                    OnError::Null,
+                )
+                .expect("name column"),
+                Column::new(
+                    "missing".to_owned(),
+                    ColumnType::Text,
+                    Extractor::Json {
+                        pointer: "/does-not-exist".to_owned(),
+                    },
+                    on_error,
+                )
+                .expect("missing column"),
+            ],
+        )
+        .expect("valid schema")
+    }
+
+    #[test]
+    fn json_missing_pointer_under_each_on_error() {
+        let rows = shape_json(
+            CATALOG_JSON.as_bytes(),
+            &meta(),
+            &json_missing_pointer_schema(OnError::Null),
+        )
+        .expect("null");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values()[1], Value::Null);
+        assert_eq!(rows[1].values()[1], Value::Null);
+
+        let rows = shape_json(
+            CATALOG_JSON.as_bytes(),
+            &meta(),
+            &json_missing_pointer_schema(OnError::DropRow),
+        )
+        .expect("drop");
+        assert_eq!(rows.len(), 0);
+
+        let error = shape_json(
+            CATALOG_JSON.as_bytes(),
+            &meta(),
+            &json_missing_pointer_schema(OnError::Fail),
+        )
+        .expect_err("fail");
+        match error {
+            ShapeError::RowFailed(column) => assert_eq!(column, "missing"),
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn shape_json_invalid_payload_is_invalid_json() {
+        let schema = OutputSchema::new(
+            "page".to_owned(),
+            Cardinality::PageLevel,
+            vec![Column::new(
+                "url".to_owned(),
+                ColumnType::Text,
+                Extractor::Meta(MetaField::Url),
+                OnError::Null,
+            )
+            .expect("url column")],
+        )
+        .expect("valid schema");
+
+        let error = shape_json(b"{not valid json", &meta(), &schema).expect_err("must fail");
+        assert!(matches!(error, ShapeError::InvalidJson(_)));
+    }
+
+    #[test]
+    fn shape_json_rejects_css_extractor_with_scope_source_mismatch() {
+        let schema = OutputSchema::new(
+            "page".to_owned(),
+            Cardinality::PageLevel,
+            vec![Column::new(
+                "name".to_owned(),
+                ColumnType::Text,
+                Extractor::Css {
+                    selector: ".name".to_owned(),
+                    pick: CssPick::Text,
+                },
+                OnError::Null,
+            )
+            .expect("css column")],
+        )
+        .expect("valid schema");
+
+        // The mismatch is caught at schema-compile time, before the payload
+        // is even parsed, so an otherwise-empty payload still surfaces it.
+        let error = shape_json(b"{}", &meta(), &schema).expect_err("must fail");
+        assert!(matches!(error, ShapeError::ScopeSourceMismatch(_)));
+    }
+
+    #[test]
+    fn shape_json_rejects_css_item_scope_with_scope_source_mismatch() {
+        let schema = OutputSchema::new(
+            "products".to_owned(),
+            Cardinality::ItemScope(ScopeSelector::Css(".product-card".to_owned())),
+            vec![Column::new(
+                "name".to_owned(),
+                ColumnType::Text,
+                Extractor::Json {
+                    pointer: "/name".to_owned(),
+                },
+                OnError::Null,
+            )
+            .expect("json column")],
+        )
+        .expect("valid schema");
+
+        let error = shape_json(b"{}", &meta(), &schema).expect_err("must fail");
+        assert!(matches!(error, ShapeError::ScopeSourceMismatch(_)));
+    }
+
+    #[test]
+    fn shape_rejects_json_pointer_item_scope_with_scope_source_mismatch() {
+        let schema = OutputSchema::new(
+            "products".to_owned(),
+            Cardinality::ItemScope(ScopeSelector::JsonPointer("/products".to_owned())),
+            vec![Column::new(
+                "name".to_owned(),
+                ColumnType::Text,
+                Extractor::Css {
+                    selector: ".name".to_owned(),
+                    pick: CssPick::Text,
+                },
+                OnError::Null,
+            )
+            .expect("name column")],
+        )
+        .expect("valid schema");
+
+        let error = shape(CATALOG_HTML.as_bytes(), &meta(), &schema).expect_err("must fail");
+        assert!(matches!(error, ShapeError::ScopeSourceMismatch(_)));
+    }
+
+    #[test]
+    fn shape_json_regex_matches_serialized_scope_text() {
+        let schema = OutputSchema::new(
+            "products".to_owned(),
+            Cardinality::ItemScope(ScopeSelector::JsonPointer("/products".to_owned())),
+            vec![Column::new(
+                "sku_number".to_owned(),
+                ColumnType::Integer,
+                Extractor::Regex {
+                    pattern: r"SKU-(\d+)".to_owned(),
+                    group: 1,
+                },
+                OnError::Null,
+            )
+            .expect("sku column")],
+        )
+        .expect("valid schema");
+
+        let rows =
+            shape_json(CATALOG_JSON.as_bytes(), &meta(), &schema).expect("shape_json regex");
+        assert_eq!(rows.len(), 2);
+        // Each row's regex matches its own item scope serialized to JSON
+        // text, not the whole document's.
+        assert_eq!(rows[0].values(), &[Value::Integer(12345)]);
+        assert_eq!(rows[1].values(), &[Value::Integer(67890)]);
+    }
+
+    #[test]
+    fn shape_json_item_scope_pointer_resolving_to_non_array_yields_zero_rows() {
+        let schema = OutputSchema::new(
+            "orders".to_owned(),
+            Cardinality::ItemScope(ScopeSelector::JsonPointer("/order".to_owned())),
+            vec![Column::new(
+                "id".to_owned(),
+                ColumnType::Integer,
+                Extractor::Json {
+                    pointer: "/id".to_owned(),
+                },
+                OnError::Null,
+            )
+            .expect("id column")],
+        )
+        .expect("valid schema");
+
+        let rows = shape_json(ORDER_DOC_JSON.as_bytes(), &meta(), &schema)
+            .expect("shape_json non-array pointer");
+        assert_eq!(rows, Vec::new());
+    }
+
+    #[test]
+    fn shape_json_item_scope_missing_pointer_yields_zero_rows() {
+        let schema = OutputSchema::new(
+            "products".to_owned(),
+            Cardinality::ItemScope(ScopeSelector::JsonPointer("/does-not-exist".to_owned())),
+            vec![Column::new(
+                "name".to_owned(),
+                ColumnType::Text,
+                Extractor::Json {
+                    pointer: "/name".to_owned(),
+                },
+                OnError::Null,
+            )
+            .expect("name column")],
+        )
+        .expect("valid schema");
+
+        let rows = shape_json(CATALOG_JSON.as_bytes(), &meta(), &schema)
+            .expect("shape_json missing pointer");
+        assert_eq!(rows, Vec::new());
     }
 }

@@ -28,6 +28,7 @@ pub(crate) fn coerce(extracted: Extracted, ty: ColumnType) -> Result<Value, ()> 
         Extracted::Value(value) => Ok(value),
         Extracted::Bool(flag) => coerce_bool(flag, ty),
         Extracted::Text(text) => coerce_text(&text, ty),
+        Extracted::Json(value) => coerce_json(&value, ty),
     }
 }
 
@@ -65,6 +66,55 @@ fn coerce_text(text: &str, ty: ColumnType) -> Result<Value, ()> {
         },
         ColumnType::Timestamp => trimmed.parse::<i64>().map(Value::Timestamp).map_err(|_| ()),
         ColumnType::Blob => Ok(Value::Blob(text.as_bytes().to_vec())),
+    }
+}
+
+/// Coerce a `shape_json` [`Extracted::Json`] scalar/composite to the
+/// column's declared type.
+///
+/// | JSON value | `Text` | `Integer` | `Real` | `Boolean` | `Timestamp` | `Blob` |
+/// |---|---|---|---|---|---|---|
+/// | `null` | miss | miss | miss | miss | miss | miss |
+/// | `string` | the string | via [`coerce_text`] | via `coerce_text` | via `coerce_text` | via `coerce_text` | via `coerce_text` |
+/// | `number` | canonical string | `i64` if integral, else miss | `f64` if finite, else miss | miss | miss | miss |
+/// | `bool` | `"true"`/`"false"` | miss | miss | the bool | miss | miss |
+/// | `array`/`object` | compact JSON text | miss | miss | miss | miss | compact JSON bytes |
+///
+/// `null` is folded to a miss (not `Value::Null`) so it flows through the
+/// owning column's `OnError` policy exactly like any other extraction miss
+/// — a schema author never sees a distinction between "pointer didn't
+/// resolve" and "pointer resolved to `null`".
+fn coerce_json(value: &serde_json::Value, ty: ColumnType) -> Result<Value, ()> {
+    match value {
+        serde_json::Value::Null => Err(()),
+        serde_json::Value::String(text) => coerce_text(text, ty),
+        serde_json::Value::Number(number) => coerce_json_number(number, ty),
+        serde_json::Value::Bool(flag) => coerce_bool(*flag, ty),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => match ty {
+            ColumnType::Text => serde_json::to_string(value).map(Value::Text).map_err(|_| ()),
+            ColumnType::Blob => serde_json::to_string(value)
+                .map(|text| Value::Blob(text.into_bytes()))
+                .map_err(|_| ()),
+            _ => Err(()),
+        },
+    }
+}
+
+/// `Integer` accepts the number only if it is exactly representable as
+/// `i64` (no fractional part); `Real` accepts any finite `f64`; `Text` gets
+/// the number's canonical string form (`serde_json::Number::to_string`, the
+/// same text the wire payload carried); every other declared type has no
+/// sensible interpretation of a bare JSON number.
+fn coerce_json_number(number: &serde_json::Number, ty: ColumnType) -> Result<Value, ()> {
+    match ty {
+        ColumnType::Integer => number.as_i64().map(Value::Integer).ok_or(()),
+        ColumnType::Real => number
+            .as_f64()
+            .filter(|parsed| parsed.is_finite())
+            .map(Value::Real)
+            .ok_or(()),
+        ColumnType::Text => Ok(Value::Text(number.to_string())),
+        _ => Err(()),
     }
 }
 
@@ -138,6 +188,85 @@ mod tests {
         assert_eq!(
             coerce(Extracted::Text("abc".to_owned()), ColumnType::Blob),
             Ok(Value::Blob(vec![97, 98, 99]))
+        );
+    }
+
+    #[test]
+    fn json_null_is_always_a_miss() {
+        assert!(coerce(Extracted::Json(serde_json::Value::Null), ColumnType::Text).is_err());
+        assert!(coerce(Extracted::Json(serde_json::Value::Null), ColumnType::Integer).is_err());
+    }
+
+    #[test]
+    fn json_string_reuses_text_coercion_rules() {
+        assert_eq!(
+            coerce(
+                Extracted::Json(serde_json::Value::String("42".to_owned())),
+                ColumnType::Integer
+            ),
+            Ok(Value::Integer(42))
+        );
+        assert_eq!(
+            coerce(
+                Extracted::Json(serde_json::Value::String("hi".to_owned())),
+                ColumnType::Text
+            ),
+            Ok(Value::Text("hi".to_owned()))
+        );
+    }
+
+    #[test]
+    fn json_number_coerces_by_declared_type_without_stringify_round_trip() {
+        let integral = serde_json::json!(42);
+        assert_eq!(
+            coerce(Extracted::Json(integral.clone()), ColumnType::Integer),
+            Ok(Value::Integer(42))
+        );
+        assert_eq!(
+            coerce(Extracted::Json(integral.clone()), ColumnType::Text),
+            Ok(Value::Text("42".to_owned()))
+        );
+        assert!(coerce(Extracted::Json(integral), ColumnType::Boolean).is_err());
+
+        let fractional = serde_json::json!(9.5);
+        assert_eq!(
+            coerce(Extracted::Json(fractional.clone()), ColumnType::Real),
+            Ok(Value::Real(9.5))
+        );
+        // Not exactly representable as an integer -> miss.
+        assert!(coerce(Extracted::Json(fractional), ColumnType::Integer).is_err());
+    }
+
+    #[test]
+    fn json_bool_maps_to_boolean_and_text_only() {
+        assert_eq!(
+            coerce(Extracted::Json(serde_json::Value::Bool(true)), ColumnType::Boolean),
+            Ok(Value::Boolean(true))
+        );
+        assert_eq!(
+            coerce(Extracted::Json(serde_json::Value::Bool(false)), ColumnType::Text),
+            Ok(Value::Text("false".to_owned()))
+        );
+        assert!(coerce(Extracted::Json(serde_json::Value::Bool(true)), ColumnType::Integer).is_err());
+    }
+
+    #[test]
+    fn json_array_and_object_serialize_compactly_for_text_and_blob_only() {
+        let array = serde_json::json!([1, 2, 3]);
+        assert_eq!(
+            coerce(Extracted::Json(array.clone()), ColumnType::Text),
+            Ok(Value::Text("[1,2,3]".to_owned()))
+        );
+        assert_eq!(
+            coerce(Extracted::Json(array.clone()), ColumnType::Blob),
+            Ok(Value::Blob(b"[1,2,3]".to_vec()))
+        );
+        assert!(coerce(Extracted::Json(array), ColumnType::Integer).is_err());
+
+        let object = serde_json::json!({"a": 1});
+        assert_eq!(
+            coerce(Extracted::Json(object), ColumnType::Text),
+            Ok(Value::Text("{\"a\":1}".to_owned()))
         );
     }
 }
