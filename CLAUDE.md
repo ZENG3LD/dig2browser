@@ -58,6 +58,30 @@ Chrome/Edge/Firefox derive UA + Client Hints from the actual launched runtime, n
 
 A persona is a versioned coherent preset (`ChromeWindowsDesktopV1`, `EdgeWindowsDesktopV1`, `FirefoxWindowsDesktopV1`, `ChromiumDesktopPrivacyCohortV1`, `ChromeAndroidPixel7MobileWebV1`) binding: viewport, DPR, `max_touch_points`, locale, timezone, `navigator.platform`, platform version, device model. `apply_persona` (`station/src/lib.rs`) pushes these to the runtime via CDP: `Emulation.setUserAgentOverride`+`userAgentMetadata` (drives JS + `Sec-CH-UA*` headers), `setTimezoneOverride`, `setDeviceMetricsOverride`, `setTouchEmulationEnabled`. Plus 18 injection scripts in `src/stealth/scripts.rs` (`navigator.webdriver=false`, `window.chrome`, canvas noise, plugins, languages, WebGL parameter strings, screen, WebRTC removal, media-devices, permissions, UA-data, etc.). `dig2browser-probe` validates a browser-visible↔server-visible↔persona matrix (incl. per-preset UA-token grammar) and rejects `webdriver:true`.
 
+### Persona SOURCE — three modes (`src/stealth/persona_source.rs`, 2026-07-29)
+
+*Where* an identity comes from is a separate axis from *what it contains* (`StealthConfig`). `PersonaSource` is that axis; `resolve()` returns `Option<StealthConfig>` where `None` means "apply nothing".
+
+| Mode | Spec | Behavior |
+|---|---|---|
+| **User** (**DEFAULT**) | `user` (or empty) | The browser's OWN identity, used as-is — no UA / timezone / device-metrics overrides at all. The page keeps following its real window. |
+| Random | `random` / `random:<seed>` | Persona generated at resolve time from coherent pools. UA ↔ platform ↔ client hints ↔ viewport ↔ locale+timezone are drawn as ONE tuple, never rolled independently (an incoherent mix is more detectable than no persona). Seeded draws are reproducible. |
+| Catalog | `catalog:<path>[#id]` | Curated `PersonaRecord` from `.json` (`{version, personas:[…]}` or a bare array) or `.sqlite`/`.db` (table `personas`, one column per record field). `#id` selects; without it the first record wins. |
+
+Wiring:
+- `StealthBrowser::attach(ws)` — **transparent**, mode User. Attaching to a browser this process did NOT launch means observing/driving it, never repainting its identity.
+- `StealthBrowser::attach_with_persona(ws, &PersonaSource)` — the three-mode door.
+- `StealthBrowser::attach_with(ws, StealthConfig)` — raw config escape hatch.
+- `dev-attach --persona user|random[:SEED]|catalog:<path>[#id]` (default `user`); the chosen mode is printed at attach.
+- `StealthConfig.transparent` is the mechanism: `apply_cdp_native_stealth` returns early, so nothing is pushed over CDP. Launched-browser flows (`open_page`) are unaffected — a browser we launch is ours to dress.
+
+**Why the default is User** (live incident 2026-07-29): attach mode used to apply the full persona to *every* attached tab, so `setDeviceMetricsOverride(1920×1080)` was pinned onto a developer's own headed window — the dev stand page then ignored real window resizes, and every `dev-attach` call re-pinned it. Symptom to recognize: `window.innerWidth` disagreeing with `window.outerWidth` / the visible window, chart-style apps rendering half-cut.
+
+Viewport repair tooling on `dev-attach`:
+- `--clear-viewport` — drop a stuck `setDeviceMetricsOverride` (persona or `--viewport` residue).
+- `--fix-viewport` — set→clear metrics cycle (the CDP equivalent of grabbing the window border) that flushes Chrome's *stale renderer size*; the set values are discarded, Chrome recomputes native metrics itself. Use when `innerWidth` disagrees with the window after mixed-DPI monitor moves or a leftover pin. Both are one-shot (exit before the poll loop) and print the resulting metrics.
+- `screenshot_full_page` clears device metrics after its `captureBeyondViewport` capture (Chrome leaves that override behind otherwise).
+
 ### Coverage — emulated vs declared (mobile persona reality)
 
 Consistent (CDP-native, drives headers + media queries): UA / Client Hints, viewport / screen / DPR, touch + `pointer:coarse` / `hover:none`, `navigator.platform`, timezone; locale via launch flags (`--lang`/`--accept-lang`; `Emulation.setLocaleOverride` is defined but unused).
