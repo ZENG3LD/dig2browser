@@ -83,6 +83,24 @@ impl ClientHintsProfile {
         }
     }
 
+    /// Build a profile from explicit fields — the seam a persona record
+    /// (generated or catalog-loaded) materializes through.
+    pub fn custom(
+        platform: impl Into<String>,
+        platform_version: impl Into<String>,
+        architecture: impl Into<String>,
+        model: impl Into<String>,
+        mobile: bool,
+    ) -> Self {
+        Self {
+            platform: platform.into(),
+            platform_version: platform_version.into(),
+            architecture: architecture.into(),
+            model: model.into(),
+            mobile,
+        }
+    }
+
     pub fn platform(&self) -> &str {
         &self.platform
     }

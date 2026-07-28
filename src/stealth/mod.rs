@@ -5,6 +5,7 @@
 
 pub mod config;
 pub mod inject;
+pub mod persona_source;
 pub mod scripts;
 
 pub use config::{
@@ -12,6 +13,9 @@ pub use config::{
     DEFAULT_USER_AGENT,
 };
 pub use inject::InjectionStrategy;
+pub use persona_source::{
+    generate_random, CatalogKind, PersonaRecord, PersonaSource, PersonaSourceError,
+};
 pub use scripts::get_scripts;
 
 use thiserror::Error;

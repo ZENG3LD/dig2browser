@@ -137,12 +137,14 @@ struct Cli {
 
     // ── Persona ──────────────────────────────────────────────────────────────
 
-    /// Apply a stealth persona to the attached tab (UA / timezone / device
-    /// metrics): "default" or "russian". WITHOUT this flag the attach is
-    /// TRANSPARENT — no identity overrides are applied at all (the correct
-    /// mode for observing/driving a dev browser).
-    #[arg(long, value_name = "PRESET")]
-    persona: Option<String>,
+    /// Persona SOURCE — which of the three identity modes to use:
+    ///   user                      the browser's own identity (DEFAULT)
+    ///   random[:SEED]             coherent generated persona
+    ///   catalog:<path>[#id]       record from a .json / .sqlite catalog
+    /// Default `user` applies no overrides at all, so the page keeps
+    /// following the real window.
+    #[arg(long, value_name = "SPEC", default_value = "user")]
+    persona: String,
 
     // ── DOM inspection ────────────────────────────────────────────────────────
 
@@ -320,23 +322,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ws_url = discover_ws_url(cli.port).await?;
     log(cli.quiet, &format!("[dev-attach] browser ws: {ws_url}"));
 
-    // Transparent attach by default — a persona is applied ONLY when
-    // explicitly requested via --persona (dev browsers keep their own
-    // honest identity: UA, timezone, window-driven viewport).
-    let browser = match cli.persona.as_deref() {
-        None => StealthBrowser::attach(ws_url).await?,
-        Some("default") | Some("english") => {
-            log(cli.quiet, "[dev-attach] applying persona: default (english desktop)");
-            StealthBrowser::attach_with(ws_url, dig2browser::StealthConfig::english()).await?
-        }
-        Some("russian") => {
-            log(cli.quiet, "[dev-attach] applying persona: russian desktop");
-            StealthBrowser::attach_with(ws_url, dig2browser::StealthConfig::russian()).await?
-        }
-        Some(other) => {
-            return Err(format!("--persona: unknown preset '{other}' (known: default, russian)").into());
-        }
-    };
+    // Persona source — three modes, default `user` (the browser's own
+    // identity, zero overrides, so the page keeps following the real
+    // window). `random` / `catalog` are explicit opt-ins.
+    let persona_source = dig2browser::stealth::PersonaSource::parse(&cli.persona)
+        .map_err(|e| format!("--persona: {e}"))?;
+    log(
+        cli.quiet,
+        &format!("[dev-attach] persona mode: {}", persona_source.mode_name()),
+    );
+    let browser = StealthBrowser::attach_with_persona(ws_url, &persona_source).await?;
 
     let pages = browser.pages().await?;
     if pages.is_empty() {

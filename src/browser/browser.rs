@@ -125,6 +125,29 @@ impl StealthBrowser {
         Self::attach_with(ws_url, stealth).await
     }
 
+    /// Attach with an explicit persona SOURCE — the three-mode selector
+    /// (`user` / `random` / `catalog`, see
+    /// [`crate::stealth::PersonaSource`]). `PersonaSource::User` (the
+    /// default) resolves to no overrides at all and is identical to
+    /// [`StealthBrowser::attach`]; the other two modes resolve to a full
+    /// identity that is pushed onto every attached tab.
+    pub async fn attach_with_persona(
+        ws_url: String,
+        source: &crate::stealth::PersonaSource,
+    ) -> Result<Self, BrowserError> {
+        let stealth = match source
+            .resolve()
+            .map_err(|e| BrowserError::Connect(e.to_string()))?
+        {
+            Some(cfg) => cfg,
+            None => StealthConfig {
+                transparent: true,
+                ..StealthConfig::default()
+            },
+        };
+        Self::attach_with(ws_url, stealth).await
+    }
+
     /// Attach to an already-running Chrome/Edge instance with an explicit
     /// stealth config — the persona IS applied to every tab attached via
     /// [`StealthBrowser::attach_page`] (UA / timezone / device metrics),
