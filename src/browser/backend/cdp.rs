@@ -1046,6 +1046,12 @@ async fn apply_cdp_native_stealth(
     session: &CdpSession,
     stealth: &StealthConfig,
 ) -> Result<(), BrowserError> {
+    // Transparent mode (dev tooling attached to a developer's own browser):
+    // observe and drive, never repaint identity — no UA, no timezone, no
+    // device-metrics override.
+    if stealth.transparent {
+        return Ok(());
+    }
     // User-Agent + Client Hints: sets Sec-CH-UA* HTTP headers automatically.
     if let Some(profile) = stealth.resolved_profile_from_user_agent() {
         match (profile.brands(), profile.full_version_list()) {
@@ -2207,6 +2213,18 @@ impl PageBackend for CdpPageBackend {
                 )
                 .await
                 .map_err(|e| BrowserError::Other(e.to_string()))?;
+
+            // `captureBeyondViewport` applies a device-metrics override for
+            // the capture and Chrome does NOT reliably drop it afterwards —
+            // the page stays pinned to the capture-time layout size
+            // (window.innerWidth frozen, real window resizes ignored) until
+            // an explicit clear. Seen live 2026-07-29 against a headed
+            // debug Chrome. Best-effort: a failed clear must not fail the
+            // screenshot itself.
+            let _ = self
+                .session
+                .call("Emulation.clearDeviceMetricsOverride", None)
+                .await;
 
             let encoded = result["data"]
                 .as_str()

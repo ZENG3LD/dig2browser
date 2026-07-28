@@ -106,14 +106,36 @@ impl StealthBrowser {
         })
     }
 
-    /// Attach to an already-running Chrome/Edge instance.
+    /// Attach to an already-running Chrome/Edge instance — TRANSPARENT by
+    /// default: no persona is applied to attached tabs (no UA / timezone /
+    /// device-metrics overrides). Attaching to a browser this library did
+    /// not launch means observing and driving it, not repainting its
+    /// identity (live incident 2026-07-29: the persona default silently
+    /// pinned a dev stand tab to 1920×1080). Persona-on-attach is an
+    /// explicit opt-in via [`StealthBrowser::attach_with`].
     ///
     /// Obtain `ws_url` via [`discover_ws_url`] or the browser's own stderr
     /// ("DevTools listening on ws://…"). The browser is NOT killed when this
     /// instance is dropped or closed.
     pub async fn attach(ws_url: String) -> Result<Self, BrowserError> {
+        let stealth = StealthConfig {
+            transparent: true,
+            ..StealthConfig::default()
+        };
+        Self::attach_with(ws_url, stealth).await
+    }
+
+    /// Attach to an already-running Chrome/Edge instance with an explicit
+    /// stealth config — the persona IS applied to every tab attached via
+    /// [`StealthBrowser::attach_page`] (UA / timezone / device metrics),
+    /// exactly like a launched-browser page. For flows that own the target
+    /// browser's identity (crawler personas); dev tooling uses the
+    /// transparent [`StealthBrowser::attach`] instead.
+    pub async fn attach_with(
+        ws_url: String,
+        stealth: StealthConfig,
+    ) -> Result<Self, BrowserError> {
         let launch = LaunchConfig::default();
-        let stealth = StealthConfig::default();
         let b = CdpBrowserBackend::attach(ws_url, launch.clone(), stealth.clone()).await?;
         Ok(Self {
             backend: Box::new(b),

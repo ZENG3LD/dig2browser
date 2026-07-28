@@ -201,6 +201,14 @@ pub enum WebrtcPolicy {
 /// Full stealth configuration passed to script generators and injection strategies.
 #[derive(Debug, Clone)]
 pub struct StealthConfig {
+    /// Transparent mode: apply NO identity overrides at all (no UA, no
+    /// timezone, no device metrics). For dev tooling that ATTACHES to a
+    /// developer's own headed browser to observe/drive it (`dev-attach`) —
+    /// repainting the identity of a browser we did not launch pins its
+    /// viewport to the persona size (live incident 2026-07-29: every
+    /// `dev-attach` call silently forced 1920×1080 metrics onto the dev
+    /// stand tab, so real window resizes were ignored).
+    pub transparent: bool,
     pub level: StealthLevel,
     pub locale: LocaleProfile,
     pub viewport: (u32, u32),
@@ -222,6 +230,7 @@ pub struct StealthConfig {
 impl Default for StealthConfig {
     fn default() -> Self {
         Self {
+            transparent: false,
             level: StealthLevel::Standard,
             locale: LocaleProfile::english_us(),
             viewport: (1920, 1080),

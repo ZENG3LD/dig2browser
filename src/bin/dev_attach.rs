@@ -123,6 +123,27 @@ struct Cli {
     #[arg(long = "viewport-scale", default_value = "1.0")]
     viewport_scale: f64,
 
+    /// Clear any device-metrics override stuck on the tab (undo a persona /
+    /// --viewport pin) — the page returns to the browser's native size.
+    #[arg(long = "clear-viewport")]
+    clear_viewport: bool,
+
+    /// Heal a stale renderer viewport (innerWidth disagreeing with the real
+    /// window, e.g. after mixed-DPI monitor moves or a leftover persona
+    /// pin): forces a device-metrics set→clear cycle — the CDP equivalent
+    /// of grabbing the window border — then prints the resulting metrics.
+    #[arg(long = "fix-viewport")]
+    fix_viewport: bool,
+
+    // ── Persona ──────────────────────────────────────────────────────────────
+
+    /// Apply a stealth persona to the attached tab (UA / timezone / device
+    /// metrics): "default" or "russian". WITHOUT this flag the attach is
+    /// TRANSPARENT — no identity overrides are applied at all (the correct
+    /// mode for observing/driving a dev browser).
+    #[arg(long, value_name = "PRESET")]
+    persona: Option<String>,
+
     // ── DOM inspection ────────────────────────────────────────────────────────
 
     /// Dump DOM tree starting at selector (use "body" for full page)
@@ -299,7 +320,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ws_url = discover_ws_url(cli.port).await?;
     log(cli.quiet, &format!("[dev-attach] browser ws: {ws_url}"));
 
-    let browser = StealthBrowser::attach(ws_url).await?;
+    // Transparent attach by default — a persona is applied ONLY when
+    // explicitly requested via --persona (dev browsers keep their own
+    // honest identity: UA, timezone, window-driven viewport).
+    let browser = match cli.persona.as_deref() {
+        None => StealthBrowser::attach(ws_url).await?,
+        Some("default") | Some("english") => {
+            log(cli.quiet, "[dev-attach] applying persona: default (english desktop)");
+            StealthBrowser::attach_with(ws_url, dig2browser::StealthConfig::english()).await?
+        }
+        Some("russian") => {
+            log(cli.quiet, "[dev-attach] applying persona: russian desktop");
+            StealthBrowser::attach_with(ws_url, dig2browser::StealthConfig::russian()).await?
+        }
+        Some(other) => {
+            return Err(format!("--persona: unknown preset '{other}' (known: default, russian)").into());
+        }
+    };
 
     let pages = browser.pages().await?;
     if pages.is_empty() {
@@ -394,6 +431,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log(cli.quiet, &format!("[dev-attach] key chord: {chord}"));
         let mod_refs: Vec<&str> = modifiers.iter().map(|s| s.as_str()).collect();
         page.key_chord(&mod_refs, &key).await?;
+    }
+
+    // --clear-viewport — strip a stuck device-metrics override (persona or
+    // --viewport residue) so the page follows the real window again.
+    // One-shot: exits unless another action (eval/screenshot/watch) is also
+    // requested — otherwise main would fall through into the poll loop.
+    if cli.clear_viewport {
+        page.clear_viewport_override().await?;
+        log(cli.quiet, "[dev-attach] device-metrics override cleared");
+        if cli.eval.is_none() && cli.screenshot.is_none() && !cli.watch_console && !cli.fix_viewport {
+            return Ok(());
+        }
+    }
+
+    // --fix-viewport — set→clear metrics cycle: flushes a stale renderer
+    // size the way a manual window-border drag does. The set value is
+    // irrelevant (clear discards it); the CYCLE forces Chrome to recompute
+    // native metrics from the real window. Proven live 2026-07-29 against
+    // a page whose innerWidth was stuck at 1920 in a 960px window.
+    if cli.fix_viewport {
+        page.set_viewport(100, 100, 0.0).await?;
+        page.clear_viewport_override().await?;
+        let v = page
+            .eval("JSON.stringify({inner:[window.innerWidth,window.innerHeight],outer:[window.outerWidth,window.outerHeight],dpr:window.devicePixelRatio})")
+            .await?;
+        let v_str = match &v {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        log(cli.quiet, &format!("[dev-attach] viewport cycle done: {v_str}"));
+        if cli.eval.is_none() && cli.screenshot.is_none() && !cli.watch_console {
+            return Ok(());
+        }
     }
 
     // --viewport
