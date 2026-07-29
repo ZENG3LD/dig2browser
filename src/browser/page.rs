@@ -246,6 +246,19 @@ impl StealthPage {
         self.backend.drag(x1, y1, x2, y2).await
     }
 
+    /// Press the left button at `(x, y)` without releasing — the split
+    /// half of [`StealthPage::drag`]. Follow with [`StealthPage::mouse_move`]
+    /// steps and finish with [`StealthPage::mouse_up`]; lets tooling freeze
+    /// and screenshot a mid-drag frame.
+    pub async fn mouse_down(&self, x: f64, y: f64) -> Result<(), BrowserError> {
+        self.backend.mouse_down(x, y).await
+    }
+
+    /// Release the left button at `(x, y)` — closes [`StealthPage::mouse_down`].
+    pub async fn mouse_up(&self, x: f64, y: f64) -> Result<(), BrowserError> {
+        self.backend.mouse_up(x, y).await
+    }
+
     /// Dispatch a scroll-wheel event at `(x, y)` with CSS-pixel deltas.
     pub async fn wheel(&self, x: f64, y: f64, dx: f64, dy: f64) -> Result<(), BrowserError> {
         self.backend.wheel(x, y, dx, dy).await

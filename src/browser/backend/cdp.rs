@@ -2394,6 +2394,24 @@ impl PageBackend for CdpPageBackend {
         })
     }
 
+    fn mouse_down<'a>(&'a self, x: f64, y: f64) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move {
+            self.session
+                .dispatch_mouse_event("mousePressed", x, y, "left", 1)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))
+        })
+    }
+
+    fn mouse_up<'a>(&'a self, x: f64, y: f64) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move {
+            self.session
+                .dispatch_mouse_event("mouseReleased", x, y, "left", 1)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))
+        })
+    }
+
     fn wheel<'a>(
         &'a self,
         x: f64,

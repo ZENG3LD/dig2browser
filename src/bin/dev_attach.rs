@@ -101,6 +101,15 @@ struct Cli {
     #[arg(long, value_name = "X1,Y1,X2,Y2")]
     drag: Option<String>,
 
+    /// Press the left button WITHOUT releasing (mid-drag inspection:
+    /// --down, then --move steps, screenshot the frozen frame, --up)
+    #[arg(long, value_name = "X,Y")]
+    down: Option<String>,
+
+    /// Release the left button (closes a prior --down)
+    #[arg(long, value_name = "X,Y")]
+    up: Option<String>,
+
     /// Wheel scroll, e.g. --wheel 500,300,0,300 (X,Y,DX,DY)
     #[arg(long, value_name = "X,Y,DX,DY")]
     wheel: Option<String>,
@@ -368,16 +377,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let page = browser.attach_page(&target_id).await?;
 
     // ── One-shot actions ──────────────────────────────────────────────────────
-
-    // --eval
-    if let Some(js) = &cli.eval {
-        let result = page.eval(js).await?;
-        match &result {
-            serde_json::Value::String(s) => println!("{s}"),
-            other => println!("{}", serde_json::to_string_pretty(other)?),
-        }
-        return Ok(());
-    }
+    // Input actions run FIRST, --eval runs after them (it used to early-return
+    // before the input block, silently swallowing every `--click … --eval` /
+    // `--move … --eval` combo — the clicks never fired).
 
     // --click
     if let Some(s) = &cli.click {
@@ -407,6 +409,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         page.drag(x1, y1, x2, y2).await?;
     }
 
+    // --down (button press held across process exits — CDP state lives in
+    // the browser, so a later --move / --up invocation continues the drag)
+    if let Some(s) = &cli.down {
+        let (x, y) = parse_xy(s).map_err(|e| format!("--down: {e}"))?;
+        log(cli.quiet, &format!("[dev-attach] mouse down at ({x},{y})"));
+        page.mouse_down(x, y).await?;
+    }
+
+    // --up
+    if let Some(s) = &cli.up {
+        let (x, y) = parse_xy(s).map_err(|e| format!("--up: {e}"))?;
+        log(cli.quiet, &format!("[dev-attach] mouse up at ({x},{y})"));
+        page.mouse_up(x, y).await?;
+    }
+
     // --wheel
     if let Some(s) = &cli.wheel {
         let (x, y, dx, dy) = parse_xy_dx_dy(s).map_err(|e| format!("--wheel: {e}"))?;
@@ -426,6 +443,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log(cli.quiet, &format!("[dev-attach] key chord: {chord}"));
         let mod_refs: Vec<&str> = modifiers.iter().map(|s| s.as_str()).collect();
         page.key_chord(&mod_refs, &key).await?;
+    }
+
+    // --eval — runs AFTER the input actions above so combos like
+    // `--move … --eval 1` actually move first.
+    if let Some(js) = &cli.eval {
+        let result = page.eval(js).await?;
+        match &result {
+            serde_json::Value::String(s) => println!("{s}"),
+            other => println!("{}", serde_json::to_string_pretty(other)?),
+        }
+        return Ok(());
+    }
+
+    // Pure input invocations are one-shot: exit unless another action
+    // (screenshot / watch / viewport / dom / rect / network) still needs
+    // the connection — otherwise main falls through into the poll loop.
+    let did_input = cli.click.is_some()
+        || cli.right_click.is_some()
+        || cli.r#move.is_some()
+        || cli.drag.is_some()
+        || cli.down.is_some()
+        || cli.up.is_some()
+        || cli.wheel.is_some()
+        || cli.key.is_some()
+        || cli.key_chord.is_some();
+    if did_input
+        && cli.screenshot.is_none()
+        && !cli.watch_console
+        && !cli.clear_viewport
+        && !cli.fix_viewport
+        && cli.viewport.is_none()
+        && cli.dom.is_none()
+        && cli.rect.is_none()
+        && !cli.network_poll
+    {
+        return Ok(());
     }
 
     // --clear-viewport — strip a stuck device-metrics override (persona or

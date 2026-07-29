@@ -209,6 +209,22 @@ pub trait PageBackend: Send + Sync {
         y2: f64,
     ) -> BoxFuture<'a, Result<(), BrowserError>>;
 
+    /// Press the left button at `(x, y)` WITHOUT releasing — the split
+    /// half of [`PageBackend::drag`] (drive `mouse_move_to` afterwards,
+    /// finish with [`PageBackend::mouse_up`]). Lets tooling freeze and
+    /// inspect a mid-drag frame, which the atomic `drag` cannot.
+    fn mouse_down<'a>(&'a self, x: f64, y: f64) -> BoxFuture<'a, Result<(), BrowserError>> {
+        let _ = (x, y);
+        Box::pin(async { Err(BrowserError::Other("mouse_down: unsupported backend".into())) })
+    }
+
+    /// Release the left button at `(x, y)` — the closing half of
+    /// [`PageBackend::mouse_down`].
+    fn mouse_up<'a>(&'a self, x: f64, y: f64) -> BoxFuture<'a, Result<(), BrowserError>> {
+        let _ = (x, y);
+        Box::pin(async { Err(BrowserError::Other("mouse_up: unsupported backend".into())) })
+    }
+
     /// Scroll-wheel event at `(x, y)` with CSS-pixel deltas.
     fn wheel<'a>(
         &'a self,
