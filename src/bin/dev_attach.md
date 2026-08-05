@@ -53,3 +53,46 @@ dev-attach --port 9222 --screenshot ./snap.png --interval 5
 ```
 
 `frames` reads `window.MLC_FRAMES`; shows `?` if the global is not set yet.
+
+## Hang forensics — `--hang-report`
+
+For a page whose main thread has stopped: it prints nothing to the console,
+because a blocked thread emits no events at all. The log being empty IS the
+symptom, so the diagnosis has to come from outside the page.
+
+```bash
+# what is this page spending itself on (works on a healthy page too)
+dev-attach --port 9222 --hang-report --hang-seconds 3
+
+# same, then take the tab back
+dev-attach --port 9222 --hang-report --recover
+```
+
+What it does, in order:
+
+1. **Probe** — one bounded `Runtime.evaluate("1")`. Two seconds without an
+   answer and the page counts as BLOCKED.
+2. **Healthy page** → CPU-profile the isolate and print the hottest frames by
+   self time. Rust/wasm frames come back with their real symbol names from the
+   dev build's name section, e.g.
+   `uzor::core::render::svg::parse_number::h4717…`.
+3. **Blocked page** → the profiler is served BY the stuck thread and answers
+   nothing (measured, not assumed), so it tries `Debugger.pause`, whose
+   `Debugger.paused` event carries the stack that is spinning.
+4. **`--recover`** (opt-in, and only after the evidence attempt):
+   `Runtime.terminateExecution` → re-probe → `Page.reload` → re-probe → as a
+   last resort open a replacement tab at the same URL and close the wedged one.
+
+Everything here speaks raw CDP over the **browser** endpoint with a flat
+session (`Target.attachToTarget {flatten:true}`), never the library's attach
+path and never the page's own socket:
+
+* the attach path negotiates with the page, so it hangs on exactly the pages
+  this command exists for;
+* a session opened directly onto a page is a legacy session and every command
+  queues behind the main thread — the thread that is stuck. A flat session
+  from the browser endpoint is what DevTools itself uses.
+
+**Recovery is opt-in on purpose.** A wedged renderer is the only place the
+state that caused it still exists; reloading or recycling the tab destroys it,
+and then the bug is a story instead of a stack.

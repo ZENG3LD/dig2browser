@@ -37,6 +37,11 @@
 //!   dev-attach --port 9222 --cdp "Browser.getVersion"
 //!   dev-attach --port 9222 --cdp "Input.dispatchMouseEvent" --cdp-params '{"type":"mouseMoved","x":100,"y":100}'
 //!
+//! # Hang forensics
+//!
+//!   dev-attach --port 9222 --hang-report
+//!   dev-attach --port 9222 --hang-report --recover
+//!
 //! # Network
 //!
 //!   dev-attach --port 9222 --network-poll
@@ -178,6 +183,27 @@ struct Cli {
     /// JSON params for --cdp, e.g. --cdp-params '{"ignoreCache":true}'
     #[arg(long = "cdp-params", value_name = "JSON")]
     cdp_params: Option<String>,
+
+    // ── Hang forensics ────────────────────────────────────────────────────────
+
+    /// Diagnose a page whose main thread has stopped answering: probe it, then
+    /// CPU-profile the stuck isolate and print what it is spinning in.
+    ///
+    /// Console and app logs go silent when the main thread blocks — no events
+    /// are emitted at all — so the log is empty exactly when it matters. The V8
+    /// profiler is served off that thread and keeps sampling, which makes it
+    /// the one channel that still talks.
+    #[arg(long = "hang-report")]
+    hang_report: bool,
+
+    /// Seconds to sample for --hang-report (default 3).
+    #[arg(long = "hang-seconds", value_name = "SECONDS", default_value_t = 3)]
+    hang_seconds: u64,
+
+    /// After reporting, take the thread back: Runtime.terminateExecution, then
+    /// Page.reload if that was not enough. Off by default — evidence first.
+    #[arg(long)]
+    recover: bool,
 
     // ── Network log ───────────────────────────────────────────────────────────
 
@@ -326,6 +352,21 @@ fn log(quiet: bool, msg: &str) {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+
+    // Hang forensics run BEFORE the attach and never touch it. Attaching
+    // negotiates with the page, and a page whose main thread is blocked cannot
+    // answer that negotiation — the tool meant for a wedged tab must not need
+    // the tab to be well.
+    if cli.hang_report {
+        return hang_report(
+            cli.port,
+            cli.target.as_deref(),
+            cli.hang_seconds,
+            cli.recover,
+            cli.quiet,
+        )
+        .await;
+    }
 
     log(cli.quiet, &format!("[dev-attach] querying debug port {}...", cli.port));
     let ws_url = discover_ws_url(cli.port).await?;
@@ -656,6 +697,417 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 last_shot_at = Instant::now();
             }
+        }
+    }
+}
+
+// ── Hang forensics ───────────────────────────────────────────────────────────
+//
+// Everything below speaks raw CDP over the PAGE's own websocket. Nothing here
+// goes through the library's attach path: that path negotiates with the page,
+// and a page whose main thread is blocked cannot answer.
+
+/// How long a liveness probe may take before the page counts as wedged.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// A wedged page cannot answer, so every CDP call needs its own ceiling.
+const CDP_TIMEOUT: Duration = Duration::from_secs(5);
+
+type Ws = tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+>;
+
+/// Diagnose — and optionally revive — a page whose main thread has stopped.
+///
+/// The order is deliberate: EVIDENCE first, recovery second, and recovery only
+/// when asked. A wedged renderer is the only place the stack that caused it
+/// still exists; reloading the tab destroys it, and the bug becomes a story
+/// instead of a stack trace.
+async fn hang_report(
+    port: u16,
+    target: Option<&str>,
+    seconds: u64,
+    recover: bool,
+    quiet: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (title, url, target_id) = pick_target(port, target).await?;
+    log(quiet, &format!("[dev-attach] page: {title} — {url}"));
+
+    // The BROWSER endpoint, not the page's own socket. A session opened
+    // straight onto a page is a legacy session and every command on it queues
+    // behind the main thread — which is precisely the thread that is stuck. A
+    // flat session attached from the browser endpoint is what DevTools itself
+    // uses, and it is the one that routes `Debugger.pause` and
+    // `Runtime.terminateExecution` out of band.
+    let browser_ws = browser_ws_url(port).await?;
+    let (mut ws, _) = tokio_tungstenite::connect_async(&browser_ws).await?;
+    let mut next_id = 1_u64;
+    let session = attach_flat(&mut ws, &mut next_id, &target_id)
+        .await
+        .ok_or("could not attach a flat session to the page")?;
+    let session = Some(session);
+
+    let alive = probe_alive(&mut ws, &mut next_id, &session).await;
+    println!("main thread: {}", if alive { "responding" } else { "BLOCKED" });
+
+    if alive {
+        // A live page answers the profiler, which is the useful question here:
+        // not "is it stuck" but "what is it spending itself on".
+        log(quiet, "[dev-attach] sampling the isolate...");
+        match cpu_profile(&mut ws, &mut next_id, &session, seconds).await {
+            Ok(frames) if !frames.is_empty() => {
+                println!("\nhottest frames ({seconds}s sample, self time):");
+                for (name, url, line, hits, pct) in frames.iter().take(15) {
+                    let where_ = if url.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  {url}:{line}")
+                    };
+                    println!("  {pct:>5.1}%  {hits:>6} samples  {name}{where_}");
+                }
+            }
+            Ok(_) => println!("\nprofiler returned no samples — the isolate never ran in the window"),
+            Err(e) => println!("\nprofiler unavailable: {e}"),
+        }
+        return Ok(());
+    }
+
+    // BLOCKED. The profiler is served BY the stuck thread, so it answers
+    // nothing — measured, not assumed. What still lands is the debugger's
+    // interrupt: `Debugger.pause` is delivered out of band, exactly as the
+    // DevTools stop button does it during a runaway script, and the resulting
+    // `Debugger.paused` event carries the stack that is spinning.
+    log(quiet, "[dev-attach] interrupting the stuck thread...");
+    match pause_stack(&mut ws, &mut next_id, &session).await {
+        Some(frames) if !frames.is_empty() => {
+            println!("\nstack at the moment of the interrupt (innermost first):");
+            for (i, (name, url, line, col)) in frames.iter().enumerate().take(20) {
+                let where_ = if url.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {url}:{line}:{col}")
+                };
+                println!("  #{i:<2} {name}{where_}");
+            }
+        }
+        Some(_) => println!("\nthe interrupt landed but the stack came back empty"),
+        None => println!("\nthe debugger interrupt did not land either — the renderer is beyond CDP"),
+    }
+
+    if !recover {
+        println!("\nnot recovering (pass --recover). The tab is still stopped, and the stack above dies with it.");
+        return Ok(());
+    }
+
+    println!("\nrecovering: Runtime.terminateExecution");
+    let _ = call(&mut ws, &mut next_id, &session, "Runtime.terminateExecution", serde_json::json!({})).await;
+    if probe_alive(&mut ws, &mut next_id, &session).await {
+        println!("recovered: the thread came back without a reload");
+        return Ok(());
+    }
+    println!("still blocked: Page.reload");
+    let _ = call(&mut ws, &mut next_id, &session, "Page.reload", serde_json::json!({})).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    if probe_alive(&mut ws, &mut next_id, &session).await {
+        println!("after reload: responding");
+        return Ok(());
+    }
+
+    // Last resort: the renderer is past every in-page command, so replace the
+    // TAB. This is the one recovery that always works and the one that costs
+    // the most — the old renderer, and any evidence still inside it, goes with
+    // it. It runs last for that reason.
+    println!("after reload: STILL BLOCKED — recycling the tab");
+    let fresh = call(
+        &mut ws,
+        &mut next_id,
+        &None,
+        "Target.createTarget",
+        serde_json::json!({ "url": url }),
+    )
+    .await
+    .and_then(|r| r.get("targetId").and_then(|v| v.as_str()).map(str::to_string));
+    match fresh {
+        Some(new_id) => {
+            let _ = call(
+                &mut ws,
+                &mut next_id,
+                &None,
+                "Target.closeTarget",
+                serde_json::json!({ "targetId": target_id }),
+            )
+            .await;
+            println!("recycled: {url} is open again on target {new_id}; the wedged tab is closed");
+        }
+        None => println!("could not open a replacement tab — the browser itself may be in trouble"),
+    }
+    Ok(())
+}
+
+/// Pick the page to look at. The browser process serves this list whatever
+/// the renderer is doing.
+async fn pick_target(
+    port: u16,
+    target: Option<&str>,
+) -> Result<(String, String, String), Box<dyn std::error::Error>> {
+    let list: serde_json::Value = reqwest::get(format!("http://127.0.0.1:{port}/json/list"))
+        .await?
+        .json()
+        .await?;
+    let pages = list.as_array().ok_or("/json/list did not return an array")?;
+    let pick = pages
+        .iter()
+        .filter(|t| t.get("type").and_then(|v| v.as_str()) == Some("page"))
+        .find(|t| match target {
+            Some(prefix) => t
+                .get("url")
+                .and_then(|v| v.as_str())
+                .is_some_and(|u| u.starts_with(prefix)),
+            None => t.get("url").and_then(|v| v.as_str()) != Some("about:blank"),
+        })
+        .ok_or("no matching page target")?;
+    Ok((
+        pick.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        pick.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        pick.get("id").and_then(|v| v.as_str()).ok_or("target has no id")?.to_string(),
+    ))
+}
+
+async fn browser_ws_url(port: u16) -> Result<String, Box<dyn std::error::Error>> {
+    let v: serde_json::Value = reqwest::get(format!("http://127.0.0.1:{port}/json/version"))
+        .await?
+        .json()
+        .await?;
+    Ok(v.get("webSocketDebuggerUrl")
+        .and_then(|u| u.as_str())
+        .ok_or("browser endpoint exposes no webSocketDebuggerUrl")?
+        .to_string())
+}
+
+/// Attach a FLAT session to the target and return its id.
+async fn attach_flat(ws: &mut Ws, next_id: &mut u64, target_id: &str) -> Option<String> {
+    let r = call(
+        ws,
+        next_id,
+        &None,
+        "Target.attachToTarget",
+        serde_json::json!({ "targetId": target_id, "flatten": true }),
+    )
+    .await?;
+    r.get("sessionId").and_then(|v| v.as_str()).map(str::to_string)
+}
+
+/// One CDP round-trip: send, then read until the reply with our id arrives,
+/// dropping the events that stream past in the meantime.
+async fn call(
+    ws: &mut Ws,
+    next_id: &mut u64,
+    session: &Option<String>,
+    method: &str,
+    params: serde_json::Value,
+) -> Option<serde_json::Value> {
+    call_within(ws, next_id, session, method, params, CDP_TIMEOUT).await
+}
+
+async fn call_within(
+    ws: &mut Ws,
+    next_id: &mut u64,
+    session: &Option<String>,
+    method: &str,
+    params: serde_json::Value,
+    limit: Duration,
+) -> Option<serde_json::Value> {
+    use futures::{SinkExt, StreamExt};
+    let id = *next_id;
+    *next_id += 1;
+    let mut envelope = serde_json::json!({ "id": id, "method": method, "params": params });
+    if let Some(sid) = session {
+        envelope["sessionId"] = serde_json::Value::String(sid.clone());
+    }
+    let msg = envelope.to_string();
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
+        .await
+        .ok()?;
+
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let next = tokio::time::timeout(remaining, ws.next()).await.ok()??.ok()?;
+        let text = match next {
+            tokio_tungstenite::tungstenite::Message::Text(t) => t,
+            _ => continue,
+        };
+        let v: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v.get("id").and_then(|x| x.as_u64()) == Some(id) {
+            return v.get("result").cloned().or(Some(serde_json::Value::Null));
+        }
+    }
+}
+
+/// One bounded round-trip through the renderer's JS thread.
+async fn probe_alive(ws: &mut Ws, next_id: &mut u64, session: &Option<String>) -> bool {
+    call_within(
+        ws,
+        next_id,
+        session,
+        "Runtime.evaluate",
+        serde_json::json!({ "expression": "1", "returnByValue": true }),
+        PROBE_TIMEOUT,
+    )
+    .await
+    .is_some()
+}
+
+/// Sample the isolate and fold the flat profile into self-time per function.
+///
+/// `Profiler.*` is served off the main thread, so it answers while JS is
+/// spinning — including inside wasm, where the frames come back with the Rust
+/// symbol names a dev build carries in its name section.
+async fn cpu_profile(
+    ws: &mut Ws,
+    next_id: &mut u64,
+    session: &Option<String>,
+    seconds: u64,
+) -> Result<Vec<(String, String, i64, u64, f64)>, String> {
+    call(ws, next_id, session, "Profiler.enable", serde_json::json!({}))
+        .await
+        .ok_or("Profiler.enable did not answer")?;
+    call(
+        ws,
+        next_id,
+        session,
+        "Profiler.setSamplingInterval",
+        serde_json::json!({ "interval": 200 }),
+    )
+    .await;
+    call(ws, next_id, session, "Profiler.start", serde_json::json!({}))
+        .await
+        .ok_or("Profiler.start did not answer")?;
+
+    tokio::time::sleep(Duration::from_secs(seconds.max(1))).await;
+
+    let stopped = call(ws, next_id, session, "Profiler.stop", serde_json::json!({}))
+        .await
+        .ok_or("Profiler.stop did not answer")?;
+    let nodes = stopped
+        .get("profile")
+        .and_then(|p| p.get("nodes"))
+        .and_then(|n| n.as_array())
+        .ok_or("profile carried no nodes")?;
+
+    let total: u64 = nodes
+        .iter()
+        .map(|n| n.get("hitCount").and_then(|h| h.as_u64()).unwrap_or(0))
+        .sum();
+    let mut rows: Vec<(String, String, i64, u64, f64)> = nodes
+        .iter()
+        .filter_map(|n| {
+            let hits = n.get("hitCount").and_then(|h| h.as_u64()).unwrap_or(0);
+            if hits == 0 {
+                return None;
+            }
+            let f = n.get("callFrame")?;
+            let name = f
+                .get("functionName")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("(anonymous)")
+                .to_string();
+            let url = f.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let line = f.get("lineNumber").and_then(|v| v.as_i64()).unwrap_or(-1) + 1;
+            let pct = if total > 0 {
+                hits as f64 * 100.0 / total as f64
+            } else {
+                0.0
+            };
+            Some((name, url, line, hits, pct))
+        })
+        .collect();
+    rows.sort_by(|a, b| b.3.cmp(&a.3));
+    Ok(rows)
+}
+
+/// Interrupt a spinning isolate and read the stack it was in.
+///
+/// `Debugger.pause` is the one command that reaches a blocked main thread —
+/// V8 takes it as an interrupt rather than as a queued message, which is why
+/// the DevTools stop button works on a runaway loop while everything else in
+/// the panel is frozen. `Debugger.enable` is sent first WITHOUT waiting for
+/// its reply: that reply is queued behind the loop and will never come, but
+/// the domain is armed by the time the interrupt fires.
+async fn pause_stack(
+    ws: &mut Ws,
+    next_id: &mut u64,
+    session: &Option<String>,
+) -> Option<Vec<(String, String, i64, i64)>> {
+    use futures::SinkExt;
+    for method in ["Debugger.enable", "Debugger.pause"] {
+        let id = *next_id;
+        *next_id += 1;
+        let mut envelope = serde_json::json!({ "id": id, "method": method, "params": {} });
+        if let Some(sid) = session {
+            envelope["sessionId"] = serde_json::Value::String(sid.clone());
+        }
+        let msg = envelope.to_string();
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(msg.into()))
+            .await
+            .ok()?;
+    }
+    let paused = wait_for_event(ws, "Debugger.paused", Duration::from_secs(5)).await?;
+    let frames = paused.get("params")?.get("callFrames")?.as_array()?;
+    Some(
+        frames
+            .iter()
+            .filter_map(|f| {
+                let name = f
+                    .get("functionName")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("(anonymous)")
+                    .to_string();
+                let loc = f.get("location")?;
+                let url = f
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let line = loc.get("lineNumber").and_then(|v| v.as_i64()).unwrap_or(-1) + 1;
+                let col = loc.get("columnNumber").and_then(|v| v.as_i64()).unwrap_or(0);
+                Some((name, url, line, col))
+            })
+            .collect(),
+    )
+}
+
+/// Read messages until the named event shows up, or the window closes.
+async fn wait_for_event(
+    ws: &mut Ws,
+    method: &str,
+    limit: Duration,
+) -> Option<serde_json::Value> {
+    use futures::StreamExt;
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let next = tokio::time::timeout(remaining, ws.next()).await.ok()??.ok()?;
+        let text = match next {
+            tokio_tungstenite::tungstenite::Message::Text(t) => t,
+            _ => continue,
+        };
+        let v: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v.get("method").and_then(|m| m.as_str()) == Some(method) {
+            return Some(v);
         }
     }
 }
