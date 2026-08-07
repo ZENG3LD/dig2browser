@@ -300,6 +300,28 @@ pub trait PageBackend: Send + Sync {
     fn subscribe_events<'a>(
         &'a self,
     ) -> BoxFuture<'a, Result<tokio::sync::broadcast::Receiver<DevToolsEvent>, BrowserError>>;
+
+    // ── Request mocking ─────────────────────────────────────────────────────
+
+    /// Enable page-level request mocking: requests whose URL contains a mock's
+    /// `url_contains` are answered locally without hitting the network.
+    ///
+    /// WARNING: do not arm together with a `NavigationPolicy`
+    /// ([`PageBackend::install_page_request_policy`]) — both mechanisms call
+    /// `Fetch.enable` on the same session and the later call overwrites the
+    /// earlier call's patterns. Default: unsupported; only the CDP backend
+    /// implements it.
+    fn enable_request_mocks<'a>(
+        &'a self,
+        mocks: Vec<RequestMock>,
+    ) -> BoxFuture<'a, Result<(), BrowserError>> {
+        let _ = mocks;
+        Box::pin(async {
+            Err(BrowserError::Other(
+                "request mocking is not supported by this backend".to_owned(),
+            ))
+        })
+    }
 }
 
 // ── Shared types ────────────────────────────────────────────────────────────
@@ -330,6 +352,34 @@ pub struct BoundingBox {
     pub y: f64,
     pub width: f64,
     pub height: f64,
+}
+
+/// A local mock answer for intercepted requests (page-level request mocking).
+///
+/// A request whose URL contains `url_contains` and whose method is in
+/// `methods` (empty = any method) is fulfilled with `status` / `content_type`
+/// / `body` without touching the network. A request that matches the URL but
+/// not the method list gets the fallback response when set — the "writes get
+/// a local 200" harness pattern. Everything else continues unmodified.
+///
+/// WARNING: mutually exclusive with `NavigationPolicy` page enforcement on
+/// the same session (both arm `Fetch.enable`; the later call wins).
+#[derive(Debug, Clone)]
+pub struct RequestMock {
+    /// Substring the request URL must contain.
+    pub url_contains: String,
+    /// HTTP methods to mock (e.g. `["GET"]`); empty matches any method.
+    pub methods: Vec<String>,
+    /// Response status code for matched methods.
+    pub status: u32,
+    /// `Content-Type` header of the mocked response.
+    pub content_type: String,
+    /// Response body for matched methods.
+    pub body: Vec<u8>,
+    /// Fallback status for URL-matched requests with a non-listed method.
+    pub fallback_status: Option<u32>,
+    /// Fallback body for URL-matched requests with a non-listed method.
+    pub fallback_body: Option<Vec<u8>>,
 }
 
 /// Options for PDF printing via [`PageBackend::print_pdf`].

@@ -40,7 +40,7 @@ use crate::stealth::{StealthConfig, get_scripts};
 
 use crate::browser::devtools::DevToolsEvent;
 use crate::browser::error::BrowserError;
-use super::{BrowserBackend, BoundingBox, ElementHandle, ElementInner, PageBackend, PrintOptions};
+use super::{BrowserBackend, BoundingBox, ElementHandle, ElementInner, PageBackend, PrintOptions, RequestMock};
 
 // ── Process handle ─────────────────────────────────────────────────────────
 
@@ -1634,6 +1634,9 @@ pub(crate) struct CdpPageBackend {
     /// Registry + directory + handler task backing `wait_for_download`.
     /// Handler aborted and directory removed (best-effort) on drop.
     download: DownloadCapture,
+    /// Background handlers answering `Fetch.requestPaused` for armed request
+    /// mocks (`enable_request_mocks`). Aborted on drop.
+    mock_tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl CdpPageBackend {
@@ -1656,6 +1659,7 @@ impl CdpPageBackend {
             owned_process_tree,
             dialog_task,
             download,
+            mock_tasks: Mutex::new(Vec::new()),
         }
     }
 
@@ -2726,6 +2730,37 @@ impl PageBackend for CdpPageBackend {
         self.request_policy_healthy.load(Ordering::Acquire)
     }
 
+    // ── Request mocking ─────────────────────────────────────────────────────
+
+    fn enable_request_mocks<'a>(
+        &'a self,
+        mocks: Vec<RequestMock>,
+    ) -> BoxFuture<'a, Result<(), BrowserError>> {
+        Box::pin(async move {
+            if mocks.is_empty() {
+                return Ok(());
+            }
+            // One interception pattern per mock, request stage only. This
+            // overwrites any previously armed Fetch patterns on the session —
+            // request mocks and a NavigationPolicy must not be armed together.
+            let patterns = mocks
+                .iter()
+                .map(|m| crate::cdp::domains::fetch::RequestPattern {
+                    url_pattern: Some(format!("*{}*", m.url_contains)),
+                    resource_type: None,
+                    request_stage: Some("Request".to_owned()),
+                })
+                .collect();
+            self.session
+                .enable_fetch(patterns)
+                .await
+                .map_err(|e| BrowserError::Other(e.to_string()))?;
+            let task = spawn_request_mock_handler(&self.session, mocks);
+            self.mock_tasks.lock().await.push(task);
+            Ok(())
+        })
+    }
+
     // ── Raw CDP escape hatch ──────────────────────────────────────────────
 
     fn cdp_call<'a>(
@@ -2950,6 +2985,10 @@ impl Drop for CdpPageBackend {
         let _target_id = &self.target_id;
         // Stop the dialog auto-handler; its session is going away.
         self.dialog_task.abort();
+        // Stop the request-mock handlers armed by `enable_request_mocks`.
+        for task in self.mock_tasks.get_mut().iter() {
+            task.abort();
+        }
         // Stop the download-event handler and best-effort remove the
         // per-page download directory it was writing into.
         self.download.task.abort();
@@ -2994,6 +3033,76 @@ fn spawn_dialog_auto_handler(session: &CdpSession) -> JoinHandle<()> {
                             Some(serde_json::json!({ "accept": accept })),
                         )
                         .await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            }
+        }
+    })
+}
+
+/// Spawn a per-session handler that answers this session's
+/// `Fetch.requestPaused` events from the locally configured `mocks`. A
+/// request matching a mock's `url_contains` whose method is in `methods`
+/// (empty = any) is fulfilled with the mock's status/content-type/body; a
+/// URL match with a non-listed method gets the fallback response when set
+/// (the "writes blocked with a local 200" harness pattern); everything else
+/// continues unmodified. Scoped to this session by `session_id` so it never
+/// answers another page's paused request — the same scoping
+/// `spawn_dialog_auto_handler` uses. Backs `PageBackend::enable_request_mocks`.
+fn spawn_request_mock_handler(session: &CdpSession, mocks: Vec<RequestMock>) -> JoinHandle<()> {
+    let responder = session.clone();
+    let my_session_id = session.session_id().map(str::to_owned);
+    let mut events = session.client().subscribe();
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(event) => {
+                    if event.method != "Fetch.requestPaused"
+                        || event.session_id.as_deref() != my_session_id.as_deref()
+                    {
+                        continue;
+                    }
+                    let Some(params) = event.params else {
+                        continue;
+                    };
+                    let Ok(paused) =
+                        serde_json::from_value::<crate::cdp::events::FetchRequestPaused>(params)
+                    else {
+                        continue;
+                    };
+                    let url = paused.request.url.as_str();
+                    let method = paused.request.method.as_str();
+                    let Some(mock) = mocks.iter().find(|m| url.contains(m.url_contains.as_str()))
+                    else {
+                        // Fetch.enable was armed with only our url patterns, so
+                        // reaching here is defensive: pass it through untouched.
+                        let _ = responder.continue_request(&paused.request_id).await;
+                        continue;
+                    };
+                    let method_matches = mock.methods.is_empty()
+                        || mock.methods.iter().any(|mm| mm.eq_ignore_ascii_case(method));
+                    if method_matches {
+                        let _ = responder
+                            .fulfill_request(
+                                &paused.request_id,
+                                mock.status,
+                                vec![("content-type".to_owned(), mock.content_type.clone())],
+                                Some(&mock.body),
+                            )
+                            .await;
+                    } else if let Some(fallback_body) = &mock.fallback_body {
+                        let _ = responder
+                            .fulfill_request(
+                                &paused.request_id,
+                                mock.fallback_status.unwrap_or(200),
+                                vec![("content-type".to_owned(), mock.content_type.clone())],
+                                Some(fallback_body),
+                            )
+                            .await;
+                    } else {
+                        let _ = responder.continue_request(&paused.request_id).await;
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,

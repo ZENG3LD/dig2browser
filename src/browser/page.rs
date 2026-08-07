@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::cookies::CookieJar;
 use crate::agentic::NavigationPolicy;
 
-use crate::browser::backend::{BoundingBox, ElementHandle, PageBackend, PrintOptions};
+use crate::browser::backend::{BoundingBox, ElementHandle, PageBackend, PrintOptions, RequestMock};
 use crate::browser::devtools::{DevToolsEvent, PageDevTools};
 use crate::browser::error::BrowserError;
 use crate::browser::wait::WaitBuilder;
@@ -173,6 +173,17 @@ impl StealthPage {
         self.backend
             .add_script_to_evaluate_on_new_document(source)
             .await
+    }
+
+    /// Enable page-level request mocking: requests whose URL contains a
+    /// mock's `url_contains` are fulfilled locally (see [`RequestMock`]).
+    ///
+    /// WARNING: do not combine with a `NavigationPolicy`
+    /// (`install_page_request_policy`) — both arm `Fetch.enable` on the page
+    /// session and the later call overwrites the earlier patterns. Supported
+    /// by the CDP backend only.
+    pub async fn enable_request_mocks(&self, mocks: Vec<RequestMock>) -> Result<(), BrowserError> {
+        self.backend.enable_request_mocks(mocks).await
     }
 
     /// Find the first element matching the CSS `selector`.

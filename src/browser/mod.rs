@@ -14,7 +14,7 @@ mod pool;
 mod wait;
 
 pub use browser::{StealthBrowser, discover_ws_url};
-pub use backend::{BoundingBox, ElementHandle, PrintOptions};
+pub use backend::{BoundingBox, ElementHandle, PrintOptions, RequestMock};
 pub use devtools::{ConsoleEvent, DevToolsEvent, NetworkEvent, PageDevTools};
 pub use error::BrowserError;
 pub use page::{Element, StealthPage};
