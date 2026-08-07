@@ -65,7 +65,7 @@ thiserror = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 web-bot-auth = "0.6.1"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 sha2 = "0.10"
