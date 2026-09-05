@@ -153,6 +153,54 @@ class CDP:
             "button": "left", "clickCount": 1,
         })
 
+    # ── keyboard ──────────────────────────────────────────────────────────
+    # The wasm shell (uzor-window-web) listens to window `keydown`/`keyup`:
+    # `ev.code()` drives the positional KeyCode (Enter/Escape/Backspace/…)
+    # and a single-scalar `ev.key()` on keydown becomes TextInput, so a
+    # printable char needs both `key` and `code`; named keys need their
+    # `code` plus the Windows VK so Chrome synthesises a real key event.
+    _NAMED_VK = {
+        "Enter": 13, "Escape": 27, "Backspace": 8, "Tab": 9, "Delete": 46,
+        "Space": 32, "ArrowLeft": 37, "ArrowUp": 38, "ArrowRight": 39,
+        "ArrowDown": 40, "Home": 36, "End": 35, "PageUp": 33, "PageDown": 34,
+    }
+
+    def key(self, name):
+        vk = self._NAMED_VK.get(name)
+        if vk is None:
+            raise SystemExit(f"key: unknown named key {name!r}; "
+                             f"one of {sorted(self._NAMED_VK)}")
+        key = " " if name == "Space" else name
+        base = {"key": key, "code": name, "windowsVirtualKeyCode": vk,
+                "nativeVirtualKeyCode": vk}
+        p = dict(base, type="rawKeyDown")
+        if name == "Space":
+            p.update(type="keyDown", text=" ", unmodifiedText=" ")
+        self.send("Input.dispatchKeyEvent", p)
+        time.sleep(0.02)
+        self.send("Input.dispatchKeyEvent", dict(base, type="keyUp"))
+
+    @staticmethod
+    def _code_for(ch):
+        if ch.isascii() and ch.isalpha():
+            return "Key" + ch.upper()
+        if ch.isdigit():
+            return "Digit" + ch
+        return "Space" if ch == " " else "Unidentified"
+
+    def type_text(self, text):
+        for ch in text:
+            if ch == "\n":
+                self.key("Enter")
+                continue
+            code = self._code_for(ch)
+            base = {"key": ch, "code": code}
+            self.send("Input.dispatchKeyEvent",
+                      dict(base, type="keyDown", text=ch, unmodifiedText=ch))
+            time.sleep(0.015)
+            self.send("Input.dispatchKeyEvent", dict(base, type="keyUp"))
+            time.sleep(0.015)
+
     def shot(self, name, out_dir):
         os.makedirs(out_dir, exist_ok=True)
         r = self.send("Page.captureScreenshot", {
@@ -415,6 +463,13 @@ def main():
         elif ns.cmd == "wheel":
             c.mouse("mouseWheel", int(a[0]), int(a[1]), dy=int(a[2]))
             print("wheel", a[2])
+        elif ns.cmd == "type":
+            text = " ".join(a)
+            c.type_text(text)
+            print("type", len(text), "chars")
+        elif ns.cmd == "key":
+            c.key(a[0])
+            print("key", a[0])
         elif ns.cmd == "reload":
             c.send("Page.enable")
             c.send("Page.reload", {"ignoreCache": True})
