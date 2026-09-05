@@ -2,8 +2,8 @@
 """CDP control panel for an already-open Chrome/Edge.
 
 Never launches a browser. Connects to the owner's headed instance
-(default :9222) and drives one tab: list, click, drag, wheel, shot, eval,
-perf, hud.
+(default :9222) and drives one tab: list, click, drag, wheel, type, key,
+shot, eval, perf, hud.
 
 Origin: Kimi's nemo/.tmp/cdp_tabs.py (2026-08) — trusted mouse is
 move → press → release with clickCount. All mouse/keyboard input is
