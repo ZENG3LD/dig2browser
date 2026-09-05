@@ -3,6 +3,7 @@
 Browser-automation substrate for Rust. Two layers:
 
 - **library** (`dig2browser` root crate) — direct in-process browser control: custom CDP / WebDriver / BiDi clients, cookie access, persona/fingerprint configuration, a live DevTools event stream, `dev-fetch`/`dev-attach` CLIs, Web Bot Auth (RFC 9421). No external browser-automation dependency.
+- **cdp-control** (`tools/cdp-control/cdp_control.py`) — attach-only Python CDP panel for the owner's already-open headed Chrome (`:9222`). Never launches a browser. Clicks/shots/eval against an existing tab (`--tab dev|prod`, `--prefix`, `--id`).
 - **station** (`crates/dig2browser-station`, binary `dig2browser-stationd`) — a local daemon that is the single owner of browser processes, durable profiles, identity leases, capture traces, and (on Windows) OS-level egress containment. Consumers connect over a named pipe; they do not launch browsers themselves.
 
 ## Contract

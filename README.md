@@ -330,6 +330,18 @@ Firefox-equivalent of CDP capabilities:
 
 ## CLI Tools
 
+### `cdp-control` — attach-only CDP panel (Python)
+
+Drive the owner's already-open headed Chrome/Edge. Never launches a browser.
+
+```bash
+python tools/cdp-control/cdp_control.py tabs
+python tools/cdp-control/cdp_control.py --tab dev shot NAME
+python tools/cdp-control/cdp_control.py --tab prod click 100 200
+```
+
+See `tools/cdp-control/README.md`.
+
 dig2browser ships three standalone binaries:
 
 ### `keygen` — Generate Ed25519 keypair for Web Bot Auth
