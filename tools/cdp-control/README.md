@@ -18,15 +18,21 @@ python tools/cdp-control/cdp_control.py --id F4009E81 shot NAME
 python tools/cdp-control/cdp_control.py --tab prod perf 60 --interval 1 --json out.jsonl
 python tools/cdp-control/cdp_control.py --tab dev hud on
 python tools/cdp-control/cdp_control.py --tab dev hud off
+python tools/cdp-control/cdp_control.py --activate --tab dev shot NAME
 ```
 
 `--tab dev` / `--tab prod` are MLC aliases (`:17499` / `mylittlechart.org`).
 Screenshots default to `nemo/.tmp/<NAME>.png` (`--out` to change).
 
-Requires `websocket-client`. Activates the target tab before input/shot
-(`Target.activateTarget`) — a background tab Internal-errors on
-`Page.captureScreenshot`. Never pass `--viewport` against the owner's
-window (pins `innerWidth`).
+Requires `websocket-client`. All mouse/keyboard input is CDP-synthetic
+(`Input.dispatch*Event`) — the tool never touches the system mouse or
+keyboard. It also never raises or focuses the owner's window
+(`Target.activateTarget`) unless `--activate` is passed — by default the
+tab it addresses is driven wherever it already is, in the background if
+that's where it is. Pass `--activate` when the command needs the tab
+actually on top (e.g. `shot`/`Page.captureScreenshot` Internal-errors on a
+backgrounded page). Never pass `--viewport` against the owner's window
+(pins `innerWidth`).
 
 ## perf / hud — dev metrics from `window.__MLC_PERF()`
 
@@ -45,7 +51,11 @@ lives **here**, never in the chart bundle.
   (samples, p95 min/median/max, distinct long frames, top dominant phases)
   always prints at the end. If `__MLC_PERF` is not defined, the tool prints
   `__MLC_PERF() not present in this page (bundle without the perf export?)`
-  and exits `2`.
+  and exits `2`. If a poll returns `busy` or the `frames` counter stalls
+  between two successful polls (both can mean the tab is backgrounded and
+  throttled), the tool prints a one-line hint (`hint: tab may be throttled
+  in the background; rerun with --activate if the owner is not using
+  Chrome`) once per run.
 - `hud on|off` — inject/remove a small on-page overlay
   (`<div id="d2b-perf-hud">`, fixed top-left, monospace, dark translucent,
   `pointer-events:none`) that polls `__MLC_PERF()` every 500 ms via a

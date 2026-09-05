@@ -6,7 +6,10 @@ Never launches a browser. Connects to the owner's headed instance
 perf, hud.
 
 Origin: Kimi's nemo/.tmp/cdp_tabs.py (2026-08) — trusted mouse is
-move → press → release with clickCount.
+move → press → release with clickCount. All mouse/keyboard input is
+CDP-synthetic (Input.dispatch*Event) — the tool never touches the system
+mouse or keyboard. It also never raises/focuses the owner's window unless
+`--activate` is passed (see Target.activateTarget below).
 
 Usage:
   python cdp_control.py tabs
@@ -16,6 +19,7 @@ Usage:
   python cdp_control.py --id F4009E81 shot NAME
   python cdp_control.py --tab prod perf 60 --interval 1 --json out.jsonl
   python cdp_control.py --tab dev hud on
+  python cdp_control.py --activate --tab dev click 100 200
 """
 from __future__ import annotations
 
@@ -72,8 +76,10 @@ def pick_tab(port: int, *, prefix: str | None, tab_id: str | None):
 
 
 def activate_tab(port: int, target_id: str):
-    """Bring the tab to the front — captureScreenshot Internal-errors if the
-    page is in the background."""
+    """Bring the tab to the front (raises/focuses the owner's window).
+    Opt-in only — called from main() when --activate is passed. Needed for
+    captureScreenshot, which Internal-errors on a backgrounded page; most
+    other verbs work fine against a tab that is merely open, not focused."""
     ver = json.load(urllib.request.urlopen(
         f"http://127.0.0.1:{port}/json/version", timeout=5))
     bws = websocket.create_connection(
@@ -161,6 +167,10 @@ class CDP:
 
 
 PERF_MISSING_MSG = "__MLC_PERF() not present in this page (bundle without the perf export?)"
+PERF_THROTTLE_HINT = (
+    "hint: tab may be throttled in the background; "
+    "rerun with --activate if the owner is not using Chrome"
+)
 
 # Fixed order of the 10 per-phase timings inside a long_frames entry's
 # "phases" object — mirrors the field order of window.__MLC_PERF()'s "last".
@@ -298,6 +308,8 @@ def cmd_perf(c, seconds, interval, json_path):
     p95_samples: list = []
     n_samples = 0
     n_busy = 0
+    last_frames = None
+    hint_shown = False
     jf = open(json_path, "a", encoding="utf-8") if json_path else None
     try:
         while time.time() < end:
@@ -311,6 +323,9 @@ def cmd_perf(c, seconds, interval, json_path):
             elif data.get("busy"):
                 n_busy += 1
                 print(f"t={poll_t0 - start:.1f}s busy")
+                if not hint_shown:
+                    print(PERF_THROTTLE_HINT)
+                    hint_shown = True
             else:
                 n_samples += 1
                 print(perf_line(poll_t0 - start, data))
@@ -324,6 +339,12 @@ def cmd_perf(c, seconds, interval, json_path):
                         seen_long.add(key)
                         long_frames.append(lf)
                         print(long_frame_line(lf))
+                frames = data.get("frames")
+                if (not hint_shown and last_frames is not None
+                        and frames is not None and frames == last_frames):
+                    print(PERF_THROTTLE_HINT)
+                    hint_shown = True
+                last_frames = frames
             elapsed = time.time() - poll_t0
             time.sleep(max(0.0, interval - elapsed))
     except KeyboardInterrupt:
@@ -350,6 +371,13 @@ def main():
     ap.add_argument("--id", dest="tab_id", help="tab id prefix from `tabs`")
     ap.add_argument("--out", default=os.path.normpath(DEFAULT_SHOT_DIR),
                     help="screenshot directory")
+    ap.add_argument("--interval", type=float, default=1.0,
+                    help="perf: seconds between polls")
+    ap.add_argument("--json", dest="json_path", default=None,
+                    help="perf: append each poll as a JSON line to PATH")
+    ap.add_argument("--activate", action="store_true",
+                    help="bring the tab to front first (Target.activateTarget) "
+                         "— raises the owner's window; opt-in only, off by default")
     ap.add_argument("cmd")
     ap.add_argument("args", nargs="*")
     ns = ap.parse_args()
@@ -361,8 +389,9 @@ def main():
     prefix = ns.prefix or TAB_ALIASES.get(ns.tab or "")
     tab = pick_tab(ns.port, prefix=prefix, tab_id=ns.tab_id)
     print(f"tab: {tab['url']}", file=sys.stderr)
-    activate_tab(ns.port, tab["id"])
-    time.sleep(0.25)
+    if ns.activate:
+        activate_tab(ns.port, tab["id"])
+        time.sleep(0.25)
     ws = websocket.create_connection(
         tab["webSocketDebuggerUrl"], timeout=30, suppress_origin=True,
     )
@@ -398,21 +427,8 @@ def main():
             })
             print(json.dumps(r.get("result", {}).get("value"), ensure_ascii=False))
         elif ns.cmd == "perf":
-            rest = list(a)
-            seconds = 60.0
-            if rest and not rest[0].startswith("--"):
-                seconds = float(rest.pop(0))
-            interval = 1.0
-            json_path = None
-            while rest:
-                flag = rest.pop(0)
-                if flag == "--interval":
-                    interval = float(rest.pop(0))
-                elif flag == "--json":
-                    json_path = rest.pop(0)
-                else:
-                    raise SystemExit(f"perf: unknown arg {flag!r}")
-            cmd_perf(c, seconds, interval, json_path)
+            seconds = float(a[0]) if a else 60.0
+            cmd_perf(c, seconds, ns.interval, ns.json_path)
         elif ns.cmd == "hud":
             if not a:
                 raise SystemExit("hud: expected on|off")
