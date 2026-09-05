@@ -468,8 +468,10 @@ def main():
             c.type_text(text)
             print("type", len(text), "chars")
         elif ns.cmd == "key":
-            c.key(a[0])
-            print("key", a[0])
+            repeat = int(a[1]) if len(a) > 1 else 1
+            for _ in range(repeat):
+                c.key(a[0])
+            print("key", a[0], "x", repeat)
         elif ns.cmd == "reload":
             c.send("Page.enable")
             c.send("Page.reload", {"ignoreCache": True})
