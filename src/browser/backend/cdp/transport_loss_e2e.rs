@@ -168,6 +168,7 @@ fn serve_request(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cdp_transport_loss_terminates_owned_chromium_before_scheduled_egress_e2e() {
+    let _real_browser_guard = crate::test_support::REAL_BROWSER_E2E.lock().await;
     let blocked = ControlledOrigin::blocked();
     let allowed = ControlledOrigin::allowed(blocked.origin());
     let root = e2e_temp_base().join(format!(
@@ -178,8 +179,10 @@ async fn cdp_transport_loss_terminates_owned_chromium_before_scheduled_egress_e2
     let profile = root.join("profile");
     std::fs::create_dir_all(&root).expect("create transport-loss E2E root");
 
-    let mut launch = LaunchConfig::default();
-    launch.profile = BrowserProfile::Persistent(profile.clone());
+    let launch = LaunchConfig {
+        profile: BrowserProfile::Persistent(profile.clone()),
+        ..Default::default()
+    };
     let browser = CdpBrowserBackend::launch(&launch, &StealthConfig::default())
         .await
         .expect("launch owned Chromium");
@@ -288,7 +291,11 @@ fn e2e_temp_base() -> PathBuf {
 }
 
 async fn remove_tree(path: &Path) {
-    for _ in 0..30 {
+    // Windows can hold the just-closed Chromium's profile files locked for a
+    // moment after process exit (antivirus scan, deferred handle release).
+    // 15s matches the other owned-process teardown waits in this suite
+    // (e.g. `ProcessTreeHandle::wait_until_empty`).
+    for _ in 0..150 {
         match std::fs::remove_dir_all(path) {
             Ok(()) => return,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,

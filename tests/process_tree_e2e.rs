@@ -39,8 +39,10 @@ async fn process_tree_child() {
     }
     let ready = PathBuf::from(std::env::var_os(READY_PATH).expect("ready path"));
     let profiles = PathBuf::from(std::env::var_os(PROFILES_PATH).expect("profiles path"));
-    let mut config = BrowserWorkerConfig::default();
-    config.command_timeout = Duration::from_secs(60);
+    let config = BrowserWorkerConfig {
+        command_timeout: Duration::from_secs(60),
+        ..Default::default()
+    };
     let worker = BrowserWorker::spawn(identity(&profiles), CapabilitySet::all(), config)
         .expect("spawn child browser worker");
     let snapshot = worker.wait_until_settled().await.expect("start child Chromium");
@@ -93,8 +95,10 @@ async fn hard_kill_owner_reaps_chromium_tree_and_releases_profile_e2e() {
     owner.wait().await.expect("reap owner process");
     wait_for_processes_to_exit(&descendants, Duration::from_secs(15)).await;
 
-    let mut successor_config = BrowserWorkerConfig::default();
-    successor_config.command_timeout = Duration::from_secs(60);
+    let successor_config = BrowserWorkerConfig {
+        command_timeout: Duration::from_secs(60),
+        ..Default::default()
+    };
     let successor = BrowserWorker::spawn(
         identity(&profiles),
         CapabilitySet::all(),
@@ -185,8 +189,10 @@ fn process_snapshot() -> std::io::Result<HashMap<u32, (u32, String)>> {
     // SAFETY: the snapshot handle is owned locally and closed before returning.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
         .map_err(windows_error)?;
-    let mut entry = PROCESSENTRY32W::default();
-    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
     let mut processes = HashMap::new();
     // SAFETY: `entry` has the required size and remains valid for each call.
     let mut next = unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok();
@@ -207,7 +213,7 @@ fn process_snapshot() -> std::io::Result<HashMap<u32, (u32, String)>> {
 }
 
 fn windows_error(error: windows::core::Error) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, error.to_string())
+    std::io::Error::other(error.to_string())
 }
 
 async fn remove_tree(path: &Path) {

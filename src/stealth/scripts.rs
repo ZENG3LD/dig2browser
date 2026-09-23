@@ -824,8 +824,10 @@ mod tests {
 
     #[test]
     fn screen_script_uses_configured_viewport_and_scale_factor() {
-        let mut config = StealthConfig::default();
-        config.viewport = (393, 852);
+        let mut config = StealthConfig {
+            viewport: (393, 852),
+            ..Default::default()
+        };
         config.set_device_scale_factor(3.0).unwrap();
 
         let scripts = get_scripts(&config).join("\n");
@@ -841,10 +843,11 @@ mod tests {
     /// only at `Full`.
     #[test]
     fn webrtc_removal_is_gated_on_policy_at_standard_level() {
-        let mut config = StealthConfig::default();
-        config.level = StealthLevel::Standard;
-
-        config.webrtc_policy = WebrtcPolicy::Remove;
+        let mut config = StealthConfig {
+            level: StealthLevel::Standard,
+            webrtc_policy: WebrtcPolicy::Remove,
+            ..Default::default()
+        };
         let removed = get_scripts(&config).join("\n");
         assert!(removed.contains("window.RTCPeerConnection = undefined"));
 

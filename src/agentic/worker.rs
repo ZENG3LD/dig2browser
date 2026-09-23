@@ -1572,10 +1572,11 @@ mod tests {
         assert_eq!(snapshot.lifecycle, WorkerLifecycle::Ready);
         assert_eq!(snapshot.restart_count, 1);
         assert_eq!(snapshot.page_epoch, 2);
-        let state = state.lock().unwrap();
-        assert_eq!(state.navigations.len(), 1);
-        assert_eq!(state.restarts, 1);
-        drop(state);
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.navigations.len(), 1);
+            assert_eq!(state.restarts, 1);
+        }
         worker.shutdown().await.unwrap();
     }
 

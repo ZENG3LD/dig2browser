@@ -156,10 +156,11 @@ fn mobile_identity(root: &PathBuf) -> IdentityProfile {
 }
 
 fn worker_config(layout: MobileLayout) -> BrowserWorkerConfig {
-    let mut config = BrowserWorkerConfig::default();
-    config.command_timeout = Duration::from_secs(60);
-    config.mobile_layout = Some(layout);
-    config
+    BrowserWorkerConfig {
+        command_timeout: Duration::from_secs(60),
+        mobile_layout: Some(layout),
+        ..Default::default()
+    }
 }
 
 async fn resolve(worker: &BrowserWorker, selector: &str) -> ElementRef {

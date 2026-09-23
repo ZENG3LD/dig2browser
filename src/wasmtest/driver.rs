@@ -303,7 +303,7 @@ mod tests {
         assert!(has_headless, "expected --headless=new in chrome args");
         let has_profile = args
             .iter()
-            .any(|a| a.as_str().map_or(false, |s| s.starts_with("--user-data-dir=")));
+            .any(|a| a.as_str().is_some_and(|s| s.starts_with("--user-data-dir=")));
         assert!(has_profile, "expected --user-data-dir in chrome args");
     }
 
@@ -382,7 +382,7 @@ mod tests {
         assert!(has_headless, "expected --headless=new in edge args");
         let has_profile = args
             .iter()
-            .any(|a| a.as_str().map_or(false, |s| s.starts_with("--user-data-dir=")));
+            .any(|a| a.as_str().is_some_and(|s| s.starts_with("--user-data-dir=")));
         assert!(has_profile, "expected --user-data-dir in edge args");
     }
 

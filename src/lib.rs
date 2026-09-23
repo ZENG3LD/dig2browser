@@ -18,6 +18,8 @@ pub mod crawl;
 mod windows_runtime_mirror;
 mod browser_process;
 mod process_tree;
+#[cfg(all(test, windows))]
+pub(crate) mod test_support;
 
 // Re-export main types at crate root
 pub use browser::*;

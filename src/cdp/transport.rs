@@ -144,187 +144,6 @@ where
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use serde_json::json;
-    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
-    use tokio::time::timeout;
-
-    use super::CdpClient;
-    use crate::cdp::error::CdpError;
-
-    const TEST_TIMEOUT: Duration = Duration::from_secs(2);
-
-    fn pipe_pair_with_limit(
-        max_frame_size: usize,
-    ) -> (Arc<CdpClient>, DuplexStream, DuplexStream) {
-        let (client_reader, server_writer) = duplex(4096);
-        let (client_writer, server_reader) = duplex(4096);
-        let client = CdpClient::from_pipe_with_max_frame_size(
-            client_reader,
-            client_writer,
-            max_frame_size,
-        );
-        (client, server_reader, server_writer)
-    }
-
-    async fn pipe_pair() -> (Arc<CdpClient>, DuplexStream, DuplexStream) {
-        let (client_reader, server_writer) = duplex(4096);
-        let (client_writer, server_reader) = duplex(4096);
-        let client = CdpClient::connect_pipe(client_reader, client_writer)
-            .await
-            .expect("construct pipe transport");
-        (client, server_reader, server_writer)
-    }
-
-    async fn read_wire_frame(reader: &mut DuplexStream) -> Vec<u8> {
-        let mut frame = Vec::new();
-        loop {
-            let mut byte = [0_u8; 1];
-            timeout(TEST_TIMEOUT, reader.read_exact(&mut byte))
-                .await
-                .expect("timed out waiting for outbound pipe frame")
-                .expect("outbound pipe closed before frame delimiter");
-            frame.push(byte[0]);
-            if byte[0] == 0 {
-                return frame;
-            }
-        }
-    }
-
-    async fn assert_terminal(client: &CdpClient) {
-        let mut terminal = client.subscribe_terminal();
-        if !*terminal.borrow() {
-            timeout(TEST_TIMEOUT, terminal.changed())
-                .await
-                .expect("timed out waiting for terminal state")
-                .expect("terminal watch sender dropped");
-        }
-        assert!(*terminal.borrow());
-        assert!(client.is_terminal());
-    }
-
-    #[tokio::test]
-    async fn pipe_multiplexes_commands_responses_and_events_with_nul_framing() {
-        let (client, mut server_reader, mut server_writer) = pipe_pair().await;
-        let mut events = client.subscribe();
-        let command_client = Arc::clone(&client);
-        let command = tokio::spawn(async move {
-            command_client
-                .send(
-                    "Runtime.evaluate",
-                    Some(json!({"expression": "6 * 7"})),
-                    Some("session-1".to_owned()),
-                )
-                .await
-        });
-
-        let frame = read_wire_frame(&mut server_reader).await;
-        assert_eq!(frame.last(), Some(&0));
-        assert_eq!(frame[..frame.len() - 1].iter().position(|byte| *byte == 0), None);
-        let outbound: serde_json::Value =
-            serde_json::from_slice(&frame[..frame.len() - 1]).expect("valid outbound JSON");
-        assert_eq!(outbound["id"], 1);
-        assert_eq!(outbound["method"], "Runtime.evaluate");
-        assert_eq!(outbound["params"], json!({"expression": "6 * 7"}));
-        assert_eq!(outbound["sessionId"], "session-1");
-
-        server_writer
-            .write_all(
-                b"{\"method\":\"Runtime.consoleAPICalled\",\"params\":{\"type\":\"log\"},\"sessionId\":\"session-1\"}\0{\"id\":1,\"result\":{\"value\":42}}\0",
-            )
-            .await
-            .expect("write multiplexed inbound frames");
-
-        let event = timeout(TEST_TIMEOUT, events.recv())
-            .await
-            .expect("timed out waiting for event")
-            .expect("event channel closed");
-        assert_eq!(event.method, "Runtime.consoleAPICalled");
-        assert_eq!(event.params, Some(json!({"type": "log"})));
-        assert_eq!(event.session_id.as_deref(), Some("session-1"));
-
-        let result = timeout(TEST_TIMEOUT, command)
-            .await
-            .expect("timed out waiting for command response")
-            .expect("command task panicked")
-            .expect("command failed");
-        assert_eq!(result, json!({"value": 42}));
-    }
-
-    #[tokio::test]
-    async fn pipe_oversize_frame_is_terminal() {
-        let (client, _server_reader, mut server_writer) = pipe_pair_with_limit(32);
-        server_writer
-            .write_all(&[b'x'; 33])
-            .await
-            .expect("write oversize frame");
-
-        assert_terminal(&client).await;
-    }
-
-    #[tokio::test]
-    async fn pipe_malformed_frame_is_terminal() {
-        let (client, _server_reader, mut server_writer) = pipe_pair().await;
-        server_writer
-            .write_all(b"not-json\0")
-            .await
-            .expect("write malformed frame");
-
-        assert_terminal(&client).await;
-    }
-
-    #[tokio::test]
-    async fn pipe_eof_is_terminal_and_fails_pending_command() {
-        let (client, mut server_reader, server_writer) = pipe_pair().await;
-        let command_client = Arc::clone(&client);
-        let command = tokio::spawn(async move {
-            command_client.send("Browser.getVersion", None, None).await
-        });
-        let _frame = read_wire_frame(&mut server_reader).await;
-
-        drop(server_writer);
-
-        assert_terminal(&client).await;
-        let result = timeout(TEST_TIMEOUT, command)
-            .await
-            .expect("timed out waiting for pending command failure")
-            .expect("command task panicked");
-        assert!(matches!(result, Err(CdpError::ConnectionClosed)));
-    }
-
-    #[tokio::test]
-    async fn pipe_close_propagates_eof_terminal_and_pending_failure() {
-        let (client, mut server_reader, _server_writer) = pipe_pair().await;
-        let command_client = Arc::clone(&client);
-        let command = tokio::spawn(async move {
-            command_client.send("Browser.getVersion", None, None).await
-        });
-        let _frame = read_wire_frame(&mut server_reader).await;
-
-        client
-            .close_transport()
-            .await
-            .expect("enqueue pipe transport close");
-
-        let mut byte = [0_u8; 1];
-        let read = timeout(TEST_TIMEOUT, server_reader.read(&mut byte))
-            .await
-            .expect("timed out waiting for pipe writer EOF")
-            .expect("read pipe writer EOF");
-        assert_eq!(read, 0);
-        assert_terminal(&client).await;
-        let result = timeout(TEST_TIMEOUT, command)
-            .await
-            .expect("timed out waiting for pending command failure")
-            .expect("command task panicked");
-        assert!(matches!(result, Err(CdpError::ConnectionClosed)));
-    }
-}
-
 impl CdpClient {
     fn new_transport() -> (Arc<Self>, mpsc::Receiver<CdpTransportCommand>) {
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
@@ -634,5 +453,186 @@ impl CdpClient {
             _ = terminal.changed() => Err(CdpError::ConnectionClosed),
             response = response_rx => response.map_err(|_| CdpError::ConnectionClosed)?,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use serde_json::json;
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
+    use tokio::time::timeout;
+
+    use super::CdpClient;
+    use crate::cdp::error::CdpError;
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+    fn pipe_pair_with_limit(
+        max_frame_size: usize,
+    ) -> (Arc<CdpClient>, DuplexStream, DuplexStream) {
+        let (client_reader, server_writer) = duplex(4096);
+        let (client_writer, server_reader) = duplex(4096);
+        let client = CdpClient::from_pipe_with_max_frame_size(
+            client_reader,
+            client_writer,
+            max_frame_size,
+        );
+        (client, server_reader, server_writer)
+    }
+
+    async fn pipe_pair() -> (Arc<CdpClient>, DuplexStream, DuplexStream) {
+        let (client_reader, server_writer) = duplex(4096);
+        let (client_writer, server_reader) = duplex(4096);
+        let client = CdpClient::connect_pipe(client_reader, client_writer)
+            .await
+            .expect("construct pipe transport");
+        (client, server_reader, server_writer)
+    }
+
+    async fn read_wire_frame(reader: &mut DuplexStream) -> Vec<u8> {
+        let mut frame = Vec::new();
+        loop {
+            let mut byte = [0_u8; 1];
+            timeout(TEST_TIMEOUT, reader.read_exact(&mut byte))
+                .await
+                .expect("timed out waiting for outbound pipe frame")
+                .expect("outbound pipe closed before frame delimiter");
+            frame.push(byte[0]);
+            if byte[0] == 0 {
+                return frame;
+            }
+        }
+    }
+
+    async fn assert_terminal(client: &CdpClient) {
+        let mut terminal = client.subscribe_terminal();
+        if !*terminal.borrow() {
+            timeout(TEST_TIMEOUT, terminal.changed())
+                .await
+                .expect("timed out waiting for terminal state")
+                .expect("terminal watch sender dropped");
+        }
+        assert!(*terminal.borrow());
+        assert!(client.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn pipe_multiplexes_commands_responses_and_events_with_nul_framing() {
+        let (client, mut server_reader, mut server_writer) = pipe_pair().await;
+        let mut events = client.subscribe();
+        let command_client = Arc::clone(&client);
+        let command = tokio::spawn(async move {
+            command_client
+                .send(
+                    "Runtime.evaluate",
+                    Some(json!({"expression": "6 * 7"})),
+                    Some("session-1".to_owned()),
+                )
+                .await
+        });
+
+        let frame = read_wire_frame(&mut server_reader).await;
+        assert_eq!(frame.last(), Some(&0));
+        assert_eq!(frame[..frame.len() - 1].iter().position(|byte| *byte == 0), None);
+        let outbound: serde_json::Value =
+            serde_json::from_slice(&frame[..frame.len() - 1]).expect("valid outbound JSON");
+        assert_eq!(outbound["id"], 1);
+        assert_eq!(outbound["method"], "Runtime.evaluate");
+        assert_eq!(outbound["params"], json!({"expression": "6 * 7"}));
+        assert_eq!(outbound["sessionId"], "session-1");
+
+        server_writer
+            .write_all(
+                b"{\"method\":\"Runtime.consoleAPICalled\",\"params\":{\"type\":\"log\"},\"sessionId\":\"session-1\"}\0{\"id\":1,\"result\":{\"value\":42}}\0",
+            )
+            .await
+            .expect("write multiplexed inbound frames");
+
+        let event = timeout(TEST_TIMEOUT, events.recv())
+            .await
+            .expect("timed out waiting for event")
+            .expect("event channel closed");
+        assert_eq!(event.method, "Runtime.consoleAPICalled");
+        assert_eq!(event.params, Some(json!({"type": "log"})));
+        assert_eq!(event.session_id.as_deref(), Some("session-1"));
+
+        let result = timeout(TEST_TIMEOUT, command)
+            .await
+            .expect("timed out waiting for command response")
+            .expect("command task panicked")
+            .expect("command failed");
+        assert_eq!(result, json!({"value": 42}));
+    }
+
+    #[tokio::test]
+    async fn pipe_oversize_frame_is_terminal() {
+        let (client, _server_reader, mut server_writer) = pipe_pair_with_limit(32);
+        server_writer
+            .write_all(&[b'x'; 33])
+            .await
+            .expect("write oversize frame");
+
+        assert_terminal(&client).await;
+    }
+
+    #[tokio::test]
+    async fn pipe_malformed_frame_is_terminal() {
+        let (client, _server_reader, mut server_writer) = pipe_pair().await;
+        server_writer
+            .write_all(b"not-json\0")
+            .await
+            .expect("write malformed frame");
+
+        assert_terminal(&client).await;
+    }
+
+    #[tokio::test]
+    async fn pipe_eof_is_terminal_and_fails_pending_command() {
+        let (client, mut server_reader, server_writer) = pipe_pair().await;
+        let command_client = Arc::clone(&client);
+        let command = tokio::spawn(async move {
+            command_client.send("Browser.getVersion", None, None).await
+        });
+        let _frame = read_wire_frame(&mut server_reader).await;
+
+        drop(server_writer);
+
+        assert_terminal(&client).await;
+        let result = timeout(TEST_TIMEOUT, command)
+            .await
+            .expect("timed out waiting for pending command failure")
+            .expect("command task panicked");
+        assert!(matches!(result, Err(CdpError::ConnectionClosed)));
+    }
+
+    #[tokio::test]
+    async fn pipe_close_propagates_eof_terminal_and_pending_failure() {
+        let (client, mut server_reader, _server_writer) = pipe_pair().await;
+        let command_client = Arc::clone(&client);
+        let command = tokio::spawn(async move {
+            command_client.send("Browser.getVersion", None, None).await
+        });
+        let _frame = read_wire_frame(&mut server_reader).await;
+
+        client
+            .close_transport()
+            .await
+            .expect("enqueue pipe transport close");
+
+        let mut byte = [0_u8; 1];
+        let read = timeout(TEST_TIMEOUT, server_reader.read(&mut byte))
+            .await
+            .expect("timed out waiting for pipe writer EOF")
+            .expect("read pipe writer EOF");
+        assert_eq!(read, 0);
+        assert_terminal(&client).await;
+        let result = timeout(TEST_TIMEOUT, command)
+            .await
+            .expect("timed out waiting for pending command failure")
+            .expect("command task panicked");
+        assert!(matches!(result, Err(CdpError::ConnectionClosed)));
     }
 }

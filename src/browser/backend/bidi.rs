@@ -775,337 +775,6 @@ where
     reconcile_teardown_results(transport_result, webdriver_result)
 }
 
-#[cfg(test)]
-mod lifecycle_tests {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-    use std::time::Instant;
-
-    use super::*;
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn cancelled_acknowledged_launch_closes_unclaimed_backend_asynchronously() {
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        let cleanup_ran = Arc::new(AtomicBool::new(false));
-        let cleanup_observed = Arc::clone(&cleanup_ran);
-        let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
-        let delivery = tokio::spawn(async move {
-            deliver_acknowledged_launch(Ok(7_u8), result_tx, move |backend| async move {
-                assert_eq!(backend, 7);
-                cleanup_observed.store(true, AtomicOrdering::SeqCst);
-                let _ = cleanup_tx.send(());
-            })
-            .await;
-        });
-
-        let ready = result_rx.await.unwrap().unwrap();
-        ready.acknowledge.send(()).unwrap();
-        drop(ready.backend);
-
-        cleanup_rx.await.unwrap();
-        delivery.await.unwrap();
-        assert!(cleanup_ran.load(AtomicOrdering::SeqCst));
-    }
-
-    #[test]
-    fn geckodriver_listener_parser_accepts_only_complete_socket_addresses() {
-        assert_eq!(
-            parse_geckodriver_listener(b"1712345678\tgeckodriver\tINFO\tListening on 127.0.0.1:54321"),
-            Some("127.0.0.1:54321".parse().unwrap())
-        );
-        assert_eq!(
-            parse_geckodriver_listener(b"Listening on localhost:4444"),
-            None
-        );
-        assert_eq!(parse_geckodriver_listener(b"unrelated log line"), None);
-    }
-
-    #[tokio::test]
-    async fn geckodriver_readiness_reader_rejects_an_unbounded_line() {
-        use tokio::io::AsyncWriteExt;
-
-        let (reader, mut writer) = tokio::io::duplex(GECKODRIVER_LINE_LIMIT * 2);
-        let (signals, mut received) = tokio::sync::mpsc::unbounded_channel();
-        let task = tokio::spawn(read_geckodriver_log("test", reader, signals));
-        writer
-            .write_all(&vec![b'x'; GECKODRIVER_LINE_LIMIT + 1])
-            .await
-            .unwrap();
-        assert!(matches!(
-            received.recv().await,
-            Some(GeckodriverLogSignal::Limit("test"))
-        ));
-        drop(writer);
-        task.await.unwrap();
-    }
-
-    fn spawn_delete_server(
-        profile_dir: std::path::PathBuf,
-    ) -> (String, std::thread::JoinHandle<bool>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let server = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(7);
-            let mut stream = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if Instant::now() >= deadline {
-                            return false;
-                        }
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(_) => return false,
-                }
-            };
-            stream.set_nonblocking(false).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            let mut request = [0_u8; 2048];
-            let bytes_read = stream.read(&mut request).unwrap();
-            let request = String::from_utf8_lossy(&request[..bytes_read]);
-            let received_delete = request.starts_with("DELETE /session/test-session ");
-            let ownership_was_held = ProfileOwnershipGuard::acquire(&profile_dir).is_err();
-
-            let body = r#"{"value":null}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .unwrap();
-            stream.flush().unwrap();
-            received_delete && ownership_was_held
-        });
-        (endpoint, server)
-    }
-
-    #[tokio::test]
-    async fn post_session_failure_with_external_webdriver_retains_profile_ownership() {
-        let profile_dir = std::env::temp_dir().join(format!(
-            "dig2browser-bidi-post-session-failure-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let mut profile_guard = Some(ProfileOwnershipGuard::acquire(&profile_dir).unwrap());
-        let (webdriver_url, server) = spawn_delete_server(profile_dir.clone());
-        let session = WdSession {
-            client: Arc::new(WdClient::new(&webdriver_url)),
-            session_id: "test-session".into(),
-            capabilities: serde_json::json!({}),
-        };
-
-        let result = complete_post_session_initialization(
-            &session,
-            &mut profile_guard,
-            &profile_dir,
-            false,
-            &mut None,
-            async { Err::<(), _>(BrowserError::Connect("missing BiDi URL".into())) },
-        )
-        .await;
-
-        assert!(matches!(result, Err(BrowserError::Launch(_))));
-        assert!(server.join().unwrap(), "DELETE did not observe profile ownership");
-        assert!(profile_guard.is_none(), "ownership must move into quarantine");
-        assert!(ProfileOwnershipGuard::acquire(&profile_dir).is_err());
-        ProfileOwnershipGuard::release_retained_for_test(&profile_dir);
-        std::fs::remove_dir_all(profile_dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn webdriver_delete_runs_while_transport_teardown_is_pending() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let delete_seen = Arc::new(tokio::sync::Notify::new());
-        let server_delete_seen = Arc::clone(&delete_seen);
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 2048];
-            let bytes_read = stream.read(&mut request).unwrap();
-            let request = String::from_utf8_lossy(&request[..bytes_read]);
-            let received_delete = request.starts_with("DELETE /session/test-session ");
-            server_delete_seen.notify_one();
-            let body = r#"{"value":null}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .unwrap();
-            received_delete
-        });
-        let session = WdSession {
-            client: Arc::new(WdClient::new(&endpoint)),
-            session_id: "test-session".into(),
-            capabilities: serde_json::json!({}),
-        };
-        let transport = async move {
-            tokio::time::timeout(Duration::from_secs(1), delete_seen.notified())
-                .await
-                .expect("DELETE must start before transport teardown returns");
-            Err(BrowserError::BiDi(crate::bidi::BiDiError::ConnectionClosed))
-        };
-
-        let outcome = teardown_concurrently(
-            transport,
-            bounded_delete_webdriver_session(&session),
-        )
-        .await;
-
-        assert!(server.join().unwrap());
-        assert!(outcome.process_termination_confirmed);
-        assert!(matches!(outcome.result, Err(BrowserError::BiDi(_))));
-    }
-
-    #[test]
-    fn confirmed_delete_and_owned_termination_accept_transport_teardown_error() {
-        let mut closed = reconcile_teardown_results(
-            Err(BrowserError::BiDi(
-                crate::bidi::BiDiError::ConnectionClosed,
-            )),
-            Ok(()),
-        );
-        closed.process_termination_confirmed = true;
-        accept_transport_error_after_confirmed_owned_termination(&mut closed);
-        assert!(closed.result.is_ok());
-
-        let mut delete_failed = reconcile_teardown_results(
-            Err(BrowserError::BiDi(
-                crate::bidi::BiDiError::ConnectionClosed,
-            )),
-            Err(BrowserError::Other("WebDriver DELETE failed".into())),
-        );
-        delete_failed.process_termination_confirmed = true;
-        accept_transport_error_after_confirmed_owned_termination(
-            &mut delete_failed,
-        );
-        assert!(delete_failed.result.is_err());
-    }
-
-    #[test]
-    fn external_webdriver_delete_does_not_confirm_firefox_termination() {
-        let mut outcome = reconcile_teardown_results(Ok(()), Ok(()));
-
-        mark_external_webdriver_termination_unconfirmed(&mut outcome);
-
-        assert!(!outcome.process_termination_confirmed);
-        assert!(matches!(outcome.result, Err(BrowserError::Launch(_))));
-    }
-
-    #[test]
-    fn external_webdriver_close_quarantines_profile_after_successful_delete() {
-        let profile_dir = std::env::temp_dir().join(format!(
-            "dig2browser-bidi-external-close-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let mut profile_guard = Some(ProfileOwnershipGuard::acquire(&profile_dir).unwrap());
-        let mut outcome = reconcile_teardown_results(Ok(()), Ok(()));
-        mark_external_webdriver_termination_unconfirmed(&mut outcome);
-
-        assert!(quarantine_profile_after_unconfirmed_outcome(
-            &outcome,
-            &mut profile_guard,
-        ));
-        assert!(profile_guard.is_none());
-        assert!(ProfileOwnershipGuard::acquire(&profile_dir).is_err());
-        ProfileOwnershipGuard::release_retained_for_test(&profile_dir);
-        std::fs::remove_dir_all(profile_dir).unwrap();
-    }
-
-    #[test]
-    fn ephemeral_profile_is_deleted_before_ownership_is_released() {
-        let profile_dir = std::env::temp_dir().join(format!(
-            "dig2browser-bidi-confirmed-delete-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let mut profile_guard = Some(ProfileOwnershipGuard::acquire(&profile_dir).unwrap());
-        std::fs::write(profile_dir.join("state"), b"test").unwrap();
-        let observed_held_ownership = Arc::new(AtomicBool::new(false));
-        let observed = Arc::clone(&observed_held_ownership);
-        release_profile_after_confirmed_termination_with(
-            &mut profile_guard,
-            &profile_dir,
-            true,
-            move |path| {
-                observed.store(
-                    ProfileOwnershipGuard::acquire(path).is_err(),
-                    AtomicOrdering::SeqCst,
-                );
-                std::fs::remove_dir_all(path)
-            },
-        )
-        .unwrap();
-        assert!(observed_held_ownership.load(AtomicOrdering::SeqCst));
-        assert!(profile_guard.is_none());
-        assert!(!profile_dir.exists());
-    }
-
-    #[test]
-    fn ephemeral_profile_cleanup_failure_quarantines_ownership() {
-        let profile_dir = std::env::temp_dir().join(format!(
-            "dig2browser-bidi-cleanup-failure-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let mut profile_guard = Some(ProfileOwnershipGuard::acquire(&profile_dir).unwrap());
-        let result = release_profile_after_confirmed_termination_with(
-            &mut profile_guard,
-            &profile_dir,
-            true,
-            |_| Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied")),
-        );
-
-        assert!(matches!(result, Err(BrowserError::Io(_))));
-        assert!(profile_guard.is_none(), "ownership must move into quarantine");
-        assert!(ProfileOwnershipGuard::acquire(&profile_dir).is_err());
-        ProfileOwnershipGuard::release_retained_for_test(&profile_dir);
-        std::fs::remove_dir_all(profile_dir).unwrap();
-    }
-
-    #[test]
-    fn webdriver_delete_failure_retains_profile_ownership() {
-        let profile_dir = std::env::temp_dir().join(format!(
-            "dig2browser-bidi-unconfirmed-delete-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let outcome = reconcile_teardown_results(
-            Ok(()),
-            Err(BrowserError::Other("WebDriver DELETE failed".into())),
-        );
-        assert!(!outcome.process_termination_confirmed);
-        let guard = ProfileOwnershipGuard::acquire(&profile_dir).unwrap();
-        let error = outcome.result.as_ref().unwrap_err();
-        retain_profile_ownership_after_unconfirmed_teardown(
-            Some(guard),
-            error,
-        );
-        assert!(ProfileOwnershipGuard::acquire(&profile_dir).is_err());
-        ProfileOwnershipGuard::release_retained_for_test(&profile_dir);
-        std::fs::remove_dir_all(profile_dir).unwrap();
-    }
-
-    #[test]
-    fn cancelled_session_creation_retains_profile_ownership() {
-        let profile_dir = std::env::temp_dir().join(format!(
-            "dig2browser-bidi-cancelled-start-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let guard = ProfileOwnershipGuard::acquire(&profile_dir).unwrap();
-        let mut pending = PendingProfileOwnership::new(guard);
-        pending.arm_for_session_creation();
-
-        drop(pending);
-
-        assert!(ProfileOwnershipGuard::acquire(&profile_dir).is_err());
-        ProfileOwnershipGuard::release_retained_for_test(&profile_dir);
-        std::fs::remove_dir_all(profile_dir).unwrap();
-    }
-}
-
 impl BrowserBackend for BiDiBrowserBackend {
     fn new_page<'a>(
         &'a self,
@@ -1874,4 +1543,335 @@ fn needs_return_prefix(js: &str) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::time::Instant;
+
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_acknowledged_launch_closes_unclaimed_backend_asynchronously() {
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let cleanup_ran = Arc::new(AtomicBool::new(false));
+        let cleanup_observed = Arc::clone(&cleanup_ran);
+        let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
+        let delivery = tokio::spawn(async move {
+            deliver_acknowledged_launch(Ok(7_u8), result_tx, move |backend| async move {
+                assert_eq!(backend, 7);
+                cleanup_observed.store(true, AtomicOrdering::SeqCst);
+                let _ = cleanup_tx.send(());
+            })
+            .await;
+        });
+
+        let ready = result_rx.await.unwrap().unwrap();
+        ready.acknowledge.send(()).unwrap();
+        drop(ready.backend);
+
+        cleanup_rx.await.unwrap();
+        delivery.await.unwrap();
+        assert!(cleanup_ran.load(AtomicOrdering::SeqCst));
+    }
+
+    #[test]
+    fn geckodriver_listener_parser_accepts_only_complete_socket_addresses() {
+        assert_eq!(
+            parse_geckodriver_listener(b"1712345678\tgeckodriver\tINFO\tListening on 127.0.0.1:54321"),
+            Some("127.0.0.1:54321".parse().unwrap())
+        );
+        assert_eq!(
+            parse_geckodriver_listener(b"Listening on localhost:4444"),
+            None
+        );
+        assert_eq!(parse_geckodriver_listener(b"unrelated log line"), None);
+    }
+
+    #[tokio::test]
+    async fn geckodriver_readiness_reader_rejects_an_unbounded_line() {
+        use tokio::io::AsyncWriteExt;
+
+        let (reader, mut writer) = tokio::io::duplex(GECKODRIVER_LINE_LIMIT * 2);
+        let (signals, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(read_geckodriver_log("test", reader, signals));
+        writer
+            .write_all(&vec![b'x'; GECKODRIVER_LINE_LIMIT + 1])
+            .await
+            .unwrap();
+        assert!(matches!(
+            received.recv().await,
+            Some(GeckodriverLogSignal::Limit("test"))
+        ));
+        drop(writer);
+        task.await.unwrap();
+    }
+
+    fn spawn_delete_server(
+        profile_dir: std::path::PathBuf,
+    ) -> (String, std::thread::JoinHandle<bool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(7);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return false;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => return false,
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0_u8; 2048];
+            let bytes_read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..bytes_read]);
+            let received_delete = request.starts_with("DELETE /session/test-session ");
+            let ownership_was_held = ProfileOwnershipGuard::acquire(&profile_dir).is_err();
+
+            let body = r#"{"value":null}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            received_delete && ownership_was_held
+        });
+        (endpoint, server)
+    }
+
+    #[tokio::test]
+    async fn post_session_failure_with_external_webdriver_retains_profile_ownership() {
+        let profile_dir = std::env::temp_dir().join(format!(
+            "dig2browser-bidi-post-session-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut profile_guard = Some(ProfileOwnershipGuard::acquire(&profile_dir).unwrap());
+        let (webdriver_url, server) = spawn_delete_server(profile_dir.clone());
+        let session = WdSession {
+            client: Arc::new(WdClient::new(&webdriver_url)),
+            session_id: "test-session".into(),
+            capabilities: serde_json::json!({}),
+        };
+
+        let result = complete_post_session_initialization(
+            &session,
+            &mut profile_guard,
+            &profile_dir,
+            false,
+            &mut None,
+            async { Err::<(), _>(BrowserError::Connect("missing BiDi URL".into())) },
+        )
+        .await;
+
+        assert!(matches!(result, Err(BrowserError::Launch(_))));
+        assert!(server.join().unwrap(), "DELETE did not observe profile ownership");
+        assert!(profile_guard.is_none(), "ownership must move into quarantine");
+        assert!(ProfileOwnershipGuard::acquire(&profile_dir).is_err());
+        ProfileOwnershipGuard::release_retained_for_test(&profile_dir);
+        std::fs::remove_dir_all(profile_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn webdriver_delete_runs_while_transport_teardown_is_pending() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let delete_seen = Arc::new(tokio::sync::Notify::new());
+        let server_delete_seen = Arc::clone(&delete_seen);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let bytes_read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..bytes_read]);
+            let received_delete = request.starts_with("DELETE /session/test-session ");
+            server_delete_seen.notify_one();
+            let body = r#"{"value":null}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            received_delete
+        });
+        let session = WdSession {
+            client: Arc::new(WdClient::new(&endpoint)),
+            session_id: "test-session".into(),
+            capabilities: serde_json::json!({}),
+        };
+        let transport = async move {
+            tokio::time::timeout(Duration::from_secs(1), delete_seen.notified())
+                .await
+                .expect("DELETE must start before transport teardown returns");
+            Err(BrowserError::BiDi(crate::bidi::BiDiError::ConnectionClosed))
+        };
+
+        let outcome = teardown_concurrently(
+            transport,
+            bounded_delete_webdriver_session(&session),
+        )
+        .await;
+
+        assert!(server.join().unwrap());
+        assert!(outcome.process_termination_confirmed);
+        assert!(matches!(outcome.result, Err(BrowserError::BiDi(_))));
+    }
+
+    #[test]
+    fn confirmed_delete_and_owned_termination_accept_transport_teardown_error() {
+        let mut closed = reconcile_teardown_results(
+            Err(BrowserError::BiDi(
+                crate::bidi::BiDiError::ConnectionClosed,
+            )),
+            Ok(()),
+        );
+        closed.process_termination_confirmed = true;
+        accept_transport_error_after_confirmed_owned_termination(&mut closed);
+        assert!(closed.result.is_ok());
+
+        let mut delete_failed = reconcile_teardown_results(
+            Err(BrowserError::BiDi(
+                crate::bidi::BiDiError::ConnectionClosed,
+            )),
+            Err(BrowserError::Other("WebDriver DELETE failed".into())),
+        );
+        delete_failed.process_termination_confirmed = true;
+        accept_transport_error_after_confirmed_owned_termination(
+            &mut delete_failed,
+        );
+        assert!(delete_failed.result.is_err());
+    }
+
+    #[test]
+    fn external_webdriver_delete_does_not_confirm_firefox_termination() {
+        let mut outcome = reconcile_teardown_results(Ok(()), Ok(()));
+
+        mark_external_webdriver_termination_unconfirmed(&mut outcome);
+
+        assert!(!outcome.process_termination_confirmed);
+        assert!(matches!(outcome.result, Err(BrowserError::Launch(_))));
+    }
+
+    #[test]
+    fn external_webdriver_close_quarantines_profile_after_successful_delete() {
+        let profile_dir = std::env::temp_dir().join(format!(
+            "dig2browser-bidi-external-close-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut profile_guard = Some(ProfileOwnershipGuard::acquire(&profile_dir).unwrap());
+        let mut outcome = reconcile_teardown_results(Ok(()), Ok(()));
+        mark_external_webdriver_termination_unconfirmed(&mut outcome);
+
+        assert!(quarantine_profile_after_unconfirmed_outcome(
+            &outcome,
+            &mut profile_guard,
+        ));
+        assert!(profile_guard.is_none());
+        assert!(ProfileOwnershipGuard::acquire(&profile_dir).is_err());
+        ProfileOwnershipGuard::release_retained_for_test(&profile_dir);
+        std::fs::remove_dir_all(profile_dir).unwrap();
+    }
+
+    #[test]
+    fn ephemeral_profile_is_deleted_before_ownership_is_released() {
+        let profile_dir = std::env::temp_dir().join(format!(
+            "dig2browser-bidi-confirmed-delete-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut profile_guard = Some(ProfileOwnershipGuard::acquire(&profile_dir).unwrap());
+        std::fs::write(profile_dir.join("state"), b"test").unwrap();
+        let observed_held_ownership = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&observed_held_ownership);
+        release_profile_after_confirmed_termination_with(
+            &mut profile_guard,
+            &profile_dir,
+            true,
+            move |path| {
+                observed.store(
+                    ProfileOwnershipGuard::acquire(path).is_err(),
+                    AtomicOrdering::SeqCst,
+                );
+                std::fs::remove_dir_all(path)
+            },
+        )
+        .unwrap();
+        assert!(observed_held_ownership.load(AtomicOrdering::SeqCst));
+        assert!(profile_guard.is_none());
+        assert!(!profile_dir.exists());
+    }
+
+    #[test]
+    fn ephemeral_profile_cleanup_failure_quarantines_ownership() {
+        let profile_dir = std::env::temp_dir().join(format!(
+            "dig2browser-bidi-cleanup-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mut profile_guard = Some(ProfileOwnershipGuard::acquire(&profile_dir).unwrap());
+        let result = release_profile_after_confirmed_termination_with(
+            &mut profile_guard,
+            &profile_dir,
+            true,
+            |_| Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied")),
+        );
+
+        assert!(matches!(result, Err(BrowserError::Io(_))));
+        assert!(profile_guard.is_none(), "ownership must move into quarantine");
+        assert!(ProfileOwnershipGuard::acquire(&profile_dir).is_err());
+        ProfileOwnershipGuard::release_retained_for_test(&profile_dir);
+        std::fs::remove_dir_all(profile_dir).unwrap();
+    }
+
+    #[test]
+    fn webdriver_delete_failure_retains_profile_ownership() {
+        let profile_dir = std::env::temp_dir().join(format!(
+            "dig2browser-bidi-unconfirmed-delete-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let outcome = reconcile_teardown_results(
+            Ok(()),
+            Err(BrowserError::Other("WebDriver DELETE failed".into())),
+        );
+        assert!(!outcome.process_termination_confirmed);
+        let guard = ProfileOwnershipGuard::acquire(&profile_dir).unwrap();
+        let error = outcome.result.as_ref().unwrap_err();
+        retain_profile_ownership_after_unconfirmed_teardown(
+            Some(guard),
+            error,
+        );
+        assert!(ProfileOwnershipGuard::acquire(&profile_dir).is_err());
+        ProfileOwnershipGuard::release_retained_for_test(&profile_dir);
+        std::fs::remove_dir_all(profile_dir).unwrap();
+    }
+
+    #[test]
+    fn cancelled_session_creation_retains_profile_ownership() {
+        let profile_dir = std::env::temp_dir().join(format!(
+            "dig2browser-bidi-cancelled-start-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let guard = ProfileOwnershipGuard::acquire(&profile_dir).unwrap();
+        let mut pending = PendingProfileOwnership::new(guard);
+        pending.arm_for_session_creation();
+
+        drop(pending);
+
+        assert!(ProfileOwnershipGuard::acquire(&profile_dir).is_err());
+        ProfileOwnershipGuard::release_retained_for_test(&profile_dir);
+        std::fs::remove_dir_all(profile_dir).unwrap();
+    }
 }

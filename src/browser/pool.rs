@@ -201,8 +201,10 @@ mod tests {
 
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
             .map_err(|error| format!("create process snapshot: {error}"))?;
-        let mut raw = PROCESSENTRY32W::default();
-        raw.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut raw = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
         let mut entries = Vec::new();
         let mut next = unsafe { Process32FirstW(snapshot, &mut raw) };
         while next.is_ok() {
@@ -307,7 +309,7 @@ mod tests {
             }
 
             let word_size = std::mem::size_of::<usize>();
-            let word_count = (byte_count as usize + word_size - 1) / word_size;
+            let word_count = (byte_count as usize).div_ceil(word_size);
             let mut storage = vec![0usize; word_count];
             let status = unsafe {
                 GetExtendedTcpTable(
@@ -393,6 +395,7 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn default_two_browser_pool_launches_over_owned_cdp_pipes_e2e() {
+        let _real_browser_guard = crate::test_support::REAL_BROWSER_E2E.lock().await;
         let baseline = process_snapshot().expect("capture process baseline");
         let config = PoolConfig {
             size: 2,

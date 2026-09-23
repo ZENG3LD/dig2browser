@@ -440,9 +440,10 @@ mod tests {
         ]);
         assert_eq!(duplicate.unwrap_err(), ContractError::DuplicateCapability);
 
-        let too_many = CapabilitySet::new(
-            std::iter::repeat(Capability::L3(L3Capability::Navigate)).take(MAX_CAPABILITIES + 1),
-        );
+        let too_many = CapabilitySet::new(std::iter::repeat_n(
+            Capability::L3(L3Capability::Navigate),
+            MAX_CAPABILITIES + 1,
+        ));
         assert!(matches!(
             too_many,
             Err(ContractError::TooManyCapabilities { .. })

@@ -907,8 +907,10 @@ mod tests {
         )
         .unwrap();
         let layout = MobileLayout::new(393, 852, 3.0, 5).unwrap();
-        let mut stealth = StealthConfig::default();
-        stealth.user_agent = "desktop-sentinel".into();
+        let stealth = StealthConfig {
+            user_agent: "desktop-sentinel".into(),
+            ..Default::default()
+        };
 
         let runtime = RealBrowserRuntime::new(
             identity,
