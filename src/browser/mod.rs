@@ -6,14 +6,14 @@
 
 pub(crate) mod backend;
 
-mod browser;
 mod devtools;
 mod error;
 mod page;
 mod pool;
+mod stealth_browser;
 mod wait;
 
-pub use browser::{StealthBrowser, discover_ws_url};
+pub use stealth_browser::{StealthBrowser, discover_ws_url};
 pub use backend::{BoundingBox, ElementHandle, PrintOptions, RequestMock};
 pub use devtools::{ConsoleEvent, DevToolsEvent, NetworkEvent, PageDevTools};
 pub use error::BrowserError;

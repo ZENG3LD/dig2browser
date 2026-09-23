@@ -15,7 +15,7 @@ use crate::detect::LaunchConfig;
 use crate::stealth::StealthConfig;
 use tracing::warn;
 
-use crate::browser::browser::StealthBrowser;
+use crate::browser::stealth_browser::StealthBrowser;
 use crate::browser::error::BrowserError;
 use crate::browser::page::StealthPage;
 

@@ -109,11 +109,12 @@ pub enum CatalogKind {
 }
 
 /// Which of the three modes supplies the identity. Default: [`Self::User`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum PersonaSource {
     /// **Mode 3 (default)** — the browser's own identity, used as-is. No
     /// UA / timezone / device-metrics overrides are applied at all, so the
     /// page keeps following the real window.
+    #[default]
     User,
     /// **Mode 1** — a coherent persona generated at resolve time. `seed`
     /// makes the draw reproducible; `None` draws from entropy.
@@ -125,12 +126,6 @@ pub enum PersonaSource {
         kind: CatalogKind,
         id: Option<String>,
     },
-}
-
-impl Default for PersonaSource {
-    fn default() -> Self {
-        Self::User
-    }
 }
 
 impl PersonaSource {

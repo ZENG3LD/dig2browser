@@ -179,10 +179,10 @@ async fn run_inner(
         .filter(|&n| n > 0);
 
     // 9. Read headless toggle (GAP-5).
-    let headless = match std::env::var("DIG2_WASM_HEADLESS").ok().as_deref() {
-        Some(v) if v.eq_ignore_ascii_case("0") || v.eq_ignore_ascii_case("false") => false,
-        _ => true,
-    };
+    let headless = !matches!(
+        std::env::var("DIG2_WASM_HEADLESS").ok().as_deref(),
+        Some(v) if v.eq_ignore_ascii_case("0") || v.eq_ignore_ascii_case("false")
+    );
 
     // 9b. Read establishment timeout (FEATURE 1).
     //     Applies to the new_session + goto phase.  Default 60s.

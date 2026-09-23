@@ -41,6 +41,7 @@ impl CdpSession {
     /// HTTP request headers — something that JS-only patching cannot achieve.
     ///
     /// `brands` should be `[("Google Chrome", "131"), ("Chromium", "131"), ("Not_A Brand", "24")]`.
+    #[allow(clippy::too_many_arguments)] // mirrors `Emulation.setUserAgentOverride` + `userAgentMetadata` 1:1; public API
     pub async fn set_user_agent_with_metadata(
         &self,
         user_agent: &str,

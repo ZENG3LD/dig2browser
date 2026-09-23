@@ -395,14 +395,14 @@ fn load_fingerprint(
 
 /// Owns either a browser or HTTP fetcher and shuts the browser down on exit.
 enum FetcherHandle {
-    Browser(fetch::browser::BrowserFetcher),
+    Browser(Box<fetch::browser::BrowserFetcher>),
     Http(fetch::http::HttpFetcher),
 }
 
 impl FetcherHandle {
     fn as_fetcher(&self) -> &dyn Fetcher {
         match self {
-            Self::Browser(f) => f,
+            Self::Browser(f) => f.as_ref(),
             Self::Http(f) => f,
         }
     }
@@ -434,7 +434,7 @@ async fn make_fetcher(
         let fetcher = fetch::browser::BrowserFetcher::new(launch, stealth, wait_selector, signer)
             .await
             .context("Failed to start browser")?;
-        Ok(FetcherHandle::Browser(fetcher))
+        Ok(FetcherHandle::Browser(Box::new(fetcher)))
     } else {
         let fetcher = fetch::http::HttpFetcher::new(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 dig2crawl/0.1",
@@ -452,7 +452,6 @@ async fn fetch_page(fetcher: &dyn Fetcher, url_str: &str) -> Result<FetchedPage>
         .fetch(&url)
         .await
         .with_context(|| format!("Failed to fetch {url_str}"))
-        .map_err(anyhow::Error::from)
 }
 
 /// Parse the raw agent response string into `AgentResponse`.

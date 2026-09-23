@@ -40,7 +40,7 @@ impl BotKeyPair {
 
     /// Save private key to a 32-byte raw file
     pub fn save_private_key(&self, path: &Path) -> std::io::Result<()> {
-        std::fs::write(path, &self.private_key)
+        std::fs::write(path, self.private_key)
     }
 
     /// Load or generate: if file exists, load it; otherwise generate and save

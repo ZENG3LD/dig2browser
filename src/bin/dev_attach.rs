@@ -589,7 +589,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let params: Option<serde_json::Value> = cli
             .cdp_params
             .as_deref()
-            .map(|s| serde_json::from_str(s))
+            .map(serde_json::from_str)
             .transpose()
             .map_err(|e| format!("--cdp-params JSON parse error: {e}"))?;
         log(cli.quiet, &format!("[dev-attach] cdp call: {method}"));
@@ -663,11 +663,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let t = t_start.elapsed().as_secs();
         let dims = eval_dims(&page).await;
 
-        if cli.watch_frames {
-            println!("[t={t}s] {dims}");
-        } else {
-            println!("[t={t}s] {dims}");
-        }
+        println!("[t={t}s] {dims}");
 
         let (console_msgs, _net) = drain_events(&mut events);
         if cli.watch_console {
@@ -1028,7 +1024,7 @@ async fn cpu_profile(
             Some((name, url, line, hits, pct))
         })
         .collect();
-    rows.sort_by(|a, b| b.3.cmp(&a.3));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.3));
     Ok(rows)
 }
 
