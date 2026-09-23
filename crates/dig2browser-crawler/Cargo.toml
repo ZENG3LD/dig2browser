@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Durable domain-neutral crawl scheduling core for dig2browser station"
+repository = "https://github.com/ZENG3LD/dig2browser"
 
 [lib]
 name = "dig2browser_crawler"

@@ -8,3 +8,8 @@
 keys/
 *.key
 .env
+
+# Internal agent notes — not part of the public repo
+CLAUDE.md
+AGENTS.md
+__pycache__/
