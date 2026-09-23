@@ -967,12 +967,29 @@ mod tests {
 
     #[test]
     fn retry_budget_and_cancellation_are_visible_in_status() {
-        let mut engine = CrawlEngine::create(MemoryStore::new(), spec(), 10).unwrap();
+        // Two seeds: the first URL burns its whole retry budget and lands in
+        // `Failed`, but the second URL is never claimed, so the job stays
+        // `Running` (pending > 0) — cancellation must only be honored while
+        // the job is still running (see `cancel_does_not_rewrite_a_terminal_job`
+        // and the mirrored `JobTerminal` guard in
+        // dig2browser-station/src/crawl.rs, which treats `CompletedWithFailures`
+        // the same as `Completed`/`Failed`/`FailureBudgetExhausted`: terminal,
+        // cancel refused).
+        let two_page_spec = CrawlSpec::new(
+            "retry-and-cancel",
+            ["https://example.com/", "https://example.com/other"],
+            Scope::seed_origins(),
+            CrawlBudget::new(2, 0, 2, 2).unwrap(),
+        )
+        .unwrap();
+        let mut engine = CrawlEngine::create(MemoryStore::new(), two_page_spec, 10).unwrap();
         let first = engine.claim_next("worker", "lease-1", 20, 10).unwrap().unwrap();
         assert!(engine.fail(&first, Failure::retryable("timeout"), 21).unwrap());
         let second = engine.claim_next("worker", "lease-2", 22, 10).unwrap().unwrap();
         assert!(!engine.fail(&second, Failure::retryable("timeout"), 23).unwrap());
         assert_eq!(engine.status().failed, 1);
+        assert_eq!(engine.status().state, JobState::Running);
+
         engine.cancel(24, Some("operator stop".to_owned())).unwrap();
         assert_eq!(engine.status().state, JobState::Cancelled);
     }
@@ -997,11 +1014,15 @@ mod tests {
 
     #[test]
     fn terminal_job_with_a_failed_page_is_not_successful() {
+        // max_failures (2) intentionally exceeds the single seed so the
+        // failure budget is not what ends the job; max_pages must be >= 2 to
+        // satisfy `CrawlBudget::validate`'s "max_failures must not exceed
+        // max_pages" invariant even though only one page is ever crawled.
         let partial_spec = CrawlSpec::new(
             "partial",
             ["https://example.com/"],
             Scope::seed_origins(),
-            CrawlBudget::new(1, 0, 2, 1).unwrap(),
+            CrawlBudget::new(2, 0, 2, 1).unwrap(),
         )
         .unwrap();
         let mut engine = CrawlEngine::create(MemoryStore::new(), partial_spec, 10).unwrap();
