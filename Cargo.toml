@@ -24,21 +24,6 @@ members = [
 ]
 resolver = "2"
 
-# Published gate4agent 0.3.0 carries a mandatory `rusqlite = "^0.31"` (the
-# harness/session-storage crates that need it are not part of the published
-# `gate4agent` package's own dependency tree, but that stale requirement
-# still ships) that conflicts via `libsqlite3-sys`'s `links = "sqlite3"`
-# with the `rusqlite = "^0.32"` this workspace uses everywhere else
-# (root `dig2browser`, `dig2browser-crawler`, `dig2browser-station`).
-# The local `gate4agent` checkout has already dropped that dependency
-# (same public `pipe`/`AgentEvent`/`CliTool`/`SessionConfig` surface the
-# `crawler` feature's `agent::session` module depends on) but has not
-# published a new version yet — patch to it for local resolution only;
-# `cargo publish` strips `[patch]` sections, so the published Cargo.toml
-# still declares a plain crates.io version dependency.
-[patch.crates-io]
-gate4agent = { path = "../gate4agent" }
-
 [[bin]]
 name = "keygen"
 path = "src/bin/keygen.rs"
@@ -122,7 +107,7 @@ zip = "2"
 anyhow = { version = "1", optional = true }
 chrono = { version = "0.4", features = ["serde"], optional = true }
 dig2browser-crawler = { path = "crates/dig2browser-crawler", version = "0.1.0", optional = true }
-gate4agent = { version = "0.3", optional = true }
+gate4agent = { version = "0.4", optional = true }
 regex = { version = "1", optional = true }
 scraper = { version = "=0.27.0", default-features = false, features = ["atomic"], optional = true }
 toml = { version = "0.8", optional = true }
