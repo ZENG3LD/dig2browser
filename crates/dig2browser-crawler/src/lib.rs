@@ -2,6 +2,7 @@ mod canonical_url;
 mod engine;
 mod html;
 mod model;
+pub mod profile;
 mod spec;
 mod store;
 
