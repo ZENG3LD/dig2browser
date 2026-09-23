@@ -210,6 +210,28 @@ let pdf = page.pdf(PrintOptions {
 std::fs::write("page.pdf", &pdf)?;
 ```
 
+### Crawler (optional, off by default: `--features crawler`)
+
+Ported from the retired standalone `dig2crawl` crate. Adds agent-driven
+CSS-selector discovery (a multi-turn Claude session escalates
+CSS → interactive clicks/scrolls → screenshot+vision, building a reusable
+site profile), a fast CSS-selector extractor that then runs without an
+agent, plain-HTTP and browser-driven fetch behind one `Fetcher` trait, and
+the `dig2crawl` CLI (`discover` / `extract` / `export-spec` / `fetch` /
+`test-selector`). The site-profile model, structured-record parsers
+(selector / JSON-LD / antibot / metadata / embedded SPA JSON), and SQLite
+job/record storage + CSV/JSONL export live in the browser-agnostic
+`dig2browser-crawler` crate (`dig2browser_crawler::profile`); this crate
+adds only the parts that need a real browser or an agent CLI transport
+(`gate4agent`). A default build of `dig2browser` links neither.
+
+```bash
+cargo run --release --features crawler --bin dig2crawl -- \
+    discover https://example.com/pricing --goal "VPS plans: name, price, ram"
+cargo run --release --features crawler --bin dig2crawl -- \
+    extract https://example.com/pricing --profile output/example.com/profile.json
+```
+
 ## Web Bot Auth
 
 Cryptographic bot identity using [RFC 9421 HTTP Message Signatures](https://datatracker.ietf.org/doc/html/rfc9421). Instead of anti-detection scripting, your crawler proves its identity to CDN providers (Cloudflare, Akamai, DataDome, HUMAN Security, AWS) with Ed25519 signatures.

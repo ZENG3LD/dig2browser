@@ -12,6 +12,8 @@ pub mod agentic;
 pub mod worker_ipc;
 pub mod digest;
 pub mod process_isolation;
+#[cfg(feature = "crawler")]
+pub mod crawl;
 #[cfg(windows)]
 mod windows_runtime_mirror;
 mod browser_process;

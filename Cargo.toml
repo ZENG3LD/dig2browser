@@ -24,6 +24,21 @@ members = [
 ]
 resolver = "2"
 
+# Published gate4agent 0.3.0 carries a mandatory `rusqlite = "^0.31"` (the
+# harness/session-storage crates that need it are not part of the published
+# `gate4agent` package's own dependency tree, but that stale requirement
+# still ships) that conflicts via `libsqlite3-sys`'s `links = "sqlite3"`
+# with the `rusqlite = "^0.32"` this workspace uses everywhere else
+# (root `dig2browser`, `dig2browser-crawler`, `dig2browser-station`).
+# The local `gate4agent` checkout has already dropped that dependency
+# (same public `pipe`/`AgentEvent`/`CliTool`/`SessionConfig` surface the
+# `crawler` feature's `agent::session` module depends on) but has not
+# published a new version yet — patch to it for local resolution only;
+# `cargo publish` strips `[patch]` sections, so the published Cargo.toml
+# still declares a plain crates.io version dependency.
+[patch.crates-io]
+gate4agent = { path = "../gate4agent" }
+
 [[bin]]
 name = "keygen"
 path = "src/bin/keygen.rs"
@@ -44,6 +59,11 @@ path = "src/bin/dev_launch_debug.rs"
 name = "dig2-wasm-test"
 path = "src/bin/dig2_wasm_test.rs"
 
+[[bin]]
+name = "dig2crawl"
+path = "src/bin/dig2crawl.rs"
+required-features = ["crawler"]
+
 [lib]
 name = "dig2browser"
 path = "src/lib.rs"
@@ -53,6 +73,24 @@ default = []
 containment-test-hooks = []
 geckodriver-test-hooks = []
 runtime-test-hooks = []
+# Off by default: browser-driven fetch, Claude-agent CSS-selector discovery,
+# and the `dig2crawl` CLI ported from the retired `dig2crawl` crate. Pulls in
+# `dig2browser-crawler` (site-profile/record model, parsers, SQLite storage)
+# and `gate4agent` (agent CLI transport) — neither is a default dependency.
+crawler = [
+    "dep:anyhow",
+    "dep:chrono",
+    "dep:dig2browser-crawler",
+    "dep:gate4agent",
+    "dep:regex",
+    "dep:scraper",
+    "dep:toml",
+    "dep:tracing-subscriber",
+    "reqwest/cookies",
+    "reqwest/gzip",
+    "reqwest/brotli",
+    "reqwest/deflate",
+]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -79,6 +117,16 @@ dashmap = "6"
 wasm-bindgen-cli-support = "=0.2.118"
 tiny_http = "0.12"
 zip = "2"
+
+# crawler feature only (all optional)
+anyhow = { version = "1", optional = true }
+chrono = { version = "0.4", features = ["serde"], optional = true }
+dig2browser-crawler = { path = "crates/dig2browser-crawler", version = "0.1.0", optional = true }
+gate4agent = { version = "0.3", optional = true }
+regex = { version = "1", optional = true }
+scraper = { version = "=0.27.0", default-features = false, features = ["atomic"], optional = true }
+toml = { version = "0.8", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
