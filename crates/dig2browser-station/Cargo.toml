@@ -12,10 +12,20 @@ path = "src/lib.rs"
 [features]
 default = []
 containment-test-hooks = ["dig2browser/containment-test-hooks"]
+# Durable crawl support: `dig2browser-crawler`-backed frontier, `crawl.rs`,
+# the `Crawl` IPC route, and the CLI's `--crawl-root`/`--allow-crawl-*`
+# flags. Off by default — a default station build owns no crawl state and
+# links no `dig2browser-crawler` code.
+crawler = ["dep:dig2browser-crawler"]
 crawler-test-hooks = []
 geckodriver-test-hooks = ["dig2browser/geckodriver-test-hooks"]
 runtime-test-hooks = ["dig2browser/runtime-test-hooks"]
 tls-test-hooks = []
+
+[[test]]
+name = "crawler_e2e"
+path = "tests/crawler_e2e.rs"
+required-features = ["crawler"]
 
 [dependencies]
 base64 = "0.22"
@@ -23,7 +33,7 @@ clap = { version = "4", features = ["derive"] }
 dig2browser = { path = "../.." }
 dig2browser-client = { path = "../dig2browser-client" }
 dig2browser-core = { path = "../dig2browser-core" }
-dig2browser-crawler = { path = "../dig2browser-crawler" }
+dig2browser-crawler = { path = "../dig2browser-crawler", optional = true }
 dig2browser-protocol = { path = "../dig2browser-protocol" }
 dig2browser-runtime-lightweight = { path = "../dig2browser-runtime-lightweight" }
 dig2browser-shape = { path = "../dig2browser-shape" }

@@ -70,14 +70,17 @@ pub(crate) struct BeginCollection {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CaptureReceiptPolicy {
     IfCaptured,
+    #[cfg(feature = "crawler")]
     Required,
 }
 
+#[cfg(feature = "crawler")]
 pub(crate) enum CollectionExecution {
     Executed(BrowserTaskResult),
     Reconciled(ReconciledCollection),
 }
 
+#[cfg(feature = "crawler")]
 pub(crate) struct ReconciledCollection {
     collection_id: CollectionId,
     final_url: String,
@@ -85,6 +88,7 @@ pub(crate) struct ReconciledCollection {
     html: ArtifactRef,
 }
 
+#[cfg(feature = "crawler")]
 impl ReconciledCollection {
     pub(crate) fn collection_id(&self) -> CollectionId {
         self.collection_id
@@ -165,7 +169,7 @@ impl CollectionManager {
             if self.started_digest(*collection_id)? != receipt.task_sha256 {
                 return Err(CollectionError::CorruptReceipt);
             }
-            self.reconcile_completed(*collection_id, receipt.task_sha256)?
+            self.reconcile_completed_receipt(*collection_id, receipt.task_sha256)?
                 .ok_or(CollectionError::CorruptReceipt)?;
         }
         self.with_ledger(|ledger| ledger.reconcile_at(unix_time_ms(), &[]))?;
@@ -254,6 +258,7 @@ impl CollectionManager {
         Ok(collection_id)
     }
 
+    #[cfg(feature = "crawler")]
     pub(crate) async fn execute(
         &self,
         collection: BeginCollection,
@@ -341,11 +346,20 @@ impl CollectionManager {
             .map_err(CollectionError::Station)
     }
 
-    pub(crate) fn reconcile_completed(
+    /// Shared reconciliation core: verifies a persisted capture receipt
+    /// against the trace ledger (finishing the ledger if a crash left the
+    /// terminal event unwritten) and returns the receipt on success.
+    ///
+    /// Used unconditionally by [`Self::reconcile_successor`] (which only
+    /// checks presence) and, behind the `crawler` feature, wrapped by
+    /// [`Self::reconcile_completed`] (which also needs the receipt's
+    /// final URL / status / HTML artifact) — kept as one implementation so
+    /// the verification logic itself is never duplicated.
+    fn reconcile_completed_receipt(
         &self,
         collection_id: CollectionId,
         task_sha256: [u8; 32],
-    ) -> Result<Option<ReconciledCollection>, CollectionError> {
+    ) -> Result<Option<CaptureReceipt>, CollectionError> {
         self.require_collection_healthy(collection_id)?;
         match self.started_digest(collection_id) {
             Ok(existing) if existing != task_sha256 => {
@@ -412,12 +426,23 @@ impl CollectionManager {
                 })?;
             }
         }
-        Ok(Some(ReconciledCollection {
-            collection_id,
-            final_url: receipt.final_url,
-            http_status: receipt.http_status,
-            html: receipt.html,
-        }))
+        Ok(Some(receipt))
+    }
+
+    #[cfg(feature = "crawler")]
+    pub(crate) fn reconcile_completed(
+        &self,
+        collection_id: CollectionId,
+        task_sha256: [u8; 32],
+    ) -> Result<Option<ReconciledCollection>, CollectionError> {
+        Ok(self
+            .reconcile_completed_receipt(collection_id, task_sha256)?
+            .map(|receipt| ReconciledCollection {
+                collection_id,
+                final_url: receipt.final_url,
+                http_status: receipt.http_status,
+                html: receipt.html,
+            }))
     }
 
     pub(crate) fn read_trace(

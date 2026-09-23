@@ -12,20 +12,23 @@ use dig2browser::agentic::{
 use dig2browser_protocol::{
     read_worker_request, validate_pipe_suffix, write_worker_response,
     CaptureCompleteness, CollectionRequest, CollectionResponse, CollectionTask,
-    CollectionTaskResult, CrawlRequest, EvidenceCapture, FailureClass, InteractiveElement,
+    CollectionTaskResult, EvidenceCapture, FailureClass, InteractiveElement,
     MonitorRequest, MonitorResponse, ProfileClass, RequestKind, ResolvedRuntimeRecord,
     ResponseStatus, StationStatus, TaskCapturePolicy, TaskReply, TaskStep, WorkerRequest,
     WorkerResponse, MAX_INTERACTIVE_ELEMENTS, PROTOCOL_VERSION,
 };
+#[cfg(feature = "crawler")]
+use dig2browser_protocol::CrawlRequest;
 use dig2browser_trace::LedgerError;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 
+#[cfg(feature = "crawler")]
+use crate::crawl::{CrawlError, CrawlManager};
 use crate::{
     collection::{
         BeginCollection, CaptureReceiptPolicy, CollectionError, CollectionManager,
     },
-    crawl::{CrawlError, CrawlManager},
     live::{LiveCaptureManager, LiveError},
     monitor::{DurableMonitorManager, MonitorError},
     BrowserLease, BrowserStation, BrowserTask, BrowserTaskStep, IdentityRequest,
@@ -188,12 +191,16 @@ pub struct ServerConfig {
     allow_headful_auth: bool,
     allow_session_health: bool,
     trace_root: Option<PathBuf>,
+    #[cfg(feature = "crawler")]
     crawl_root: Option<PathBuf>,
     monitor_root: Option<PathBuf>,
     allow_durable_read: bool,
     allow_durable_write: bool,
+    #[cfg(feature = "crawler")]
     allow_crawl_read: bool,
+    #[cfg(feature = "crawler")]
     allow_crawl_write: bool,
+    #[cfg(feature = "crawler")]
     allow_authenticated_crawl: bool,
     allow_live_events: bool,
     allow_session_import: bool,
@@ -230,12 +237,16 @@ impl ServerConfig {
             allow_headful_auth: false,
             allow_session_health: false,
             trace_root: None,
+            #[cfg(feature = "crawler")]
             crawl_root: None,
             monitor_root: None,
             allow_durable_read: false,
             allow_durable_write: false,
+            #[cfg(feature = "crawler")]
             allow_crawl_read: false,
+            #[cfg(feature = "crawler")]
             allow_crawl_write: false,
+            #[cfg(feature = "crawler")]
             allow_authenticated_crawl: false,
             allow_live_events: false,
             allow_session_import: false,
@@ -303,6 +314,7 @@ impl ServerConfig {
         Ok(self)
     }
 
+    #[cfg(feature = "crawler")]
     pub fn crawl_root(mut self, root: impl Into<PathBuf>) -> Result<Self, ConfigError> {
         let root = root.into();
         if !root.is_absolute() {
@@ -335,11 +347,13 @@ impl ServerConfig {
         self
     }
 
+    #[cfg(feature = "crawler")]
     pub fn allow_crawl_read(mut self, allow: bool) -> Self {
         self.allow_crawl_read = allow;
         self
     }
 
+    #[cfg(feature = "crawler")]
     pub fn allow_crawl_write(mut self, allow: bool) -> Self {
         self.allow_crawl_write = allow;
         self
@@ -347,6 +361,7 @@ impl ServerConfig {
 
     /// Allow a crawl to run under an `Authenticated` profile (session reuse).
     /// Subordinate to the crawl/durable gates; default-deny.
+    #[cfg(feature = "crawler")]
     pub fn allow_authenticated_crawl(mut self, allow: bool) -> Self {
         self.allow_authenticated_crawl = allow;
         self
@@ -437,33 +452,44 @@ async fn run_windows_server(
     let (connection_shutdown, _) = watch::channel(false);
     let (remote_shutdown, mut remote_requests) = mpsc::channel::<()>(1);
     let telemetry = Arc::new(ServerTelemetry::default());
-    let crawl_execution_authorized = config.allow_crawl_write
-        && config.allow_crawl_read
-        && config.allow_durable_write
-        && config.allow_durable_read;
     let collections = config
         .trace_root
         .as_ref()
         .map(|root| CollectionManager::open_deferred(station.clone(), root.clone()))
         .transpose()?;
-    let crawls = match (config.crawl_root.as_ref(), config.trace_root.as_ref(), collections.as_ref()) {
-        (Some(crawl_root), Some(trace_root), Some(collections)) => Some(CrawlManager::open_deferred(
-            station.clone(),
-            collections.clone(),
-            crawl_root.clone(),
-            trace_root,
-            crawl_execution_authorized,
-            crawl_execution_authorized && config.allow_authenticated_crawl,
-        )?),
-        (Some(_), _, _) => return Err(ServerError::CrawlTraceRequired),
-        (None, _, _) => None,
+    #[cfg(feature = "crawler")]
+    let crawls = {
+        let crawl_execution_authorized = config.allow_crawl_write
+            && config.allow_crawl_read
+            && config.allow_durable_write
+            && config.allow_durable_read;
+        let crawls = match (
+            config.crawl_root.as_ref(),
+            config.trace_root.as_ref(),
+            collections.as_ref(),
+        ) {
+            (Some(crawl_root), Some(trace_root), Some(collections)) => {
+                Some(CrawlManager::open_deferred(
+                    station.clone(),
+                    collections.clone(),
+                    crawl_root.clone(),
+                    trace_root,
+                    crawl_execution_authorized,
+                    crawl_execution_authorized && config.allow_authenticated_crawl,
+                )?)
+            }
+            (Some(_), _, _) => return Err(ServerError::CrawlTraceRequired),
+            (None, _, _) => None,
+        };
+        if let Some(crawls) = &crawls {
+            crawls.reconcile_and_recover()?;
+        }
+        crawls
     };
-    if let Some(crawls) = &crawls {
-        crawls.reconcile_and_recover()?;
-    }
     if let Some(collections) = &collections {
         collections.reconcile_successor()?;
     }
+    #[cfg(feature = "crawler")]
     if let Some(crawls) = &crawls {
         crawls.start_runners()?;
     }
@@ -534,6 +560,7 @@ async fn run_windows_server(
                 let context = ConnectionContext {
                     station: station.clone(),
                     collections: collections.clone(),
+                    #[cfg(feature = "crawler")]
                     crawls: crawls.clone(),
                     live: live.clone(),
                     monitor: monitors.clone(),
@@ -549,7 +576,9 @@ async fn run_windows_server(
                         session_health: config.allow_session_health,
                         durable_read: config.allow_durable_read,
                         durable_write: config.allow_durable_write,
+                        #[cfg(feature = "crawler")]
                         crawl_read: config.allow_crawl_read,
+                        #[cfg(feature = "crawler")]
                         crawl_write: config.allow_crawl_write,
                         live_events: config.allow_live_events,
                         session_import: config.allow_session_import,
@@ -598,11 +627,14 @@ async fn run_windows_server(
         connections.abort_all();
         while connections.join_next().await.is_some() {}
     }
-    let crawl_shutdown = match crawls {
-        Some(crawls) => crawls.shutdown(config.drain_timeout).await,
-        None => Ok(false),
-    };
-    drain_timed_out |= crawl_shutdown?;
+    #[cfg(feature = "crawler")]
+    {
+        let crawl_shutdown = match crawls {
+            Some(crawls) => crawls.shutdown(config.drain_timeout).await,
+            None => Ok(false),
+        };
+        drain_timed_out |= crawl_shutdown?;
+    }
     let collection_shutdown = match collections {
         Some(collections) => collections.shutdown(config.drain_timeout).await,
         None => Ok(false),
@@ -631,6 +663,7 @@ async fn run_windows_server(
 struct ConnectionContext {
     station: BrowserStation,
     collections: Option<CollectionManager>,
+    #[cfg(feature = "crawler")]
     crawls: Option<CrawlManager>,
     live: LiveCaptureManager,
     monitor: Option<DurableMonitorManager>,
@@ -649,6 +682,7 @@ async fn serve_connection(
     let ConnectionContext {
         station,
         collections,
+        #[cfg(feature = "crawler")]
         crawls,
         live,
         monitor,
@@ -702,6 +736,7 @@ async fn serve_connection(
                 )
                 .await
             }
+            #[cfg(feature = "crawler")]
             RequestKind::Crawl => {
                 crawl_request(
                     crawls.as_ref(),
@@ -710,6 +745,12 @@ async fn serve_connection(
                 )
                 .await
             }
+            #[cfg(not(feature = "crawler"))]
+            RequestKind::Crawl => WorkerResponse::failure(
+                &request,
+                ResponseStatus::Unsupported,
+                "durable crawler unavailable",
+            ),
             RequestKind::LiveEvents if task_permissions.live_events => {
                 live_request(&live, &request).await
             }
@@ -806,7 +847,9 @@ struct TaskPermissions {
     session_health: bool,
     durable_read: bool,
     durable_write: bool,
+    #[cfg(feature = "crawler")]
     crawl_read: bool,
+    #[cfg(feature = "crawler")]
     crawl_write: bool,
     live_events: bool,
     session_import: bool,
@@ -815,6 +858,7 @@ struct TaskPermissions {
     output_shaping: bool,
 }
 
+#[cfg(feature = "crawler")]
 async fn crawl_request(
     crawls: Option<&CrawlManager>,
     request: &WorkerRequest,
@@ -892,6 +936,7 @@ async fn crawl_request(
     }
 }
 
+#[cfg(feature = "crawler")]
 fn crawl_error_response(request: &WorkerRequest, error: &CrawlError) -> WorkerResponse {
     let (status, message) = match error {
         CrawlError::AuthenticatedProfileUnsupported => {
@@ -2383,6 +2428,7 @@ pub enum ConfigError {
     InvalidDrainTimeout,
     #[error("trace root must be absolute")]
     InvalidTraceRoot,
+    #[cfg(feature = "crawler")]
     #[error("crawl root must be absolute")]
     InvalidCrawlRoot,
 }
@@ -2397,12 +2443,14 @@ pub enum ServerError {
     Frame(#[from] dig2browser_protocol::FrameError),
     #[error(transparent)]
     Collection(#[from] CollectionError),
+    #[cfg(feature = "crawler")]
     #[error(transparent)]
     Crawl(#[from] CrawlError),
     #[error(transparent)]
     Live(#[from] LiveError),
     #[error(transparent)]
     Monitor(#[from] MonitorError),
+    #[cfg(feature = "crawler")]
     #[error("crawl root requires a trace root")]
     CrawlTraceRequired,
     #[error(transparent)]

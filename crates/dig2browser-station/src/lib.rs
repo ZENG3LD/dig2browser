@@ -43,6 +43,7 @@ use route::PreparedRoute;
 
 mod collection;
 pub mod containment;
+#[cfg(feature = "crawler")]
 mod crawl;
 mod egress;
 pub mod ipc;
@@ -60,6 +61,7 @@ pub use dig2browser_core::{
     ResolvedRuntime, RuntimeKind, RuntimeRequirements, RuntimeSelector,
 };
 pub use collection::CollectionError;
+#[cfg(feature = "crawler")]
 pub use crawl::CrawlError;
 pub use egress::{
     EgressError, EgressPeerPolicy, EgressPeerPolicyError, EgressProxy,

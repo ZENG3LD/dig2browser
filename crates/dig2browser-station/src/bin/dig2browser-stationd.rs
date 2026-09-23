@@ -43,9 +43,11 @@ use dig2browser_station::windows_wfp_broker::{
     BrokerBrowser, WindowsWfpBrokerCapability, WindowsWfpBrokerError,
     WindowsWfpBrokerRejectCode, WindowsWfpLeaseLoss,
 };
+#[cfg(all(windows, feature = "crawler"))]
+use dig2browser_station::CrawlError;
 #[cfg(windows)]
 use dig2browser_station::{
-    BrowserStation, CollectionError, ConfigError as StationConfigError, CrawlError, EgressError,
+    BrowserStation, CollectionError, ConfigError as StationConfigError, EgressError,
     EgressPeerPolicy, EgressPeerPolicyError, EgressProxy, EgressReport,
     EgressRouteError, ProfilesRootError, ProfilesRootOwnership, RouteDescriptor,
     RouteRegistry, RouteRegistryError, RuntimeKind, RuntimeSelector, StationConfig,
@@ -104,6 +106,7 @@ struct Cli {
     profiles_root: PathBuf,
     #[arg(long)]
     trace_root: Option<PathBuf>,
+    #[cfg(feature = "crawler")]
     #[arg(
         long,
         help = "Own this durable crawl root and resume unfinished crawl jobs"
@@ -212,10 +215,13 @@ struct Cli {
     allow_durable_read: bool,
     #[arg(long, default_value_t = false)]
     allow_durable_write: bool,
+    #[cfg(feature = "crawler")]
     #[arg(long, default_value_t = false)]
     allow_crawl_read: bool,
+    #[cfg(feature = "crawler")]
     #[arg(long, default_value_t = false)]
     allow_crawl_write: bool,
+    #[cfg(feature = "crawler")]
     #[arg(
         long,
         default_value_t = false,
@@ -535,17 +541,22 @@ async fn run(cli: Cli) -> Result<DaemonReport, DaemonError> {
         .allow_session_health(cli.allow_session_health)
         .allow_durable_read(cli.allow_durable_read)
         .allow_durable_write(cli.allow_durable_write)
-        .allow_crawl_read(cli.allow_crawl_read)
-        .allow_crawl_write(cli.allow_crawl_write)
-        .allow_authenticated_crawl(cli.allow_authenticated_crawl)
         .allow_live_events(cli.allow_live_events)
         .allow_session_import(cli.allow_session_import)
         .allow_file_upload(cli.allow_file_upload)
         .allow_downloads(cli.allow_downloads)
         .allow_output_shaping(cli.allow_output_shaping);
+        #[cfg(feature = "crawler")]
+        {
+            server_config = server_config
+                .allow_crawl_read(cli.allow_crawl_read)
+                .allow_crawl_write(cli.allow_crawl_write)
+                .allow_authenticated_crawl(cli.allow_authenticated_crawl);
+        }
         if let Some(trace_root) = cli.trace_root {
             server_config = server_config.trace_root(trace_root)?;
         }
+        #[cfg(feature = "crawler")]
         if let Some(crawl_root) = cli.crawl_root {
             server_config = server_config.crawl_root(crawl_root)?;
         }
@@ -1064,6 +1075,7 @@ impl DaemonError {
             Self::Server(ServerError::UnsupportedPlatform) => "unsupported_platform",
             Self::Server(ServerError::Io(_)) => "station_endpoint_unavailable",
             Self::Server(ServerError::Frame(_)) => "station_protocol_failure",
+            #[cfg(feature = "crawler")]
             Self::Server(ServerError::CrawlTraceRequired) => "invalid_config",
             Self::Server(ServerError::Collection(
                 CollectionError::Ledger(dig2browser_trace::LedgerError::WriterLocked),
@@ -1084,10 +1096,13 @@ impl DaemonError {
                 ),
             )) => "trace_corrupt",
             Self::Server(ServerError::Collection(_)) => "trace_root_unavailable",
+            #[cfg(feature = "crawler")]
             Self::Server(ServerError::Crawl(CrawlError::RootLocked)) => "crawl_root_owned",
+            #[cfg(feature = "crawler")]
             Self::Server(ServerError::Crawl(
                 CrawlError::RootNotAbsolute | CrawlError::RootOverlap,
             )) => "invalid_config",
+            #[cfg(feature = "crawler")]
             Self::Server(ServerError::Crawl(
                 CrawlError::InvalidJournalName
                 | CrawlError::InvalidBinding
@@ -1104,6 +1119,7 @@ impl DaemonError {
                 | CrawlError::Spec(_)
                 | CrawlError::CanonicalUrl(_),
             )) => "crawl_corrupt",
+            #[cfg(feature = "crawler")]
             Self::Server(ServerError::Crawl(_)) => "crawl_root_unavailable",
             // `ServerError::Live` can only arise from the live-capture
             // manager's shutdown-time lease drain, not a boot-time
