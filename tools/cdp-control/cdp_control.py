@@ -20,6 +20,12 @@ Usage:
   python cdp_control.py --tab prod perf 60 --interval 1 --json out.jsonl
   python cdp_control.py --tab dev hud on
   python cdp_control.py --activate --tab dev click 100 200
+  python cdp_control.py --port 9223 open http://127.0.0.1:17611/index.html
+  python cdp_control.py --port 9223 --id 5A1C2F3E close
+
+Two browsers only, both already running: :9222 (signed in as admin) and
+:9223 (signed out). `open` adds a tab to the running window; never launch
+a browser, never create a browser context (it opens a separate window).
 """
 from __future__ import annotations
 
@@ -73,6 +79,19 @@ def pick_tab(port: int, *, prefix: str | None, tab_id: str | None):
             raise SystemExit(f"no page starting with {prefix!r} on :{port}")
         return hits[0]
     raise SystemExit("need --tab / --prefix / --id")
+
+
+def open_tab(port: int, url: str):
+    """Open `url` as a new TAB in the already-running browser (its current
+    window) — never a new window, browser context or browser process."""
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/json/new?{url}", method="PUT")
+    return json.load(urllib.request.urlopen(req, timeout=10))
+
+
+def close_tab(port: int, target_id: str):
+    urllib.request.urlopen(
+        f"http://127.0.0.1:{port}/json/close/{target_id}", timeout=5).read()
 
 
 def activate_tab(port: int, target_id: str):
@@ -433,8 +452,19 @@ def main():
     if ns.cmd == "tabs":
         list_tabs(ns.port)
         return
+    if ns.cmd == "open":
+        if not ns.args:
+            raise SystemExit("open: expected a URL")
+        t = open_tab(ns.port, ns.args[0])
+        print(f"{t['id'][:8]}  {t.get('url', '')}")
+        return
 
     prefix = ns.prefix or TAB_ALIASES.get(ns.tab or "")
+    if ns.cmd == "close":
+        tab = pick_tab(ns.port, prefix=prefix, tab_id=ns.tab_id)
+        close_tab(ns.port, tab["id"])
+        print("closed", tab["id"][:8], tab.get("url", ""))
+        return
     tab = pick_tab(ns.port, prefix=prefix, tab_id=ns.tab_id)
     print(f"tab: {tab['url']}", file=sys.stderr)
     if ns.activate:
