@@ -6,6 +6,7 @@ pub mod stealth;
 pub mod cookies;
 pub mod detect;
 pub mod browser;
+pub mod browser_stream;
 pub mod wasmtest;
 pub mod identity;
 pub mod agentic;

@@ -49,6 +49,10 @@ name = "dig2crawl"
 path = "src/bin/dig2crawl.rs"
 required-features = ["crawler"]
 
+[[bin]]
+name = "dig2-stream-node"
+path = "src/bin/dig2_stream_node.rs"
+
 [lib]
 name = "dig2browser"
 path = "src/lib.rs"
