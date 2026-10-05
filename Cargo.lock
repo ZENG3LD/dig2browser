@@ -1313,7 +1313,7 @@ dependencies = [
 
 [[package]]
 name = "dig2browser"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1355,7 +1355,7 @@ dependencies = [
 
 [[package]]
 name = "dig2browser-client"
-version = "0.1.0"
+version = "0.5.2"
 dependencies = [
  "dig2browser-core",
  "dig2browser-protocol",
@@ -1366,11 +1366,11 @@ dependencies = [
 
 [[package]]
 name = "dig2browser-core"
-version = "0.1.0"
+version = "0.5.2"
 
 [[package]]
 name = "dig2browser-crawler"
-version = "0.1.1"
+version = "0.5.2"
 dependencies = [
  "ahash",
  "chrono",
@@ -1389,7 +1389,7 @@ dependencies = [
 
 [[package]]
 name = "dig2browser-probe"
-version = "0.1.0"
+version = "0.5.2"
 dependencies = [
  "dig2browser-core",
  "dig2browser-protocol",
@@ -1400,7 +1400,7 @@ dependencies = [
 
 [[package]]
 name = "dig2browser-protocol"
-version = "0.3.0"
+version = "0.5.2"
 dependencies = [
  "dig2browser-core",
  "tokio",
@@ -1408,7 +1408,7 @@ dependencies = [
 
 [[package]]
 name = "dig2browser-runtime-lightweight"
-version = "0.1.0"
+version = "0.5.2"
 dependencies = [
  "dig2browser",
  "dig2browser-core",
@@ -1421,7 +1421,7 @@ dependencies = [
 
 [[package]]
 name = "dig2browser-shape"
-version = "0.1.0"
+version = "0.5.2"
 dependencies = [
  "dig2browser-protocol",
  "regex",
@@ -1431,7 +1431,7 @@ dependencies = [
 
 [[package]]
 name = "dig2browser-station"
-version = "0.1.0"
+version = "0.5.2"
 dependencies = [
  "base64",
  "clap",
@@ -1456,7 +1456,7 @@ dependencies = [
 
 [[package]]
 name = "dig2browser-trace"
-version = "0.1.0"
+version = "0.5.2"
 dependencies = [
  "dig2browser-core",
  "dig2browser-protocol",

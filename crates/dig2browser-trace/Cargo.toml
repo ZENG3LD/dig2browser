@@ -1,6 +1,6 @@
 [package]
 name = "dig2browser-trace"
-version = "0.1.0"
+version = "0.5.2"
 edition = "2021"
 license = "MIT"
 description = "Crash-safe trace and artifact ledger for dig2browser collections"

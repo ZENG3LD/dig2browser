@@ -1,6 +1,6 @@
 [package]
 name = "dig2browser-runtime-lightweight"
-version = "0.1.0"
+version = "0.5.2"
 edition = "2021"
 license = "MIT"
 description = "Bounded static-document runtime for dig2browser"
