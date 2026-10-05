@@ -239,18 +239,28 @@ fn firefox_proxy_user_js(socks: SocketAddr) -> String {
          user_pref(\"network.predictor.enabled\", false);\n\
          user_pref(\"browser.safebrowsing.malware.enabled\", false);\n\
          user_pref(\"browser.safebrowsing.phishing.enabled\", false);\n\
-         user_pref(\"browser.safebrowsing.downloads.enabled\", false);\n",
+         user_pref(\"browser.safebrowsing.downloads.enabled\", false);\n\
+         user_pref(\"devtools.debugger.remote-enabled\", true);\n\
+         user_pref(\"devtools.debugger.prompt-connection\", false);\n\
+         user_pref(\"remote.active-protocols\", 1);\n",
         ip = socks.ip(),
         port = socks.port(),
     )
 }
 
-fn firefox_launch_args(profile_dir: &Path, url: Option<&str>) -> Vec<String> {
+fn firefox_launch_args(
+    profile_dir: &Path,
+    url: Option<&str>,
+    debugger_port: Option<u16>,
+) -> Vec<String> {
     let mut args = vec![
         "-no-remote".to_owned(),
         "-profile".to_owned(),
         profile_dir.display().to_string(),
     ];
+    if let Some(port) = debugger_port {
+        args.push(format!("--remote-debugging-port={port}"));
+    }
     if let Some(url) = url {
         args.push(url.to_owned());
     }
@@ -1084,6 +1094,126 @@ async fn install_onion_random_uuid(port: u16) -> Result<(), String> {
     Ok(())
 }
 
+const FIREFOX_ONION_RANDOM_UUID_FN: &str = r#"() => {
+  var c = globalThis.crypto;
+  if (!c || typeof c.randomUUID === "function") return;
+  c.randomUUID = function() {
+    var bytes = new Uint8Array(16);
+    c.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 15) | 64;
+    bytes[8] = (bytes[8] & 63) | 128;
+    var hex = "";
+    for (var i = 0; i < 16; i++) hex += bytes[i].toString(16).padStart(2, "0");
+    return hex.slice(0,8)+"-"+hex.slice(8,12)+"-"+hex.slice(12,16)+"-"+hex.slice(16,20)+"-"+hex.slice(20);
+  };
+}"#;
+
+async fn firefox_bidi(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    id: u64,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    use futures::{SinkExt, StreamExt};
+    let message = serde_json::json!({ "id": id, "method": method, "params": params });
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(message.to_string().into()))
+        .await
+        .map_err(|error| error.to_string())?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(format!("{method} timed out"));
+        }
+        let next = tokio::time::timeout(remaining, ws.next())
+            .await
+            .map_err(|_| format!("{method} timed out"))?
+            .ok_or_else(|| "firefox debugger closed".to_owned())?
+            .map_err(|error| error.to_string())?;
+        let text = match next {
+            tokio_tungstenite::tungstenite::Message::Text(text) => text.to_string(),
+            _ => continue,
+        };
+        let value: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if value.get("id").and_then(|item| item.as_u64()) != Some(id) {
+            continue;
+        }
+        if value.get("type").and_then(|item| item.as_str()) == Some("error") {
+            return Err(format!(
+                "{method} {}",
+                value.get("message").and_then(|item| item.as_str()).unwrap_or(&text)
+            ));
+        }
+        return Ok(value);
+    }
+}
+
+/// Firefox has no CDP. The same randomUUID shim goes in through WebDriver BiDi
+/// and the socket stays open so the preload survives the reload.
+async fn install_firefox_random_uuid(port: u16) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let (mut ws, _) = loop {
+        if std::time::Instant::now() >= deadline {
+            return Err("firefox debugger did not answer".into());
+        }
+        match tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/session")).await {
+            Ok(pair) => break pair,
+            Err(error) => {
+                eprintln!("[dev-launch-debug] firefox debugger wait: {error}");
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        }
+    };
+    firefox_bidi(
+        &mut ws,
+        1,
+        "session.new",
+        serde_json::json!({
+            "capabilities": { "alwaysMatch": { "webSocketUrl": true } }
+        }),
+    )
+    .await?;
+    firefox_bidi(
+        &mut ws,
+        2,
+        "script.addPreloadScript",
+        serde_json::json!({
+            "functionDeclaration": FIREFOX_ONION_RANDOM_UUID_FN
+        }),
+    )
+    .await?;
+    let tree = firefox_bidi(
+        &mut ws,
+        3,
+        "browsingContext.getTree",
+        serde_json::json!({}),
+    )
+    .await?;
+    if let Some(context) = tree
+        .pointer("/result/contexts/0/context")
+        .and_then(|value| value.as_str())
+    {
+        // Firefox 157 rejects ignoreCache on this command.
+        if let Err(error) = firefox_bidi(
+            &mut ws,
+            4,
+            "browsingContext.reload",
+            serde_json::json!({ "context": context }),
+        )
+        .await
+        {
+            eprintln!("[dev-launch-debug] firefox shim reload failed: {error}");
+        }
+    }
+    hold_debugger_socket(ws);
+    Ok(())
+}
+
 async fn wait_for_child(mut child: tokio::process::Child) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[dev-launch-debug] Ctrl-C to quit and kill the browser");
     tokio::select! {
@@ -1108,6 +1238,7 @@ async fn wait_for_child(mut child: tokio::process::Child) -> Result<(), Box<dyn 
 async fn run_firefox(
     browser: &Path,
     profile_dir: &Path,
+    port: u16,
     url: Option<&str>,
     tor_socks: Option<SocketAddr>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1117,7 +1248,8 @@ async fn run_firefox(
             .map_err(|error| format!("firefox user.js: {error}"))?;
         eprintln!("[dev-launch-debug] firefox proxy user.js written");
     }
-    let args = firefox_launch_args(profile_dir, url);
+    let debugger = tor_socks.is_some() && url.is_some_and(http_onion_page);
+    let args = firefox_launch_args(profile_dir, url, debugger.then_some(port));
     let child = tokio::process::Command::new(browser)
         .args(&args)
         .stderr(std::process::Stdio::null())
@@ -1130,6 +1262,14 @@ async fn run_firefox(
         "[dev-launch-debug] browser spawned (pid {:?})",
         child.id()
     );
+    if debugger {
+        match install_firefox_random_uuid(port).await {
+            Ok(()) => eprintln!("[dev-launch-debug] firefox onion randomUUID shim installed"),
+            Err(error) => {
+                eprintln!("[dev-launch-debug] firefox onion randomUUID shim failed: {error}")
+            }
+        }
+    }
     eprintln!("[dev-launch-debug] ready — firefox");
     wait_for_child(child).await
 }
@@ -1143,7 +1283,7 @@ async fn run_browser(
     tor_socks: Option<SocketAddr>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if kind == BrowserKind::Firefox {
-        return run_firefox(browser, profile_dir, url, tor_socks).await;
+        return run_firefox(browser, profile_dir, port, url, tor_socks).await;
     }
     let args = debug_launch_args(port, profile_dir, url, tor_socks);
 
@@ -1293,13 +1433,21 @@ mod tests {
         assert!(prefs.contains("network.dns.blockDotOnion\", false"));
         assert!(prefs.contains("dom.security.https_first\", false"));
         assert!(prefs.contains("dom.security.https_only_mode\", false"));
+        assert!(prefs.contains("remote.active-protocols\", 1"));
         assert!(!prefs.contains(".onion"));
         assert!(!prefs.contains("host-resolver"));
-        let args = firefox_launch_args(Path::new("profile"), Some("http://example.onion/"));
+        let args = firefox_launch_args(Path::new("profile"), Some("http://example.onion/"), None);
         assert_eq!(args[0], "-no-remote");
         assert_eq!(args[1], "-profile");
         assert_eq!(args[2], "profile");
         assert_eq!(args[3], "http://example.onion/");
+        let debug = firefox_launch_args(
+            Path::new("profile"),
+            Some("http://example.onion/"),
+            Some(9338),
+        );
+        assert_eq!(debug[3], "--remote-debugging-port=9338");
+        assert_eq!(debug[4], "http://example.onion/");
         assert!(args.iter().all(|argument| {
             !argument.contains("socks5://")
                 && !argument.starts_with("--proxy-")
