@@ -1,6 +1,6 @@
 [package]
 name = "dig2browser-crawler"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 description = "Durable domain-neutral crawl scheduling core for dig2browser station"

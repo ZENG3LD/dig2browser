@@ -552,9 +552,8 @@ mod embedded_tor {
     fn init_tor_tracing() {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
-            let filter = tracing_subscriber::EnvFilter::new(
-                "warn,tor_dirmgr=info,tor_dirclient=info,tor_circmgr=info,tor_hsclient=info",
-            );
+            let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
             // stderr is block-buffered when this process is launched with a
             // redirected handle. Flush each record so a killed bootstrap
             // still leaves the directory error on disk.
