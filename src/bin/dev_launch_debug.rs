@@ -220,6 +220,12 @@ fn http_onion_page(url: &str) -> bool {
 /// upgraded to a port the hidden service does not publish. Background
 /// clearnet (safe browsing, captive portal, prefetch) stays off so it does
 /// not fill the one Tor client before the page loads.
+///
+/// Every origin shares this one SOCKS endpoint. A second socket at 250ms
+/// (`connection-retry-timeout`) and speculative connects are off. The
+/// connection pool stays at Firefox's own default: a hard cap of a handful
+/// of sockets pins the long-lived kline websockets and a click cannot
+/// open the next one.
 fn firefox_proxy_user_js(socks: SocketAddr) -> String {
     format!(
         "user_pref(\"network.proxy.type\", 1);\n\
@@ -233,6 +239,9 @@ fn firefox_proxy_user_js(socks: SocketAddr) -> String {
          user_pref(\"dom.security.https_first\", false);\n\
          user_pref(\"dom.security.https_first_pbm\", false);\n\
          user_pref(\"network.http.http3.enable\", false);\n\
+         user_pref(\"network.dns.echconfig.enabled\", false);\n\
+         user_pref(\"network.http.connection-retry-timeout\", 0);\n\
+         user_pref(\"network.http.speculative-parallel-limit\", 0);\n\
          user_pref(\"network.captive-portal-service.enabled\", false);\n\
          user_pref(\"network.connectivity-service.enabled\", false);\n\
          user_pref(\"network.prefetch-next\", false);\n\
@@ -671,6 +680,9 @@ mod embedded_tor {
         mut local: TcpStream,
         client: Arc<TorClient<PreferredRuntime>>,
     ) -> Result<(), String> {
+        // A 10-byte SOCKS reply sits behind Nagle. Firefox aborts the
+        // socket before that packet goes out; Chromium waits.
+        let _ = local.set_nodelay(true);
         read_greeting(&mut local).await?;
         let target = match read_connect(&mut local).await {
             Ok(target) => target,
@@ -1096,16 +1108,17 @@ async fn install_onion_random_uuid(port: u16) -> Result<(), String> {
 
 const FIREFOX_ONION_RANDOM_UUID_FN: &str = r#"() => {
   var c = globalThis.crypto;
-  if (!c || typeof c.randomUUID === "function") return;
-  c.randomUUID = function() {
-    var bytes = new Uint8Array(16);
-    c.getRandomValues(bytes);
-    bytes[6] = (bytes[6] & 15) | 64;
-    bytes[8] = (bytes[8] & 63) | 128;
-    var hex = "";
-    for (var i = 0; i < 16; i++) hex += bytes[i].toString(16).padStart(2, "0");
-    return hex.slice(0,8)+"-"+hex.slice(8,12)+"-"+hex.slice(12,16)+"-"+hex.slice(16,20)+"-"+hex.slice(20);
-  };
+  if (c && typeof c.randomUUID !== "function") {
+    c.randomUUID = function() {
+      var bytes = new Uint8Array(16);
+      c.getRandomValues(bytes);
+      bytes[6] = (bytes[6] & 15) | 64;
+      bytes[8] = (bytes[8] & 63) | 128;
+      var hex = "";
+      for (var i = 0; i < 16; i++) hex += bytes[i].toString(16).padStart(2, "0");
+      return hex.slice(0,8)+"-"+hex.slice(8,12)+"-"+hex.slice(12,16)+"-"+hex.slice(16,20)+"-"+hex.slice(20);
+    };
+  }
 }"#;
 
 async fn firefox_bidi(
@@ -1428,12 +1441,19 @@ mod tests {
         let socks: SocketAddr = "127.0.0.1:19050".parse().unwrap();
         let prefs = firefox_proxy_user_js(socks);
         assert!(prefs.contains("network.proxy.socks_remote_dns\", true"));
+        assert!(!prefs.contains("network.dns.disabled"));
         assert!(prefs.contains("network.proxy.socks_port\", 19050"));
         assert!(prefs.contains("network.trr.mode\", 5"));
         assert!(prefs.contains("network.dns.blockDotOnion\", false"));
         assert!(prefs.contains("dom.security.https_first\", false"));
         assert!(prefs.contains("dom.security.https_only_mode\", false"));
         assert!(prefs.contains("remote.active-protocols\", 1"));
+        assert!(prefs.contains("network.dns.echconfig.enabled\", false"));
+        assert!(!prefs.contains("network.http.max-connections"));
+        assert!(!prefs.contains("network.http.max-persistent-connections-per-proxy"));
+        assert!(prefs.contains("network.http.connection-retry-timeout\", 0"));
+        assert!(prefs.contains("network.http.speculative-parallel-limit\", 0"));
+        assert!(!prefs.contains("network.http.http2.enabled"));
         assert!(!prefs.contains(".onion"));
         assert!(!prefs.contains("host-resolver"));
         let args = firefox_launch_args(Path::new("profile"), Some("http://example.onion/"), None);
