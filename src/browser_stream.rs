@@ -770,28 +770,40 @@ pub fn frame_timing_header(capture_ns: u64) -> [u8; 12] {
     out
 }
 
-/// CLOCK_MONOTONIC nanoseconds. Same clock in every netns on this box.
+/// Monotonic nanoseconds. On Unix this is `CLOCK_MONOTONIC`. Windows has
+/// no `clock_gettime`; a process-local `Instant` is the same kind of clock
+/// for frame deltas. C2 forwards the bytes and does not interpret them.
 pub fn mono_ns() -> u64 {
-    #[repr(C)]
-    struct Timespec {
-        tv_sec: i64,
-        tv_nsec: i64,
+    #[cfg(unix)]
+    {
+        #[repr(C)]
+        struct Timespec {
+            tv_sec: i64,
+            tv_nsec: i64,
+        }
+        extern "C" {
+            fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
+        }
+        const CLOCK_MONOTONIC: i32 = 1;
+        let mut ts = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let rc = unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) };
+        if rc != 0 {
+            return 0;
+        }
+        return (ts.tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(ts.tv_nsec as u64);
     }
-    extern "C" {
-        fn clock_gettime(clk_id: i32, tp: *mut Timespec) -> i32;
+    #[cfg(not(unix))]
+    {
+        use std::sync::OnceLock;
+        static BASE: OnceLock<std::time::Instant> = OnceLock::new();
+        let base = BASE.get_or_init(std::time::Instant::now);
+        u64::try_from(base.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
-    const CLOCK_MONOTONIC: i32 = 1;
-    let mut ts = Timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    let rc = unsafe { clock_gettime(CLOCK_MONOTONIC, &mut ts) };
-    if rc != 0 {
-        return 0;
-    }
-    (ts.tv_sec as u64)
-        .saturating_mul(1_000_000_000)
-        .saturating_add(ts.tv_nsec as u64)
 }
 
 fn append_clock(path: &std::path::Path, line: &str) {
