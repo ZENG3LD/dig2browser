@@ -1,6 +1,6 @@
 [package]
 name = "dig2browser"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 license = "MIT"
 description = "Stealth browser automation with Web Bot Auth — CDP, WebDriver, BiDi backends"
@@ -117,7 +117,7 @@ zip = "2"
 # crawler feature only (all optional)
 anyhow = { version = "1", optional = true }
 chrono = { version = "0.4", features = ["serde"], optional = true }
-dig2browser-crawler = { path = "crates/dig2browser-crawler", version = "0.5.2", optional = true }
+dig2browser-crawler = { path = "crates/dig2browser-crawler", version = "0.5.3", optional = true }
 gate4agent = { version = "0.4", optional = true }
 regex = { version = "1", optional = true }
 scraper = { version = "=0.27.0", default-features = false, features = ["atomic"], optional = true }

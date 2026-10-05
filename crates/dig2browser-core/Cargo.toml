@@ -1,9 +1,10 @@
 [package]
 name = "dig2browser-core"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 license = "MIT"
 description = "Runtime capability truth and negotiation for dig2browser"
+repository = "https://github.com/ZENG3LD/dig2browser"
 
 [lib]
 name = "dig2browser_core"

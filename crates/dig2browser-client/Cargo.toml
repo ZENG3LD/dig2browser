@@ -1,19 +1,20 @@
 [package]
 name = "dig2browser-client"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 license = "MIT"
 description = "Versioned local IPC client for dig2browser-station"
+repository = "https://github.com/ZENG3LD/dig2browser"
 
 [lib]
 name = "dig2browser_client"
 path = "src/lib.rs"
 
 [dependencies]
-dig2browser-protocol = { path = "../dig2browser-protocol" }
+dig2browser-protocol = { path = "../dig2browser-protocol", version = "0.5.3" }
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-dig2browser-core = { path = "../dig2browser-core" }
+dig2browser-core = { path = "../dig2browser-core", version = "0.5.3" }

@@ -156,7 +156,7 @@ runner = "dig2-wasm-test"
 
 Команда:
 ```bash
-cd c:/Users/VA PC/CODING/ML_TRADING/nemo/digdigdig3
+cd digdigdig3
 cargo test --target wasm32-unknown-unknown -p digdigdig3 --test wasm_smoke
 ```
 

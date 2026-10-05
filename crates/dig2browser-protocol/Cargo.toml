@@ -1,16 +1,17 @@
 [package]
 name = "dig2browser-protocol"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 license = "MIT"
 description = "Lightweight versioned IPC contract for dig2browser services"
+repository = "https://github.com/ZENG3LD/dig2browser"
 
 [lib]
 name = "dig2browser_protocol"
 path = "src/lib.rs"
 
 [dependencies]
-dig2browser-core = { path = "../dig2browser-core" }
+dig2browser-core = { path = "../dig2browser-core", version = "0.5.3" }
 tokio = { version = "1", features = ["io-util"] }
 
 [dev-dependencies]

@@ -24,6 +24,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from urllib.parse import urlparse
@@ -33,7 +34,7 @@ ONION_RE = re.compile(r"[a-z2-7]{16,56}\.onion", re.I)
 CDP_CONTROL = os.path.normpath(os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "cdp-control", "cdp_control.py"
 ))
-DEFAULT_OUT = os.environ.get("TOR_CDP_OUT") or r"E:\d2b-arti-tmp\tor-cdp"
+DEFAULT_OUT = os.environ.get("TOR_CDP_OUT") or os.path.join(tempfile.gettempdir(), "tor-cdp")
 
 STATUS_JS = r"""(() => {
   const clip = (value) => String(value == null ? "" : value)
@@ -312,14 +313,16 @@ def cmd_trace(ws, reload, wait, kinds):
         say(line)
 
 
-EXE = os.environ.get("TOR_CDP_EXE") or r"E:\d2b-arti-target\debug\dev-launch-debug.exe"
-MIRRORS = os.environ.get("TOR_CDP_MIRRORS") or r"C:\Users\VA PC\CODING\ML_TRADING\nemo\env\mlc-edges\tor\mirrors.txt"
+EXE = os.environ.get("TOR_CDP_EXE") or ""
+MIRRORS = os.environ.get("TOR_CDP_MIRRORS") or ""
 LOG_PATH = os.path.join(DEFAULT_OUT, "launcher.log")
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 CREATE_NEW_CONSOLE = 0x00000010
 
 
 def onion_url():
+    if not MIRRORS:
+        raise SystemExit("set TOR_CDP_MIRRORS")
     host = ""
     with open(MIRRORS, encoding="utf-8") as handle:
         for raw in handle:
@@ -384,10 +387,10 @@ def start_spare(browser):
             pid, port = existing[0]
             say("already up pid=%s port=%s" % (pid, port))
             return None, None, port, LOG_PATH
-    if not os.path.isfile(EXE):
-        raise SystemExit("tor launcher binary is missing")
+    if not EXE or not os.path.isfile(EXE):
+        raise SystemExit("set TOR_CDP_EXE to the dev-launch-debug binary")
     port = spare_port()
-    profile = os.path.join(os.environ.get("TEMP") or r"C:\Users\VAPC~1\AppData\Local\Temp", "dig2browser-debug-%s" % port)
+    profile = os.path.join(tempfile.gettempdir(), "dig2browser-debug-%s" % port)
     os.makedirs(DEFAULT_OUT, exist_ok=True)
     log_path = LOG_PATH if browser == "chrome" else os.path.join(DEFAULT_OUT, "launcher-%s.log" % browser)
     log = open(log_path, "w", encoding="utf-8", errors="replace")
