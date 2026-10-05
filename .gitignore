@@ -13,3 +13,6 @@ keys/
 CLAUDE.md
 AGENTS.md
 __pycache__/
+
+# Operator-supplied Tor binary. The build does not download it.
+third_party/tor/

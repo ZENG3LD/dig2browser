@@ -1,0 +1,21 @@
+[workspace]
+
+[package]
+name = "saturating-time"
+version = "0.5.0"
+authors = ["The Tor Project, Inc.", "Clara Engler <cve@torproject.org>"]
+edition = "2024"
+rust-version = "1.92"
+description = "A trait for limits and saturations on types inside std::time"
+license = "MIT OR Apache-2.0"
+repository = "https://gitlab.torproject.org/tpo/core/arti.git"
+
+[lib]
+name = "saturating_time"
+path = "src/lib.rs"
+
+[features]
+full = ["web-time-compat/full"]
+
+[dependencies]
+web-time-compat = "0.3.0"

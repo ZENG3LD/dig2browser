@@ -80,6 +80,10 @@ crawler = [
     "reqwest/brotli",
     "reqwest/deflate",
 ]
+# Opt-in embedded Tor client for dev-launch-debug. Off by default so the
+# library and a launcher built without this feature stay free of Arti.
+# Rebuild that one binary with `--features tor` to accept `--tor`.
+tor = ["dep:arti-client", "dep:rustls", "dep:tor-rtcompat", "dep:tracing-subscriber"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -92,7 +96,10 @@ thiserror = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
-rusqlite = { version = "0.32", features = ["bundled"] }
+# Exact 0.36.0 so this crate and arti-client share one libsqlite3-sys.
+# Cargo allows only one package with links = "sqlite3". 0.32 pulls 0.30;
+# arti's rusqlite 0.37+ pulls a newer one. 0.36.0 is the overlap.
+rusqlite = { version = "=0.36.0", features = ["bundled"] }
 web-bot-auth = "0.6.1"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 sha2 = "0.10"
@@ -117,6 +124,29 @@ scraper = { version = "=0.27.0", default-features = false, features = ["atomic"]
 toml = { version = "0.8", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
+# tor feature only. Exact pin. No OpenSSL, no bridges, no onion service, no PoW.
+# static-sqlite bundles SQLite the same way this crate already bundles rusqlite,
+# so the launcher does not link a system sqlite3. rustls is a direct dependency
+# only so this process can install the ring CryptoProvider Arti 0.47 requires
+# before it builds a TLS runtime; default features stay off so aws-lc is not pulled.
+arti-client = { version = "=0.47.0", optional = true, default-features = false, features = [
+    "tokio",
+    "rustls",
+    "onion-service-client",
+    "static-sqlite",
+] }
+rustls = { version = "=0.23.21", optional = true, default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
+# Same release as arti-client. Only so the launcher can name PreferredRuntime;
+# arti-client does not re-export it. Features match the client (tokio + rustls).
+tor-rtcompat = { version = "=0.47.0", optional = true, default-features = false, features = [
+    "tokio",
+    "rustls",
+] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Security_Cryptography",
@@ -135,3 +165,10 @@ windows = { version = "0.58", features = [
     "Win32_System_Threading",
     "Win32_UI_Shell",
 ] }
+
+# saturating-time 0.5.0 livelocks on Windows while computing SystemTime::max_value:
+# FILETIME is 100ns, so a 51ns step makes checked_add return Some(self) and the
+# search never finishes. Arti calls that during directory bootstrap. This patch
+# is the published 0.5.0 crate plus that one loop fix.
+[patch.crates-io]
+saturating-time = { path = "patches/saturating-time" }

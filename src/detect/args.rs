@@ -160,17 +160,7 @@ impl LaunchConfig {
         // Typed route selection is station-owned and intentionally follows
         // caller-provided flags so consumer args cannot replace it by order.
         if let Some(browser_proxy) = self.browser_proxy {
-            match browser_proxy {
-                BrowserProxy::Direct => args.push("--no-proxy-server".into()),
-                BrowserProxy::Http(endpoint) => {
-                    args.push(format!("--proxy-server=http://{endpoint}"));
-                    add_proxied_runtime_args(&mut args);
-                }
-                BrowserProxy::Socks5(endpoint) => {
-                    args.push(format!("--proxy-server=socks5://{endpoint}"));
-                    add_proxied_runtime_args(&mut args);
-                }
-            }
+            browser_proxy.append_launch_args(&mut args);
         }
 
         // Keep protected arguments last as a second line of defence against
@@ -219,6 +209,26 @@ impl LaunchConfig {
             .and_then(|listener| listener.local_addr())
             .map(|addr| addr.port())
             .unwrap_or(9222) // fallback
+    }
+}
+
+impl BrowserProxy {
+    /// Append the Chromium arguments for this one proxy setting.
+    ///
+    /// HTTP, SOCKS5, and direct all render here. Callers do not format a
+    /// second `--proxy-server` value.
+    pub fn append_launch_args(self, args: &mut Vec<String>) {
+        match self {
+            BrowserProxy::Direct => args.push("--no-proxy-server".into()),
+            BrowserProxy::Http(endpoint) => {
+                args.push(format!("--proxy-server=http://{endpoint}"));
+                add_proxied_runtime_args(args);
+            }
+            BrowserProxy::Socks5(endpoint) => {
+                args.push(format!("--proxy-server=socks5://{endpoint}"));
+                add_proxied_runtime_args(args);
+            }
+        }
     }
 }
 
