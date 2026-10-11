@@ -1313,7 +1313,7 @@ dependencies = [
 
 [[package]]
 name = "dig2browser"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "aes-gcm",
  "anyhow",
