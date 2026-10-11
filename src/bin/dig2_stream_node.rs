@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use dig2browser::browser_stream::{run_login_node, run_node, LoginNodeOptions, NodeOptions};
+use dig2browser::browser_stream::{run_browse_node, run_login_node, run_node, BrowseNodeOptions, LoginNodeOptions, NodeOptions};
 
 #[tokio::main]
 async fn main() {
@@ -20,6 +20,7 @@ async fn main() {
     let mut clock = None;
     let mut targets = None;
     let mut ready_file = None;
+    let mut browse: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -33,6 +34,7 @@ async fn main() {
                     .unwrap_or_else(|_| fail("--click-wait-secs is not an integer"));
             }
             "--login" => login = true,
+            "--browse" => browse = Some(need(&arg, args.next())),
             "--try-url" => try_url = need(&arg, args.next()),
             "--expect-clicks" => {
                 expect_clicks = need(&arg, args.next())
@@ -55,6 +57,20 @@ async fn main() {
     let session = session.unwrap_or_else(|| fail("--session is required"));
     let profile = profile.unwrap_or_else(|| fail("--profile is required"));
     let evidence = evidence.unwrap_or_else(|| fail("--evidence is required"));
+    if let Some(start_url) = browse {
+        let options = BrowseNodeOptions {
+            c2,
+            session,
+            profile,
+            evidence,
+            start_url,
+            duration: Duration::from_secs(click_wait),
+        };
+        if let Err(err) = run_browse_node(options).await {
+            fail(&err.to_string());
+        }
+        return;
+    }
     if login {
         let options = LoginNodeOptions {
             c2,

