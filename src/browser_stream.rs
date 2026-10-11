@@ -622,6 +622,17 @@ pub async fn run_node(options: NodeOptions) -> Result<NodeProof, StreamError> {
                     frames_sent: frames_sent.load(Ordering::Relaxed),
                     last_frame_bytes: last_frame_bytes.load(Ordering::Relaxed),
                 });
+                // Push the page as it looks after the input so the peer can
+                // see the effect, not only the pre-input paint.
+                for _ in 0..3 {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    if let Ok(png) = page.screenshot().await {
+                        if png.starts_with(&[0x89, b'P', b'N', b'G']) {
+                            let _ = frame_tx.send(png).await;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 break;
             }
         }
