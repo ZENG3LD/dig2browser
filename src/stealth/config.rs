@@ -7,13 +7,13 @@ use crate::detect::BrowserKind;
 pub enum StealthLevel {
     /// Only webdriver + chrome_runtime patches.
     Basic,
-    /// Basic + canvas, plugins, languages, permissions, hardware, memory,
-    /// max touch points, WebRTC (per `webrtc_policy`), connection.
+    /// Basic + canvas, audio, languages, permissions, hardware, memory,
+    /// max touch points, WebRTC (per `webrtc_policy`).
     StandardNoWebGL,
-    /// StandardNoWebGL + WebGL + screen resolution.
+    /// StandardNoWebGL + WebGL + screen resolution + media devices.
     #[default]
     Standard,
-    /// Standard + timezone, media devices, performance timing, battery,
+    /// Standard + timezone, performance timing, battery,
     /// outer size, UA data.
     Full,
 }
@@ -44,6 +44,39 @@ impl LocaleProfile {
             timezone: None,
         }
     }
+}
+
+/// Chrome-shaped expansion of a BCP-47 locale into the language tag list that
+/// backs both the `Accept-Language` header and `navigator.languages`.
+///
+/// Chrome appends the region-less base tag (`ru-RU` → `ru`) and — for
+/// non-English locales only — the `en-US, en` fallback pair. English locales
+/// get no fallback pair: `en-US` expands to `en-US, en` and never carries the
+/// `en` tag twice (`en;q=0.9,en;q=0.7` duplicate).
+pub(crate) fn accept_language_tags(locale: &str) -> Vec<String> {
+    let base = locale.split('-').next().unwrap_or(locale);
+    let mut tags = vec![locale.to_owned()];
+    if !base.eq_ignore_ascii_case(locale) {
+        tags.push(base.to_owned());
+    }
+    if !base.eq_ignore_ascii_case("en") {
+        tags.push("en-US".to_owned());
+        tags.push("en".to_owned());
+    }
+    tags
+}
+
+/// The `Accept-Language` header value for a locale: the expanded tag list with
+/// Chrome's descending q-values (first tag implicit q=1, then 0.9, 0.8, 0.7).
+pub(crate) fn accept_language_header(locale: &str) -> String {
+    const Q_VALUES: &[&str] = &["0.9", "0.8", "0.7"];
+    let tags = accept_language_tags(locale);
+    let mut header = tags[0].clone();
+    for (index, tag) in tags.iter().skip(1).enumerate() {
+        let q = Q_VALUES.get(index).copied().unwrap_or("0.5");
+        header.push_str(&format!(",{tag};q={q}"));
+    }
+    header
 }
 
 /// An empty value selects an automatic User-Agent derived from the browser

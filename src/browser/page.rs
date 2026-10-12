@@ -418,27 +418,34 @@ impl StealthPage {
     /// Count `requestAnimationFrame` callbacks fired over `duration_ms` milliseconds.
     ///
     /// Resolves once the timer expires and returns the frame count.
+    ///
+    /// Implemented as a single promise-returning eval — no `window.*`
+    /// bookkeeping properties, so the page context never carries a counter
+    /// global. The backend's eval must await promises (the CDP backend passes
+    /// `awaitPromise: true`); a backend that does not await fails with an
+    /// error rather than silently reporting zero frames.
     pub async fn count_frames(&self, duration_ms: u64) -> Result<u64, BrowserError> {
-        // Kick off the counter in the page, then poll for the result.
-        let start_js = format!(
+        let js = format!(
             r#"
-(function() {{
-    window.__d2b_frame_count = 0;
-    window.__d2b_frame_done = false;
+new Promise(function(resolve) {{
+    let frames = 0;
+    const deadline = Date.now() + {duration_ms};
     function tick() {{
-        window.__d2b_frame_count++;
-        if (!window.__d2b_frame_done) requestAnimationFrame(tick);
+        frames++;
+        if (Date.now() < deadline) requestAnimationFrame(tick);
+        else resolve(frames);
     }}
     requestAnimationFrame(tick);
-    setTimeout(function() {{ window.__d2b_frame_done = true; }}, {duration_ms});
-}})()
+}})
 "#
         );
-        self.backend.eval(&start_js).await?;
-        // Wait for duration + a bit of padding.
-        tokio::time::sleep(Duration::from_millis(duration_ms + 200)).await;
-        let val = self.backend.eval("window.__d2b_frame_count || 0").await?;
-        Ok(val.as_u64().unwrap_or(0))
+        let val = self.backend.eval(&js).await?;
+        val.as_u64().ok_or_else(|| {
+            BrowserError::JsEval(
+                "frame counter promise did not resolve to a number (backend must await promises)"
+                    .into(),
+            )
+        })
     }
 
     // ── Task 5: Raw CDP escape hatch ─────────────────────────────────────────

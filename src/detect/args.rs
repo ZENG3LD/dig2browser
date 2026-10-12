@@ -141,12 +141,14 @@ impl LaunchConfig {
         // Cap the on-disk cache to 100 MB so long-running daemons don't accumulate GBs.
         args.push("--disk-cache-size=104857600".into());
         // Locale flags ensure HTTP Accept-Language matches navigator.languages.
+        // The tag list uses Chrome's expansion (no duplicated `en` for English
+        // locales; an `en-US` fallback step for non-English ones) — one shared
+        // source with the `navigator.languages` JS override.
         let effective_locale = locale.unwrap_or("en-US");
-        let lang_base = effective_locale.split('-').next().unwrap_or("en");
         args.push(format!("--lang={}", effective_locale));
         args.push(format!(
-            "--accept-lang={},{};q=0.9,en;q=0.7",
-            effective_locale, lang_base
+            "--accept-lang={}",
+            crate::stealth::config::accept_language_header(effective_locale)
         ));
 
         args.push(format!(
@@ -362,6 +364,16 @@ mod tests {
         assert!(args
             .iter()
             .any(|argument| argument == "--disable-background-mode"));
+    }
+
+    #[test]
+    fn accept_language_follows_chrome_expansion_without_duplicates() {
+        let en = LaunchConfig::default().build_args(Path::new("profile"), 9_222, Some("en-US"));
+        assert!(en.iter().any(|argument| argument == "--accept-lang=en-US,en;q=0.9"));
+
+        let ru = LaunchConfig::default().build_args(Path::new("profile"), 9_222, Some("ru-RU"));
+        assert!(ru.iter()
+            .any(|argument| argument == "--accept-lang=ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"));
     }
 
     #[test]
