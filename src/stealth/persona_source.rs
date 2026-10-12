@@ -61,6 +61,13 @@ pub struct PersonaRecord {
     pub hardware_concurrency: u32,
     #[serde(default = "default_memory")]
     pub device_memory_gb: u32,
+    /// Explicit `UNMASKED_VENDOR_WEBGL`. `None` derives a platform-coherent
+    /// value from `platform` (see [`webgl_pool_for_platform`]).
+    #[serde(default)]
+    pub webgl_vendor: Option<String>,
+    /// Explicit `UNMASKED_RENDERER_WEBGL`; same derivation as `webgl_vendor`.
+    #[serde(default)]
+    pub webgl_renderer: Option<String>,
 }
 
 fn default_dsf() -> f64 { 1.0 }
@@ -73,6 +80,7 @@ impl PersonaRecord {
     /// Materialize this record into a full stealth configuration.
     pub fn to_stealth_config(&self) -> StealthConfig {
         let base = StealthConfig::default();
+        let (webgl_vendor, webgl_renderer) = self.webgl_pair();
         StealthConfig {
             transparent: false,
             locale: LocaleProfile {
@@ -93,8 +101,22 @@ impl PersonaRecord {
                 &self.model,
                 self.mobile,
             ),
+            webgl_vendor,
+            webgl_renderer,
             ..base
         }
+    }
+
+    /// WebGL vendor/renderer for this record. Explicit record fields win;
+    /// otherwise the strings are derived from the persona's OS so a macOS or
+    /// Linux persona never reports the Windows-only `…D3D11` renderer (and a
+    /// Windows persona never reports Metal/Mesa).
+    fn webgl_pair(&self) -> (String, String) {
+        if let (Some(vendor), Some(renderer)) = (&self.webgl_vendor, &self.webgl_renderer) {
+            return (vendor.clone(), renderer.clone());
+        }
+        let (vendor, renderer) = webgl_pool_for_platform(&self.platform)[0];
+        (vendor.to_owned(), renderer.to_owned())
     }
 }
 
@@ -252,6 +274,60 @@ const LOCALE_POOL: &[(&str, &str)] = &[
 const CORES_POOL: &[u32] = &[4, 8, 12, 16];
 const MEMORY_POOL: &[u32] = &[4, 8, 16];
 
+/// Plausible desktop GPU identities per OS. The WebGL vendor/renderer pair is
+/// drawn as ONE tuple so vendor and renderer never contradict each other, and
+/// the pool is selected by the persona's platform so a non-Windows persona
+/// never reports a Windows-only `D3D11` renderer.
+const WEBGL_WINDOWS_POOL: &[(&str, &str)] = &[
+    (
+        "Google Inc. (NVIDIA)",
+        "ANGLE (NVIDIA, NVIDIA GeForce GTX 1080 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+    ),
+    (
+        "Google Inc. (NVIDIA)",
+        "ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+    ),
+    (
+        "Google Inc. (Intel)",
+        "ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+    ),
+    (
+        "Google Inc. (AMD)",
+        "ANGLE (AMD, AMD Radeon RX 6600 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+    ),
+];
+
+const WEBGL_MACOS_POOL: &[(&str, &str)] = &[
+    (
+        "Google Inc. (Apple)",
+        "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)",
+    ),
+    (
+        "Google Inc. (Apple)",
+        "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)",
+    ),
+];
+
+const WEBGL_LINUX_POOL: &[(&str, &str)] = &[
+    (
+        "Google Inc. (Intel)",
+        "ANGLE (Intel, Mesa Intel(R) UHD Graphics 620 (KBL GT2), OpenGL 4.6 (Core Profile) Mesa 22.3.6)",
+    ),
+    (
+        "Google Inc. (Intel)",
+        "ANGLE (Intel, Mesa Intel(R) UHD Graphics (CML GT2), OpenGL 4.6 (Core Profile) Mesa 23.0.4)",
+    ),
+];
+
+/// The GPU pool for a persona platform (`Sec-CH-UA-Platform` value).
+fn webgl_pool_for_platform(platform: &str) -> &'static [(&'static str, &'static str)] {
+    match platform {
+        "macOS" => WEBGL_MACOS_POOL,
+        "Linux" | "FreeBSD" | "OpenBSD" => WEBGL_LINUX_POOL,
+        _ => WEBGL_WINDOWS_POOL,
+    }
+}
+
 /// Draw a coherent random persona. With `seed` the draw is reproducible.
 pub fn generate_random(seed: Option<u64>) -> PersonaRecord {
     let mut rng = match seed {
@@ -263,6 +339,8 @@ pub fn generate_random(seed: Option<u64>) -> PersonaRecord {
     let (locale, timezone) = LOCALE_POOL[rng.gen_range(0..LOCALE_POOL.len())];
     let cores = CORES_POOL[rng.gen_range(0..CORES_POOL.len())];
     let memory = MEMORY_POOL[rng.gen_range(0..MEMORY_POOL.len())];
+    let webgl_pool = webgl_pool_for_platform(platform);
+    let (webgl_vendor, webgl_renderer) = webgl_pool[rng.gen_range(0..webgl_pool.len())];
     let tag: u32 = rng.gen();
 
     PersonaRecord {
@@ -279,6 +357,8 @@ pub fn generate_random(seed: Option<u64>) -> PersonaRecord {
         mobile: false,
         hardware_concurrency: cores,
         device_memory_gb: memory,
+        webgl_vendor: Some(webgl_vendor.to_owned()),
+        webgl_renderer: Some(webgl_renderer.to_owned()),
     }
 }
 
@@ -336,6 +416,10 @@ fn load_sqlite(path: &Path, id: Option<&str>) -> Result<PersonaRecord, PersonaSo
                 mobile: row.get::<_, Option<bool>>(11)?.unwrap_or(false),
                 hardware_concurrency: row.get::<_, Option<u32>>(12)?.unwrap_or_else(default_cores),
                 device_memory_gb: row.get::<_, Option<u32>>(13)?.unwrap_or_else(default_memory),
+                // Not part of the catalog table schema; derived from the
+                // record's platform in `to_stealth_config`.
+                webgl_vendor: None,
+                webgl_renderer: None,
             })
         })
         .map_err(|e| PersonaSourceError::Parse(format!("{}: {e}", path.display())))?;
@@ -430,6 +514,7 @@ mod tests {
             let p = generate_random(Some(seed));
             let ua_mac = p.user_agent.contains("Mac OS X");
             let ua_win = p.user_agent.contains("Windows NT");
+            let ua_linux = p.user_agent.contains("Linux");
             if ua_mac {
                 assert_eq!(p.platform, "macOS", "seed {seed}");
             }
@@ -437,7 +522,61 @@ mod tests {
                 assert_eq!(p.platform, "Windows", "seed {seed}");
             }
             assert!(p.viewport[0] >= 1366 && p.viewport[1] >= 768, "seed {seed}");
+
+            // Coherence: the WebGL renderer matches the persona's OS — no
+            // Windows-only D3D11 string under a macOS/Linux UA.
+            let renderer = p.webgl_renderer.as_deref().expect("random personas set WebGL");
+            let vendor = p.webgl_vendor.as_deref().expect("random personas set WebGL");
+            if ua_win {
+                assert!(renderer.contains("D3D11"), "seed {seed}: {renderer}");
+            }
+            if ua_mac {
+                assert!(renderer.contains("Metal"), "seed {seed}: {renderer}");
+                assert!(vendor.contains("Apple"), "seed {seed}: {vendor}");
+            }
+            if ua_linux {
+                assert!(renderer.contains("Mesa"), "seed {seed}: {renderer}");
+            }
+
+            // The materialized config carries the same pair.
+            let cfg = p.to_stealth_config();
+            assert_eq!(cfg.webgl_renderer, renderer);
+            assert_eq!(cfg.webgl_vendor, vendor);
         }
+    }
+
+    #[test]
+    fn catalog_record_without_webgl_derives_it_from_the_platform() {
+        let record = PersonaRecord {
+            id: "t".into(),
+            user_agent: "UA".into(),
+            viewport: [1920, 1080],
+            device_scale_factor: 1.0,
+            locale: "en-US".into(),
+            timezone: None,
+            platform: "macOS".into(),
+            platform_version: default_platform_version(),
+            architecture: default_architecture(),
+            model: String::new(),
+            mobile: false,
+            hardware_concurrency: default_cores(),
+            device_memory_gb: default_memory(),
+            webgl_vendor: None,
+            webgl_renderer: None,
+        };
+        let cfg = record.to_stealth_config();
+        assert!(cfg.webgl_renderer.contains("Metal"));
+        assert!(cfg.webgl_vendor.contains("Apple"));
+
+        // Explicit record fields always win over the platform derivation.
+        let explicit = PersonaRecord {
+            webgl_vendor: Some("CustomVendor".into()),
+            webgl_renderer: Some("CustomRenderer".into()),
+            ..record
+        };
+        let cfg = explicit.to_stealth_config();
+        assert_eq!(cfg.webgl_vendor, "CustomVendor");
+        assert_eq!(cfg.webgl_renderer, "CustomRenderer");
     }
 
     #[test]
